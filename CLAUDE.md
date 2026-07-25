@@ -266,3 +266,23 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - D3D11グラフィックスパイプラインは「DXBCコンテナがパースできる」段階のみ。SPIR-V生成・実描画には未到達(タスク指示のスコープ通り)。
      - Compute Shader側(SM5.0、3シェーダー形状)の対応範囲・実Vulkan検証済み範囲に変更は無い(既存のまま)。
   - 次にすべきこと: (1) DXIL側: `TYPE_BLOCK`のレコードを実際の型テーブルへ、`FUNCTION_BLOCK`のレコードを実際の命令列へデコードする(`vector_add_dxil.hlsl`という1つの既知シェーダーに絞ってまず動かす、DXBC/SM5.0側で採用した「狭いが実物」のアプローチを踏襲)。(2) グラフィックス側: `spirv_gen`(またはそれと並行する新規デコーダ)をVS/PSのオペコード(`dcl_output_siv`・`dcl_input_ps`・補間モード等)に対応するよう拡張し、最終的に実Vulkanで実際に三角形を描画するところまで進める。(3) 両タスクとも、今回同様「実バイト列を確認してから対応opcodeを追加する」漸進的アプローチを継続する。
+
+- **2026-07-25(続き4) DXBC->SPIR-Vデコーダへ4つ目の実シェーダー(除算)を追加、実Vulkanで数値一致確認**:
+  1. **新規シェーダー**: `shaders/vector_div.hlsl`(add/mul/sub_boundedと同じ`RWStructuredBuffer`3本・256要素契約、演算のみ除算)を実`fxc.exe /T cs_5_0 /E main`でコンパイル(`tools/compile-dxbc-shaders.ps1`更新済み)。
+  2. **実SHEX命令列を`examples/dump_shex.rs`で実際にダンプして確認**(思い込みで対応を追加しない、既存方針の継続): `vector_div.dxbc`は`vector_add.dxbc`/`vector_mul.dxbc`と全く同じ命令形状(`dcl_uav_structured`x3 -> `dcl_input`(vThreadID) -> `dcl_temps`(1) -> `dcl_thread_group`(64,1,1) -> `ld_structured`x2 -> `Opcode::Div` -> `store_structured` -> `ret`)で、オペコードだけが`Add`/`Mul`から`Div`へ変わっているだけだった。fxcは除算に特別な最適化(vector_sub_boundedのnegated-addのような書き換え)を行わないことも実機出力で確認できた。
+  3. **実装**: `BinaryOp::Div`を新設、`decode_shader_shape`の`match ins.opcode`へ`Opcode::Div => op = Some(BinaryOp::Div)`を追加、`emit_spirv`で`OpFDiv`(`b.f_div`)を選ぶ分岐を追加。既存の3パターン(add/mul/negated-add-as-sub)のロジックには一切手を入れていない(追加のみ、非破壊)。
+  4. **実Vulkanテスト追加**: `tests/vector_div_real_vulkan.rs`(既存の`vector_mul_real_vulkan.rs`と同型パターン、ゼロ除算を避けるため入力を両方とも正の非ゼロ値に構成)。
+  5. **実際に`cargo test --workspace -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     test spirv_gen::tests::translates_real_fxc_compiled_vector_div_dxbc_to_valid_spirv ... ok
+     test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     running 1 test
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, div)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]/b[i])と256要素すべてで数値一致した
+     c[0]=0.5, c[255]=1.7966101
+     test dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     ```
+     ワークスペース全体で計20テスト全green(実Vulkanディスパッチ4本を含む)。`cargo clippy --workspace --all-targets`警告0件。
+  6. **正直な開示**: 対応する2項演算はadd/mul/negated-add-as-sub/divの4種のみ。この4パターン以外のオペコード・オペランド形状は引き続き`SpirvGenError::UnsupportedShader`で拒否される。DXIL側・D3D11グラフィックスパイプライン側は前回エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: 前回エントリの(1)(2)(3)は変更なし(DXILの型/命令デコード、VS/PS向けSPIR-V生成、両タスクとも「実バイト列確認→対応追加」の継続)。Compute Shader側の演算網羅については、次候補として複数の一時レジスタを使う式(例: `(a+b)*c`のような3入力演算、UAV数が3以外になるケース)や`else`分岐を検討する。

@@ -1,7 +1,7 @@
 //! DXBC(SM5.0)命令列 -> SPIR-Vの翻訳(バックエンド)。
 //!
-//! **正直なスコープ(2026-07-25、2回目の一般化後)**: これは汎用SM5.0
-//! デコーダではない。以下の3つの実シェーダー(いずれも`fxc.exe`で実際に
+//! **正直なスコープ(2026-07-25、3回目の一般化後)**: これは汎用SM5.0
+//! デコーダではない。以下の4つの実シェーダー(いずれも`fxc.exe`で実際に
 //! コンパイルし、実SHEX命令列を確認した上でサポートを追加したもの)だけを
 //! 対象にした翻訳器である:
 //!
@@ -12,6 +12,10 @@
 //!    `if (id.x < N)`境界チェック付きの減算。fxcは`a - b`を
 //!    `add dest, -b, a`(第1ソースオペランドに`negate`フラグを立てたadd)
 //!    へ最適化することを実機出力で確認した上でその形を検出している。
+//! 4. `shaders/vector_div.hlsl` — 演算が除算(`Opcode::Div`)。実SHEX命令列を
+//!    ダンプして確認したところ、add/mulと全く同じ命令形状
+//!    (`ld_structured`x2 -> 演算 -> `store_structured`)で、オペコードだけが
+//!    異なる形だった(fxcは除算専用の特別な最適化をしていない)。
 //!
 //! 共通の骨格は次の通り:
 //!
@@ -53,6 +57,10 @@ pub enum BinaryOp {
     /// `add dest, -srcB, srcA`(第1ソースオペランドにnegate) — `A - B`。
     /// fxcが`a - b`をこの形へ最適化することを実機出力で確認した。
     Sub,
+    /// `div dest, srcA, srcB`(`Opcode::Div`) — `A / B`。add/mulと全く同じ
+    /// 命令形状(`ld_structured`x2->演算->`store_structured`)で、オペコード
+    /// だけがDivに変わる形を実機出力(`vector_div.dxbc`)で確認した。
+    Div,
 }
 
 /// 翻訳結果のSPIR-Vモジュールと、Vulkanディスパッチに必要な最小限のメタ情報。
@@ -77,7 +85,7 @@ pub struct TranslatedKernel {
 pub enum SpirvGenError {
     #[error("DXBC解析エラー: {0}")]
     Translate(#[from] TranslateError),
-    #[error("このシェーダーは対応スコープ外(vector_add/vector_mul/vector_sub_bounded系オペコード列専用): {0}")]
+    #[error("このシェーダーは対応スコープ外(vector_add/vector_mul/vector_div/vector_sub_bounded系オペコード列専用): {0}")]
     UnsupportedShader(String),
 }
 
@@ -271,6 +279,9 @@ fn decode_shader_shape(instructions: &[Instruction]) -> Result<ShaderShape, Spir
                 Opcode::Mul => {
                     op = Some(BinaryOp::Mul);
                 }
+                Opcode::Div => {
+                    op = Some(BinaryOp::Div);
+                }
                 Opcode::StoreStructured => {
                     let dest_uav = operands.first().ok_or_else(|| {
                         SpirvGenError::UnsupportedShader("store_structuredの書き込み先オペランドが無い".to_string())
@@ -428,6 +439,7 @@ fn emit_spirv(shape: &ShaderShape) -> Vec<u32> {
             BinaryOp::Add => b.f_add(float_ty, None, val_a, val_b).expect("OpFAdd"),
             BinaryOp::Mul => b.f_mul(float_ty, None, val_a, val_b).expect("OpFMul"),
             BinaryOp::Sub => b.f_sub(float_ty, None, val_a, val_b).expect("OpFSub"),
+            BinaryOp::Div => b.f_div(float_ty, None, val_a, val_b).expect("OpFDiv"),
         };
 
         let ac_c = b
@@ -557,5 +569,22 @@ mod tests {
         let mut loader = rspirv::dr::Loader::new();
         rspirv::binary::parse_bytes(&bytes, &mut loader)
             .expect("emitted SPIR-V (sub, bounded) must be well-formed and re-parseable");
+    }
+
+    /// `shaders/vector_div.dxbc`(実fxc.exe出力、除算)。
+    const VECTOR_DIV_DXBC: &[u8] = include_bytes!("../shaders/vector_div.dxbc");
+
+    #[test]
+    fn translates_real_fxc_compiled_vector_div_dxbc_to_valid_spirv() {
+        let kernel = translate_shader(VECTOR_DIV_DXBC)
+            .expect("real fxc-compiled vector_div.dxbc (div opcode) must translate");
+        assert_eq!(kernel.uav_bind_points, (0, 1, 2));
+        assert_eq!(kernel.local_size, (64, 1, 1));
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203);
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_bytes(&bytes, &mut loader)
+            .expect("emitted SPIR-V (div) must be well-formed and re-parseable");
     }
 }
