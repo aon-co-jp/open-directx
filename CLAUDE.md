@@ -1,4 +1,4 @@
-# 開発方針＆開発環境ルール(open-directx)
+# 設計思想＆開発方針＆開発環境ルール(open-directx)
 
 作業ドライブは`F:\runo`。この節は[`open-raid-z`](https://github.com/aon-co-jp/open-raid-z)の
 `CLAUDE.md`を正本とし、各プロジェクトへコピーして同期する方針に準じる。
@@ -238,3 +238,31 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **DXILパースは今回も実装していない**(container形式の調査のみ、上記7参照)。
      - **D3D11グラフィックスパイプラインは引き続き未着手**。
   - 次にすべきこと: (1) 引き続き実DXBCシェーダーを1つずつ`fxc.exe`でコンパイルし遭遇したオペコードを追加していく(次候補: 実際の`div`オペコード、複数の一時レジスタを使う式、`else`分岐)。(2) DXILの実バイト列パースへ本格着手する場合は`llvm-bitcode`クレートの実際の検証(このワークスペースでの`cargo add`試験)から始める。(3) この垂直スライスの3シェーダーが安定してから、D3D11最小グラフィックスパイプラインへ進む。
+
+- **2026-07-25(続き3) DXIL実バイト列をbitstream/ブロックレベルまでパース(container止まりから前進)、D3D11 VS/PSのDXBCパースに着手**:
+  1. **タスク1(DXIL)**: `shaders/vector_add_dxil.hlsl`(SM5.0版`vector_add.hlsl`と同一契約、あえて別ファイルに分離)を実`dxc.exe -T cs_6_0 -E main`(`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`)でコンパイルし、`shaders/vector_add.dxil`(実DXILバイト列、1392バイトのbitcode本体を含むDXBCコンテナ)を得た。`tools/compile-dxbc-shaders.ps1`にdxc.exe自動検出ロジック(`DXC_BIN`環境変数→PATH→`%VULKAN_SDK%\Bin\dxc.exe`の順)を追加。
+     - 既存の`dxbc`クレート(`0.1.0`)を実際に調べたところ、`DXIL`チャンクの`DxilProgramHeader`/`DxilBitcodeHeader`(シェーダー種別・SM版数・マジック`'DXIL'`・bitcodeオフセット/サイズ)は**既にパース済み**で、`ChunkData::Dxil(DxilData { shader_kind, major_version, minor_version, dxil_version, bitcode })`として取得できることが分かった(前回HANDOFFの「不透明バイト列として保持するのみ」は、bitcode本体の中身を指しては正しいが、ヘッダ自体は既にパースされていたという訂正)。
+     - `llvm-bitcode = "0.4.0"`を新規依存として実際に追加し(`cargo add`→ビルド確認)、`dxil_chunk.bitcode`(生LLVM bitcode)を`llvm_bitcode::Bitcode::new()`に渡したところ、**実際に成功した**。まず`examples/dump_dxil.rs`(調査用ツール、`dump_shex.rs`と同じ位置づけ)で中身を確認: LLVMラッパーマジック`BC\xC0\xDE`、トップレベル`MODULE_BLOCK`(id=8, 16要素)、その中に`TYPE_BLOCK_ID_NEW`(17)・`PARAMATTR_GROUP_BLOCK`(10)・`PARAMATTR_BLOCK`(9)・`CONSTANTS_BLOCK`(11)・`FUNCTION_BLOCK`(12、5個——`main`の基本ブロック数分)・`VALUE_SYMTAB_BLOCK`(14)・`METADATA_BLOCK`(15、2個)という、LLVM標準ブロックIDとして辻褄の合う構造が実際に出てきた。
+     - `crates/directx-shader-translate/src/dxil.rs`新設: `parse_dxil_container(bytes) -> Result<DxilModule, DxilParseError>`。`DxilModule`は`shader_kind`/`shader_model_major`/`minor`/`dxil_version`/`bitcode_byte_len`/`bitcode_has_llvm_magic`(実バイト列を見て確認、決め打ちでない)/`top_level_blocks: Vec<BitcodeBlockSummary>`(各ブロックの生の`block_id`・子要素数・子ブロックID一覧)を持つ。5件のテスト(実dxc.exe出力を`include_bytes!`で埋め込み、DXILチャンクの無いDXBC〈SM5.0〉を渡した場合に正直に`NoDxilChunk`を返すことも確認)、全green。
+     - **正直な開示・ここで止まっている**: LLVM型システムの解決(`TYPE_BLOCK`のレコードを実際の型として解釈する)、命令オペコードの意味解釈(`FUNCTION_BLOCK`内のレコードがload/store/callのどれか等)は一切していない。ブロック/レコードの木構造(生の数値ID)が読めるところまで。DXIL→SPIR-V変換は存在しない。
+  2. **タスク2(D3D11グラフィックスパイプライン)**: `shaders/triangle_vs.hlsl`(`POSITION`/`COLOR`入力→`SV_POSITION`/`COLOR`出力の最小パススルー頂点シェーダー)・`shaders/triangle_ps.hlsl`(`COLOR`入力→`SV_TARGET`出力のパススルーピクセルシェーダー)を実`fxc.exe /T vs_5_0`・`/T ps_5_0`でコンパイル。
+     - 既存の`parse_dxbc`(無改修)がVS/PSのDXBCコンテナも問題なくパースできることを確認(`src/lib.rs`に2件のテスト追加、`has_input_signature`/`has_output_signature`/`instruction_count > 0`を検証)。
+     - `examples/dump_shex.rs`で実SHEX命令列を実際にダンプして確認(思い込みで書かない、CLAUDE.md方針の継続): VSは`dcl_globalFlags`→`dcl_input`(POSITION, mask 7)→`dcl_input`(COLOR, mask 15)→`dcl_output_siv`(SV_POSITION)→`dcl_output`(COLOR)→`mov`x3→`ret`。PSは`dcl_globalFlags`→`dcl_input_ps`(`linear`補間付き、COLOR)→`dcl_output`(SV_TARGET)→`mov`→`ret`。**Compute Shaderで出てきたオペコード(`dcl_uav_structured`・`ld_structured`・`store_structured`・`dcl_thread_group`)は一切出現しない**——想定通りだが、実際にダンプして確認した上での記録。
+     - `translate_shader`(Compute専用)にVSのDXBCを渡すと`SpirvGenError::UnsupportedShader`で正しく拒否されることをテストで確認(`vertex_shader_spirv_translation_is_honestly_unimplemented_not_silently_wrong`)——誤ったSPIR-Vを黙って生成しないことの継続的な保証。
+     - **正直な開示・未着手**: VS/PS向けのSPIR-Vコード生成、ラスタライザ、出力マージ、実Vulkanでの三角形描画は一切実装していない(タスク指示通りスコープ外)。
+  3. **検証**: `cargo test --workspace`(型チェックのみで完了と報告しない、実行結果):
+     ```
+     running 15 tests (unit)
+     ... 全15件 ok(内訳: 既存7件+dxil::tests 5件+lib.rs新規3件)
+     test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     running 1 test (tests/vector_add_real_vulkan.rs) ... ok
+     running 1 test (tests/vector_mul_real_vulkan.rs) ... ok
+     running 1 test (tests/vector_sub_bounded_real_vulkan.rs) ... ok
+     ```
+     合計18件全green(このマシンの実NVIDIA GT 730での実Vulkan実行3件を含む、フェイク成功なし)。`cargo clippy --workspace --all-targets`警告0件。
+  4. **正直な開示・全体まとめ(誇張しない)**:
+     - DXILは「コンテナレベル」から「LLVM bitstreamのブロック/レコード木レベル」まで前進したが、命令・型の意味解釈と DXIL→SPIR-V 変換は依然として未着手。
+     - D3D11グラフィックスパイプラインは「DXBCコンテナがパースできる」段階のみ。SPIR-V生成・実描画には未到達(タスク指示のスコープ通り)。
+     - Compute Shader側(SM5.0、3シェーダー形状)の対応範囲・実Vulkan検証済み範囲に変更は無い(既存のまま)。
+  - 次にすべきこと: (1) DXIL側: `TYPE_BLOCK`のレコードを実際の型テーブルへ、`FUNCTION_BLOCK`のレコードを実際の命令列へデコードする(`vector_add_dxil.hlsl`という1つの既知シェーダーに絞ってまず動かす、DXBC/SM5.0側で採用した「狭いが実物」のアプローチを踏襲)。(2) グラフィックス側: `spirv_gen`(またはそれと並行する新規デコーダ)をVS/PSのオペコード(`dcl_output_siv`・`dcl_input_ps`・補間モード等)に対応するよう拡張し、最終的に実Vulkanで実際に三角形を描画するところまで進める。(3) 両タスクとも、今回同様「実バイト列を確認してから対応opcodeを追加する」漸進的アプローチを継続する。

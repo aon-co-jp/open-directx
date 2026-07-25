@@ -1,5 +1,11 @@
 # PORTING.md — what's reusable, by whom, and how
 
+> **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
+> 「設計思想＆開発方針＆開発環境ルール」へ改名しました
+> (設計思想・開発方針・開発環境ルールを明確に区別)。移設先でも
+> `CLAUDE.md`の内容を必ず確認してください。
+
+
 ## `crates/directx-shader-translate`
 
 **Reusable by**: any Rust project that needs to inspect DXBC (D3D9/10/11
@@ -120,6 +126,83 @@ because their argument layout (3 buffers + 1 `uint` push constant) is
 identical — the actual operation executed is whatever the dispatched
 SPIR-V bytes say, not something implied by the name string.
 
+## DXIL (SM6+, D3D12) — container/bitstream parsing, added 2026-07-25
+
+`src/dxil.rs`'s `parse_dxil_container(bytes) -> Result<DxilModule, DxilParseError>`
+parses a real `dxc.exe -T cs_6_0`-compiled DXBC container
+(`shaders/vector_add_dxil.hlsl` -> `shaders/vector_add.dxil`, same
+`vector_add` contract as the SM5.0/DXBC shader, compiled separately so
+the DXBC-vs-DXIL container diff isn't entangled with a shader-content
+diff). Two real steps, chained:
+
+1. The existing `dxbc` crate (already a dependency) parses the `DXIL`
+   chunk's `DxilProgramHeader` (shader kind, SM major/minor) and
+   `DxilBitcodeHeader` (magic `'DXIL'`, bitcode offset/size) and returns
+   the raw LLVM bitcode bytes (`dxbc::chunks::dxil::DxilData::bitcode`).
+   This part already existed in the crate before today; it just wasn't
+   being called from this repo.
+2. The newly-added `llvm-bitcode = "0.4.0"` crate (generic LLVM
+   bitstream reader, no DXIL/HLSL-specific knowledge) reads the raw
+   bitcode bytes into a `Bitcode { elements: Vec<BitcodeElement> }` tree
+   of blocks/records. `dxil.rs` walks the top level and one level of
+   children, recording each block's raw numeric LLVM block ID.
+
+Actually confirmed against the real `vector_add.dxil` bytes (not
+assumed from documentation): the LLVM bitcode wrapper magic
+`BC\xC0\xDE`, a single top-level `MODULE_BLOCK_ID` (8), and inside it
+`TYPE_BLOCK_ID_NEW`(17), `PARAMATTR_GROUP_BLOCK_ID`(10),
+`PARAMATTR_BLOCK_ID`(9), `CONSTANTS_BLOCK_ID`(11), `FUNCTION_BLOCK_ID`
+(12, appearing 5 times — one per basic block in `main`'s single-function
+body), `VALUE_SYMTAB_BLOCK_ID`(14), and `METADATA_BLOCK_ID`(15, twice).
+This was found empirically with `examples/dump_dxil.rs` before writing
+the assertions in `dxil.rs`'s tests, the same "dump first, decode
+narrowly second" discipline used for the DXBC/SM5.0 SHEX opcode work.
+
+**Where this stops, honestly**: no LLVM type-system resolution (the
+`TYPE_BLOCK` records' fields are raw `u64` varints, not decoded into an
+actual type table), no instruction-opcode decoding inside
+`FUNCTION_BLOCK` records, and therefore **no DXIL-to-SPIR-V translation
+of any kind**. `DxilModule` only exposes `shader_kind`,
+`shader_model_major/minor`, `dxil_version`, `bitcode_has_llvm_magic`,
+and `top_level_blocks: Vec<BitcodeBlockSummary>` (each just `block_id`,
+`child_count`, `child_block_ids` — raw IDs, no semantics). If this is
+picked up again, the natural next step is decoding `TYPE_BLOCK` records
+into an actual type table for this one known shader, mirroring how
+`decode_shader_shape` started narrow for DXBC/SM5.0.
+
+## D3D11 graphics pipeline (vertex/pixel shaders) — DXBC parsing only, added 2026-07-25
+
+`shaders/triangle_vs.hlsl` (`POSITION`/`COLOR` in, `SV_POSITION`/`COLOR`
+out) and `shaders/triangle_ps.hlsl` (`COLOR` in, `SV_TARGET` out) — a
+minimal passthrough pair for a solid-color triangle — were compiled with
+real `fxc.exe /T vs_5_0` / `/T ps_5_0` (`tools/compile-dxbc-shaders.ps1`).
+The existing `parse_dxbc` front-end (unmodified) parses both containers
+successfully — new tests
+`parses_real_fxc_compiled_vertex_shader_dxbc_container` /
+`_pixel_shader_dxbc_container` in `src/lib.rs` confirm `has_input_signature`/
+`has_output_signature`/`instruction_count > 0` for both.
+
+Dumping the real SHEX stream (`examples/dump_shex.rs`) confirmed the
+opcode/operand vocabulary really is different from compute shaders, not
+assumed: `dcl_globalFlags`, `dcl_input` (positional, for VS) /
+`dcl_input_ps` (with `linear` interpolation, for PS), `dcl_output` /
+`dcl_output_siv` (`SV_POSITION`), `mov`, `ret` — no
+`dcl_uav_structured`, `ld_structured`/`store_structured`, or
+`dcl_thread_group` at all (those are compute-only). Passing either
+shader's DXBC into `translate_shader` (the existing compute-only SPIR-V
+generator) is confirmed, via a new test
+(`vertex_shader_spirv_translation_is_honestly_unimplemented_not_silently_wrong`),
+to fail with `SpirvGenError::UnsupportedShader` rather than silently
+emitting something wrong.
+
+**Honest scope**: no SPIR-V generation for graphics shaders exists, no
+rasterizer, no output-merger, no actual Vulkan triangle draw. This pass
+only establishes that the DXBC container front-end generalizes to
+graphics shaders and records what their SHEX opcode vocabulary actually
+looks like, as the documented prerequisite for eventually extending
+`spirv_gen` (or writing a parallel graphics-focused decoder) to cover
+this pipeline stage.
+
 ## What is NOT yet reusable (honest gaps)
 
 - **No general SM5.0 instruction decoder.** Only the 3 opcode shapes
@@ -128,19 +211,18 @@ SPIR-V bytes say, not something implied by the name string.
   `SV_DispatchThreadID` indexing, a real dedicated `sub`/`div` opcode
   instead of negated-`add`, more than one bounds check, etc.) will be
   rejected by `decode_shader_shape`, not silently mistranslated.
-- **DXIL (SM6+) is investigated at the container level only, not
-  implemented.** The underlying `dxbc` crate parses the `DXIL` chunk as
-  an opaque LLVM-bitcode blob (see its `ChunkData::Dxil` variant) but
-  does not decode it. As of 2026-07-25, LLVM's own docs describe the
-  DXContainer format and a native DXIL backend architecture
-  (`llvm.org/docs/DirectX/DXContainer.html` /
-  `.../DXILArchitecture.html`) — more official coverage than existed
-  when this was previously surveyed — and a generic `llvm-bitcode` crate
-  exists on crates.io for the bitcode layer. No DXIL bytes have actually
-  been parsed in this repo. D3D12 support remains Phase 3+ per
-  `CLAUDE.md`'s roadmap.
-- **No D3D11 graphics pipeline (vertex/pixel shaders, rasterizer, etc.).**
-  Compute-only, per the vertical-slice scope in `CLAUDE.md`.
+- **DXIL (SM6+) is parsed down to the LLVM bitstream block/record tree
+  (see the dedicated section above, added 2026-07-25) but no further —
+  no type/instruction semantic decoding, no DXIL-to-SPIR-V translation.**
+  D3D12's higher-level layers (command lists, descriptor heaps, root
+  signatures) remain entirely unimplemented, Phase 3+ per `CLAUDE.md`'s
+  roadmap.
+- **D3D11 graphics pipeline: DXBC container parsing for vertex/pixel
+  shaders is confirmed working (see the dedicated section above, added
+  2026-07-25), but there is no SPIR-V generation, rasterizer, texture
+  sampler, blend state, output-merger, or actual Vulkan triangle draw.**
+  Compute-only SPIR-V codegen, per the original vertical-slice scope in
+  `CLAUDE.md`.
 
 ## Path-dependency convention used in this ecosystem (for reference)
 

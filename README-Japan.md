@@ -1,5 +1,12 @@
 # open-directx (日本語版)
 
+> **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
+> 「開発方針＆開発環境ルール」から「設計思想＆開発方針＆開発環境ルール」
+> へ改名しました。プロジェクトの設計思想(何を大事にしているか)・
+> 開発方針(どう進めるか)・開発環境ルール(具体的な運用規約)を明確に
+> 区別して記載しています。詳細は`CLAUDE.md`を参照してください。
+
+
 DXVK/vkd3d-protonと同じ方向性の、クロスプラットフォームDirectX
 (D3D9/10/11/12)互換層。Windows専用のDirectXアプリを、DXBC/DXILシェーダー
 バイトコードをSPIR-Vへ翻訳し、[open-cuda](https://github.com/aon-co-jp/open-cuda)の
@@ -9,6 +16,46 @@ Linux(将来的にAndroid/macOS)上で実際に動かすことを目指す。
 設計の背景・正直なスコープ/ロードマップ・セッション引き継ぎ記録の全文は
 [`CLAUDE.md`](CLAUDE.md)を参照。このREADMEは現状の**検証済みの部分だけ**
 を要約する。
+
+## 現状(2026-07-25続き: DXILのbitstreamレベルパース + D3D11 VS/PSのDXBCパース)
+
+下記フェーズ1(Compute Shader垂直スライス)に加え、今回2つ着手した:
+
+- **DXIL(D3D12/SM6+)——実バイト列をbitstream/ブロックレベルまで実際に
+  パース。** `crates/directx-shader-translate/src/dxil.rs`
+  (`parse_dxil_container`)が、実`dxc.exe -T cs_6_0`でコンパイルした
+  DXBCコンテナ(`shaders/vector_add_dxil.hlsl` →
+  `shaders/vector_add.dxil`、`tools/compile-dxbc-shaders.ps1`で生成)を
+  解析する: 既存の`dxbc`クレートで`DXIL`チャンクの`DxilProgramHeader`/
+  `DxilBitcodeHeader`(シェーダー種別・SM6.0・DXIL版数)を取り出し、
+  中の生LLVM bitcodeを新規依存の`llvm-bitcode`クレート(DXIL固有知識を
+  持たない汎用LLVM bitstreamリーダー)に渡してブロック/レコード木を
+  実際にデコードする。実バイト列で確認できたこと: LLVMラッパーマジック
+  `BC\xC0\xDE`、トップレベルの`MODULE_BLOCK`(id=8)が1個、その中に
+  標準LLVMサブブロック——`TYPE_BLOCK_ID_NEW`(17)・
+  `PARAMATTR_GROUP_BLOCK`(10)・`PARAMATTR_BLOCK`(9)・
+  `CONSTANTS_BLOCK`(11)・`FUNCTION_BLOCK`(12、`main`の基本ブロックの数
+  だけ5個)・`VALUE_SYMTAB_BLOCK`(14)・`METADATA_BLOCK`(15、2個)。
+  **ここで止まっている**——LLVM型システムの解決・命令オペコードの
+  意味解釈は一切行っていないため、DXIL→SPIR-V変換は存在しない
+  (詳細は下記「未実装」節)。
+- **D3D11グラフィックスパイプライン——DXBCパースのみ、SPIR-V無し。**
+  `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl`(最小のパス
+  スルー頂点+ピクセルシェーダーの組、`POSITION`/`COLOR`入力→
+  `SV_POSITION`/`SV_TARGET`出力)を実`fxc.exe /T vs_5_0`/`/T ps_5_0`で
+  コンパイル。既存の`parse_dxbc`(コンテナレベルのみ、無改修)が両方とも
+  問題なくパースできることを確認——同じDXBCコンテナ/チャンクの
+  フロントエンドがCompute Shaderだけでなくグラフィックスシェーダーにも
+  そのまま使えることの実証。`examples/dump_shex.rs`で実SHEX命令列を
+  ダンプし、オペコード/オペランド語彙が実際にCompute Shaderとは異なる
+  ことを確認した: `dcl_input`/`dcl_input_ps`(`linear`補間付き)/
+  `dcl_output`/`dcl_output_siv`(`SV_POSITION`)/`mov`——
+  `dcl_uav_structured`・`ld_structured`/`store_structured`・
+  `dcl_thread_group`は一切出現しない。`translate_shader`
+  (Compute専用)はVS/PSいずれも`SpirvGenError::UnsupportedShader`で
+  正しく拒否する(誤った翻訳を試みない、新規テストで確認済み)。SPIR-V
+  コード生成・ラスタライザ・実Vulkanでの三角形描画は今回のスコープ外
+  (`CLAUDE.md`のHANDOFF参照)。
 
 ## 現状(2026-07-25、3つの既知シェーダーへ一般化してフェーズ1垂直スライス達成)
 
@@ -103,6 +150,11 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 ```
 
 `cargo clippy --workspace --all-targets`: 警告0件。
+
+今回のDXIL/VS/PS追加分を含めると、`cargo test --workspace`は合計18件
+(単体テスト15件+実Vulkan統合テスト3件)が全て成功する。新規追加分は
+`dxil::tests::*`5件+`src/lib.rs`のDXBC VS/PSコンテナテスト2件+
+「Compute専用翻訳器がVSを正直に拒否する」テスト1件の計8件。
 
 DXBCフィクスチャをHLSLから再生成する場合(Windows SDK付属の`fxc.exe`が
 必要——`dxc.exe`はDXIL/SM6+専用でDXBCは出力できない点に注意):

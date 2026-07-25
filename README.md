@@ -1,5 +1,13 @@
 # open-directx
 
+> **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
+> renamed from "Development Policy & Dev Environment Rules" to
+> "Design Philosophy & Development Policy & Dev Environment Rules",
+> to more clearly separate the project's design philosophy (what we
+> value), development policy (how we work), and dev environment rules
+> (concrete operational conventions). See `CLAUDE.md` for details.
+
+
 A cross-platform DirectX (D3D9/10/11/12) compatibility layer — in the
 spirit of DXVK / vkd3d-proton — aiming to run unmodified Windows
 DirectX applications on Linux (and eventually Android/macOS) by
@@ -10,6 +18,47 @@ an existing Vulkan compute backend ([open-cuda](https://github.com/aon-co-jp/ope
 See [`CLAUDE.md`](CLAUDE.md) for the full design rationale, honest
 scope/roadmap, and session HANDOFF log — this README only summarizes
 current, verified state.
+
+## Current state (2026-07-25, continued: DXIL bitstream-level parsing + D3D11 VS/PS DXBC parsing)
+
+Two new pieces of work landed on top of the Phase 1 compute-shader
+vertical slice below:
+
+- **DXIL (D3D12/SM6+) — actual bytes parsed, container/bitstream level
+  only.** `crates/directx-shader-translate/src/dxil.rs`
+  (`parse_dxil_container`) parses a real `dxc.exe -T cs_6_0`-compiled
+  DXBC container (`shaders/vector_add_dxil.hlsl` ->
+  `shaders/vector_add.dxil`, produced by `tools/compile-dxbc-shaders.ps1`):
+  extracts the `DXIL` chunk's `DxilProgramHeader`/`DxilBitcodeHeader`
+  (shader kind, SM6.0, DXIL version) via the existing `dxbc` crate, then
+  hands the raw LLVM bitcode payload to the `llvm-bitcode` crate (newly
+  added dependency, generic LLVM bitstream reader with no DXIL-specific
+  knowledge) to actually decode the block/record tree. Confirmed against
+  real bytes: the LLVM wrapper magic `BC\xC0\xDE`, a single top-level
+  `MODULE_BLOCK` (id 8), and standard LLVM sub-blocks inside it —
+  `TYPE_BLOCK_ID_NEW`(17), `PARAMATTR_GROUP_BLOCK`(10),
+  `PARAMATTR_BLOCK`(9), `CONSTANTS_BLOCK`(11), `FUNCTION_BLOCK`(12, x5 —
+  one per basic block of `main`), `VALUE_SYMTAB_BLOCK`(14),
+  `METADATA_BLOCK`(15, x2). **This stops at block/record structure —
+  no LLVM type-system or instruction-opcode decoding**, so no
+  DXIL-to-SPIR-V translation exists. See "Not implemented" below.
+- **D3D11 graphics pipeline — DXBC parsing only, no SPIR-V.**
+  `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl` (minimal
+  passthrough vertex+pixel shader pair, `POSITION`/`COLOR` in,
+  `SV_POSITION`/`SV_TARGET` out) compiled with real `fxc.exe
+  /T vs_5_0`/`/T ps_5_0`. `parse_dxbc` (already existing, container-level
+  only) parses both without modification — confirming the same DXBC
+  container/chunk front-end works for graphics shaders, not just
+  compute. Dumping the real SHEX stream with `examples/dump_shex.rs`
+  confirmed the opcode/operand vocabulary is genuinely different from
+  compute shaders: `dcl_input`/`dcl_input_ps`(with `linear`
+  interpolation)/`dcl_output`/`dcl_output_siv`(`SV_POSITION`)/`mov` — no
+  `dcl_uav_structured`, `ld_structured`/`store_structured`, or
+  `dcl_thread_group` at all. `translate_shader` (compute-only) correctly
+  rejects both with `SpirvGenError::UnsupportedShader` rather than
+  attempting a wrong translation (verified by a new test). No SPIR-V
+  codegen, rasterizer, or actual Vulkan triangle draw exists — that is
+  explicitly out of scope for this pass, see `CLAUDE.md` HANDOFF.
 
 ## Current state (2026-07-25, Phase 1 vertical slice generalized to 3 known shaders)
 
@@ -107,6 +156,12 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 `cargo clippy --workspace --all-targets`: 0 warnings.
 
+After today's DXIL/VS/PS additions, `cargo test --workspace` runs 18
+tests total (15 unit + 3 real-Vulkan integration tests), all passing,
+including 8 new ones: `dxil::tests::*` (5), plus 2 new DXBC VS/PS
+container tests and 1 "VS is honestly rejected by the compute-only
+translator" test in `src/lib.rs`.
+
 To regenerate the DXBC fixtures from HLSL (requires the Windows SDK's
 `fxc.exe` — note `dxc.exe` only targets DXIL/SM6+ and cannot produce
 DXBC):
@@ -125,23 +180,25 @@ pwsh tools/compile-dxbc-shaders.ps1
   adopting/porting an existing one, e.g. studying `dxbc-spirv`/
   `dxil-spirv`'s approach more closely) remains the actual next
   milestone.
-- **DXIL (Shader Model 6+, D3D12) parsing/translation — investigated at
-  the container level only (2026-07-25), not implemented.** DXIL is
-  LLVM 3.7-era bitcode wrapped in a `DXIL` part inside the same
-  DXContainer/DXBC-style outer container (ProgramHeader + BitcodeHeader
-  + serialized LLVM IR module, magic `0x4C495844`). LLVM's own docs now
-  describe this container format and a native-LLVM DXIL backend
-  architecture (`llvm.org/docs/DirectX/DXContainer.html`,
-  `.../DXILArchitecture.html`) — this is newer/more official coverage
-  than existed when this was last surveyed. Candidate Rust building
-  blocks if this is picked up later: the `dxbc` crate already used here
-  exposes the `DXIL` chunk as an opaque blob (no decode); a generic
-  `llvm-bitcode` crate exists on crates.io for the bitcode layer itself.
-  No DXIL bytes have been parsed in this repo; this section is
-  container-format research only, matching the depth of the original
-  Phase 0 DXBC container research.
-- Full graphics pipeline (rasterizer, texture sampling, blend state) —
-  explicitly out of scope until then.
+- **DXIL (Shader Model 6+, D3D12): real bytes are now parsed down to the
+  LLVM bitstream block/record tree — but no further.** No LLVM
+  type-system resolution, no instruction-opcode decoding, and therefore
+  **no DXIL-to-SPIR-V translation** — `dxil.rs` only exposes
+  `DxilModule { shader_kind, shader_model_major/minor, dxil_version,
+  bitcode_has_llvm_magic, top_level_blocks: Vec<BitcodeBlockSummary> }`,
+  where each block just carries its raw numeric LLVM block ID and child
+  block IDs, not decoded semantics. D3D12 command list/descriptor
+  heap/root signature support (the layer above shader translation) is
+  untouched. Next step if this is picked up again: decode `TYPE_BLOCK`
+  records into an actual type table, and `FUNCTION_BLOCK` records into
+  an actual instruction list, for the same narrow single-shader case
+  (`vector_add_dxil.hlsl`) the DXBC/SM5.0 path started with.
+- **D3D11 graphics pipeline: DXBC container parsing confirmed working
+  for VS/PS, but no SPIR-V codegen, no rasterizer, no actual triangle
+  drawn on screen.** The full pipeline (rasterizer, texture sampling,
+  blend state, output-merger) remains out of scope; so does extending
+  `spirv_gen`'s narrow opcode-shape decoder to understand
+  `dcl_output_siv`/`dcl_input_ps`/interpolation modes.
 - PlayStation family targets — explicitly out of scope; see `CLAUDE.md`
   for the legal/ToS reasoning.
 
