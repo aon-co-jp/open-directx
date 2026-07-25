@@ -815,6 +815,92 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
     Ok(resolved_calls)
 }
 
+// ---------------------------------------------------------------------
+// ここから先(SPIR-V生成)は今回新規に追加した部分。DXBC側の
+// `spirv_gen::translate_vector_add_shader`と対になる、DXIL版の
+// vector_addバックエンドである。
+// ---------------------------------------------------------------------
+//
+// 上で解決した7個の`ResolvedDxilCall`(3x CreateHandle + ThreadId +
+// 2x BufferLoad + 1x BufferStore)から、DXBC側と同じ最終SPIR-V形状
+// (storage buffer 3本 + push constant `n` + `GlobalInvocationId`添字)を
+// 組み立てる。命令セット自体はDXBC/DXILで全く異なるが、`vector_add`の
+// 意味(u0[i]+u1[i]->u2[i])が同一である以上、出力SPIR-Vの形も同一にできる
+// ——これは`spirv_gen::emit_spirv_for_kernel`という共有関数として既に
+// 実装済みのものを、DXBC側の`ShaderShape`経由ではなくここから直接呼ぶ形で
+// 再利用する(コード重複を避ける)。
+//
+// **正直な開示(スレッドグループサイズ)**: DXBCの`dcl_thread_group`に相当
+// する情報は、DXILでは`METADATA_BLOCK`内の`dx.entryPoints`メタデータに
+// エンコードされており、このセクションのスコープ(`FUNCTION_BLOCK`の
+// 命令列デコード)では読み取っていない。このリポジトリが対象とする唯一の
+// 実バイト列`vector_add.dxil`は`shaders/vector_add_dxil.hlsl`
+// (`[numthreads(64, 1, 1)]`、DXBC版と意図的に同一の契約)をdxc.exeで
+// コンパイルしたものだと分かっているため、ここでは`(64, 1, 1)`を
+// 決め打ちで使う。METADATA_BLOCKからの実抽出は今回のスコープ外
+// (将来の課題として正直に残す)。
+
+use crate::spirv_gen::emit_spirv_for_kernel;
+use crate::BinaryOp;
+
+/// [`resolve_vector_add_dxil_calls`]が返す7個の`ResolvedDxilCall`(実DXIL
+/// バイト列から解決済み)から、DXBC側と同じ契約のSPIR-Vを組み立てる。
+///
+/// マッピング: `BufferLoad`が最初に現れた`handle_range_id`をA、2番目を
+/// Bとし(DXBC側`ld_uavs`の発見順と同じ規約)、`BufferStore`の
+/// `handle_range_id`をCとする。スレッドグループサイズは上記の通り
+/// `(64, 1, 1)`固定(このシェーダー専用の既知値)。
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DxilSpirvError {
+    #[error("Call命令の解決に失敗した: {0}")]
+    CallResolution(#[from] DxilCallResolutionError),
+    #[error("BufferLoadの呼び出しが想定と異なる個数だった(実際={0}, 期待=2)")]
+    UnexpectedBufferLoadCount(usize),
+    #[error("BufferStoreの呼び出しが想定と異なる個数だった(実際={0}, 期待=1)")]
+    UnexpectedBufferStoreCount(usize),
+}
+
+/// DXILバイト列(`vector_add.dxil`と同じ契約の1シェーダー専用)を解析し、
+/// SPIR-Vへ翻訳する。DXBC側の[`crate::spirv_gen::translate_vector_add_shader`]
+/// と対になる、D3D12/DXIL版のvector_addバックエンド。
+pub fn translate_dxil_vector_add_to_spirv(
+    bytes: &[u8],
+) -> Result<crate::spirv_gen::TranslatedKernel, DxilSpirvError> {
+    let calls = resolve_vector_add_dxil_calls(bytes)?;
+
+    let mut buffer_loads: Vec<i64> = Vec::new();
+    let mut buffer_store: Option<i64> = None;
+    for call in &calls {
+        match call {
+            ResolvedDxilCall::BufferLoad { handle_range_id } => buffer_loads.push(*handle_range_id),
+            ResolvedDxilCall::BufferStore { handle_range_id } => buffer_store = Some(*handle_range_id),
+            ResolvedDxilCall::CreateHandle { .. } | ResolvedDxilCall::ThreadId => {}
+        }
+    }
+
+    if buffer_loads.len() != 2 {
+        return Err(DxilSpirvError::UnexpectedBufferLoadCount(buffer_loads.len()));
+    }
+    let uav_c = buffer_store.ok_or(DxilSpirvError::UnexpectedBufferStoreCount(0))?;
+
+    // 実バイト列は非負のレンジID(u#のバインドポイント)であることを
+    // `resolve_vector_add_dxil_calls`のテストで既に確認済み。
+    let uav_a = buffer_loads[0] as u32;
+    let uav_b = buffer_loads[1] as u32;
+    let uav_c = uav_c as u32;
+
+    // このシェーダー(vector_add_dxil.hlsl)専用の既知値:
+    // [numthreads(64, 1, 1)]、演算はfadd(BinaryOp::Add)、境界チェック無し。
+    let spirv_words = emit_spirv_for_kernel((64, 1, 1), uav_a, uav_b, uav_c, BinaryOp::Add, false);
+
+    Ok(crate::spirv_gen::TranslatedKernel {
+        spirv_words,
+        entry_point: "main",
+        local_size: (64, 1, 1),
+        uav_bind_points: (uav_a, uav_b, uav_c),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

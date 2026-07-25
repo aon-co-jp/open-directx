@@ -364,6 +364,47 @@ fn decode_shader_shape(instructions: &[Instruction]) -> Result<ShaderShape, Spir
 /// バインドポイント)+ push constant `uint n`。`bounds_check`が真の場合、
 /// このpush constantの`n`を`id.x < n`の比較に実際に使う。
 fn emit_spirv(shape: &ShaderShape) -> Vec<u32> {
+    emit_spirv_for_kernel(
+        shape.thread_group,
+        shape.uav_a,
+        shape.uav_b,
+        shape.uav_c,
+        shape.op,
+        shape.bounds_check,
+    )
+}
+
+/// `emit_spirv`の中身そのもの(DXBC固有の`ShaderShape`型に依存しない、
+/// 純粋なパラメータのみを受け取る形)。DXBC(`emit_spirv`経由)とDXIL
+/// (`crate::dxil::translate_dxil_vector_add_to_spirv`)の両方の翻訳経路
+/// から共有される、実際のSPIR-V組み立てロジック本体。
+///
+/// **正直な開示**: DXBCとDXILは命令セット・コンテナ形式が全く異なるが、
+/// `vector_add`が要求する最終的なSPIR-Vの形(storage buffer 3本読み書き+
+/// スレッドID添字)は同一であることを、DXBC側の`ShaderShape`抽出結果と
+/// DXIL側の`resolve_vector_add_dxil_calls`解決結果を突き合わせて確認した
+/// 上で共通化している(命令セットの共通化ではなく、あくまで出力SPIR-Vの
+/// 形の共通化)。
+pub(crate) fn emit_spirv_for_kernel(
+    thread_group: (u32, u32, u32),
+    uav_a: u32,
+    uav_b: u32,
+    uav_c: u32,
+    op: BinaryOp,
+    bounds_check: bool,
+) -> Vec<u32> {
+    let shape = ShaderShape {
+        thread_group,
+        uav_a,
+        uav_b,
+        uav_c,
+        op,
+        bounds_check,
+    };
+    emit_spirv_impl(&shape)
+}
+
+fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);

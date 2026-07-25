@@ -19,6 +19,23 @@ See [`CLAUDE.md`](CLAUDE.md) for the full design rationale, honest
 scope/roadmap, and session HANDOFF log — this README only summarizes
 current, verified state.
 
+## Current state (2026-07-25, latest: DXIL vertical slice complete on real hardware)
+
+The D3D12/DXIL compute-shader vertical slice now reaches full parity
+with the D3D11/DXBC one: `vector_add.dxil` (real `dxc.exe -T cs_6_0`
+output) is decoded end-to-end (container -> LLVM bitstream ->
+type table -> instructions -> all 7 `Call` records disambiguated to
+real `dx.op.*` meaning) and translated to real SPIR-V
+(`directx_shader_translate::translate_dxil_vector_add_to_spirv`), which
+`tests/vector_add_dxil_real_vulkan.rs` dispatches on this machine's
+real NVIDIA GT 730 and verifies numerically matches the CPU reference
+`a[i]+b[i]`. This is still one known shader shape only, not a general
+SM6.0 decoder — see "Not implemented (honest scope)" below for the
+precise boundary (in particular, the SPIR-V workgroup size is currently
+hardcoded rather than extracted from DXIL metadata). See the
+2026-07-25 "continued 7" HANDOFF entry in `CLAUDE.md` for the full
+account.
+
 ## Current state (2026-07-25, continued: DXIL bitstream-level parsing + D3D11 VS/PS DXBC parsing)
 
 Two new pieces of work landed on top of the Phase 1 compute-shader
@@ -202,20 +219,31 @@ pwsh tools/compile-dxbc-shaders.ps1
   adopting/porting an existing one, e.g. studying `dxbc-spirv`/
   `dxil-spirv`'s approach more closely) remains the actual next
   milestone.
-- **DXIL (Shader Model 6+, D3D12): all 7 `Call` records in
-  `vector_add.dxil` are now disambiguated to real `dx.op.*` meaning, but
-  there is still no DXIL-to-SPIR-V translation.**
-  `resolve_type_table`/`decode_function_instructions` in `dxil.rs`
-  decode real `TYPE_BLOCK`/`FUNCTION_BLOCK` records against LLVM's
-  documented codes; `resolve_vector_add_dxil_calls` (new) additionally
-  resolves `VALUE_SYMTAB_BLOCK` function names and hand-decodes LLVM's
-  relative-value operand encoding to identify which `Call` is
-  `CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore` and which UAV
-  bind point (`range_id`) each one touches. **Still no SPIR-V codegen or
-  Vulkan dispatch for the DXIL path** — that requires reusing/adapting
-  `spirv_gen.rs`'s `emit_spirv` to consume `ResolvedDxilCall` output,
-  which is the next step. D3D12 command list/descriptor heap/root
-  signature support (the layer above shader translation) is untouched.
+- **DXIL (Shader Model 6+, D3D12): the `vector_add.dxil` vertical slice
+  is now complete end-to-end, on real hardware — but still only for
+  this one known shader shape, not general SM6.0.**
+  `resolve_type_table`/`decode_function_instructions`/
+  `resolve_vector_add_dxil_calls` in `dxil.rs` decode the real
+  `TYPE_BLOCK`/`FUNCTION_BLOCK`/`VALUE_SYMTAB_BLOCK` records against
+  LLVM's documented codes and disambiguate all 7 `Call` records to their
+  real `dx.op.*` meaning (`CreateHandle`/`ThreadId`/`BufferLoad`/
+  `BufferStore`, with UAV bind points). `translate_dxil_vector_add_to_spirv`
+  (new) feeds that resolved output into `spirv_gen.rs`'s shared
+  `emit_spirv_for_kernel` (factored out of the DXBC path's `emit_spirv`
+  so both backends emit from one code path) to produce real SPIR-V,
+  which `tests/vector_add_dxil_real_vulkan.rs` dispatches on this
+  machine's real NVIDIA GT 730 via `opencuda-vulkan` and verifies
+  matches the CPU reference `a[i]+b[i]` for all 256 elements — the same
+  rigor as the DXBC `vector_add` test. **Known gap**: the SPIR-V
+  workgroup size (`64,1,1`) is hardcoded rather than extracted from
+  DXIL's `METADATA_BLOCK` (`dx.entryPoints`), since that metadata
+  decoding is out of scope so far — this is the one place the DXIL path
+  falls short of the DXBC path's "everything extracted, nothing
+  hardcoded" standard. Any other opcode/operand shape (different
+  operation, multiple basic blocks, bounds checks, different
+  `numthreads`) is still rejected, not mistranslated. D3D12 command
+  list/descriptor heap/root signature support (the layer above shader
+  translation) is untouched.
 - **D3D11 graphics pipeline: DXBC container parsing confirmed working
   for VS/PS, but no SPIR-V codegen, no rasterizer, no actual triangle
   drawn on screen.** The full pipeline (rasterizer, texture sampling,

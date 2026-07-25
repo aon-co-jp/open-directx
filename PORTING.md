@@ -210,12 +210,61 @@ counts, opcode constants, or operand shapes are rejected via
 `DxilCallResolutionError`, matching `SpirvGenError::UnsupportedShader`'s
 pattern.
 
-**Where this still stops, honestly**: there is **still no
-DXIL-to-SPIR-V translation of any kind** — `ResolvedDxilCall` values
-exist, but nothing yet consumes them to emit SPIR-V or dispatch on
-Vulkan. That is the next step, reusing `spirv_gen.rs`'s `emit_spirv`
-machinery where the target SPIR-V shape matches the DXBC `vector_add`
-case.
+### DXIL-to-SPIR-V translation + real hardware dispatch (added 2026-07-25, later same day)
+
+`spirv_gen.rs`'s `emit_spirv(shape: &ShaderShape)` body was renamed to
+`emit_spirv_impl` and factored into a shape-agnostic
+`pub(crate) fn emit_spirv_for_kernel(thread_group, uav_a, uav_b, uav_c,
+op: BinaryOp, bounds_check: bool) -> Vec<u32>`, so both the DXBC and
+DXIL backends emit SPIR-V from one shared code path (the DXBC-facing
+`emit_spirv` is now a thin wrapper; existing DXBC tests are unaffected).
+
+`dxil.rs`'s new `translate_dxil_vector_add_to_spirv(bytes) ->
+Result<TranslatedKernel, DxilSpirvError>` takes the 7 resolved
+`ResolvedDxilCall` values above and maps them onto that shared emitter:
+the first `BufferLoad`'s `handle_range_id` becomes buffer A, the
+second becomes B, and `BufferStore`'s `handle_range_id` becomes C
+(same "discovery order" convention as the DXBC side's `ld_uavs`). The
+operation is fixed to `BinaryOp::Add` with no bounds check, since that
+is what `vector_add_dxil.hlsl` is confirmed to produce.
+
+**Honest gap — workgroup size is hardcoded, not extracted.** DXBC's
+`dcl_thread_group` has no DXIL equivalent in what this project decodes
+so far; `numthreads` is actually encoded in DXIL's `METADATA_BLOCK`
+(`dx.entryPoints`), which is out of scope for this pass. Since the one
+supported byte sequence (`vector_add.dxil`, compiled from
+`vector_add_dxil.hlsl`'s `[numthreads(64,1,1)]`) is known, `(64,1,1)`
+is hardcoded — the one place the DXIL path departs from the DXBC path's
+"everything extracted from real parsed data, nothing hardcoded" rule.
+
+`tests/vector_add_dxil_real_vulkan.rs` mirrors
+`vector_add_real_vulkan.rs` exactly: parse real `vector_add.dxil` ->
+run the full DXIL decode pipeline -> `translate_dxil_vector_add_to_spirv`
+-> dispatch via `opencuda_vulkan::VulkanDevice` on real hardware ->
+compare against the CPU reference `a[i]+b[i]`. One integration wrinkle
+surfaced only at runtime: `VulkanDevice`'s `launch_kernel` dispatches
+by `CompiledKernel::name`, and only recognizes the literal string
+`"vector_add"` (not `"vector_add_dxil"`) — using the wrong name failed
+with `VulkanDevice v0.4.0 only implements vector_add/vector_add_f32 and
+matmul/matmul_f32; got \`vector_add_dxil\``, which is why the test
+passes `"vector_add"` as the kernel name despite the DXIL origin.
+
+Real output (NVIDIA GeForce GT 730, `cargo test --workspace`):
+
+```
+test dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware ... ok
+```
+with stdout `device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)` and
+`OK: DXIL(dxc.exe実コンパイル、SM6.0)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した`.
+All 5 real-hardware tests (4 DXBC + 1 DXIL) and 22 unit tests pass;
+`cargo build --workspace` / `cargo clippy --workspace --all-targets`
+are clean (0 warnings).
+
+**This reaches parity with the DXBC `vector_add` milestone, but only
+for this one known DXIL shader shape** — not a general SM6.0 decoder.
+Any operation other than `add`, more than one basic block, bounds
+checks, or a `numthreads` other than the hardcoded `(64,1,1)` is still
+honestly rejected, not mistranslated.
 
 ## D3D11 graphics pipeline (vertex/pixel shaders) — DXBC parsing only, added 2026-07-25
 
@@ -258,13 +307,14 @@ this pipeline stage.
   `SV_DispatchThreadID` indexing, a real dedicated `sub`/`div` opcode
   instead of negated-`add`, more than one bounds check, etc.) will be
   rejected by `decode_shader_shape`, not silently mistranslated.
-- **DXIL (SM6+) is parsed down to a resolved type table + a coarse
-  instruction list (see the dedicated section above, updated
-  2026-07-25) but no further — no `Call`-target name resolution, no
-  operand/relative-value decoding, no DXIL-to-SPIR-V translation.**
-  D3D12's higher-level layers (command lists, descriptor heaps, root
-  signatures) remain entirely unimplemented, Phase 3+ per `CLAUDE.md`'s
-  roadmap.
+- **DXIL (SM6+): the `vector_add.dxil` vertical slice is complete on
+  real hardware (see the dedicated section above, updated 2026-07-25),
+  but only for this one known shader shape — not a general SM6.0
+  decoder.** Its SPIR-V workgroup size is hardcoded rather than
+  extracted from `METADATA_BLOCK`; any other operation, basic-block
+  count, or bounds-check shape is rejected. D3D12's higher-level layers
+  (command lists, descriptor heaps, root signatures) remain entirely
+  unimplemented, Phase 3+ per `CLAUDE.md`'s roadmap.
 - **D3D11 graphics pipeline: DXBC container parsing for vertex/pixel
   shaders is confirmed working (see the dedicated section above, added
   2026-07-25), but there is no SPIR-V generation, rasterizer, texture

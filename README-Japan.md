@@ -17,6 +17,20 @@ Linux(将来的にAndroid/macOS)上で実際に動かすことを目指す。
 [`CLAUDE.md`](CLAUDE.md)を参照。このREADMEは現状の**検証済みの部分だけ**
 を要約する。
 
+## 現状(2026-07-25最新: DXIL垂直スライス、実機で完了)
+
+D3D12/DXILのCompute Shader垂直スライスが、D3D11/DXBC側と同じパリティに
+到達した: `vector_add.dxil`(実`dxc.exe -T cs_6_0`出力)をコンテナ→
+LLVM bitstream→型テーブル→命令列→7個の`Call`すべてを実際の`dx.op.*`
+意味へ解決、というところまで一気通貫でデコードし、実際のSPIR-Vへ翻訳
+(`directx_shader_translate::translate_dxil_vector_add_to_spirv`)、
+`tests/vector_add_dxil_real_vulkan.rs`がこのマシンの実NVIDIA GT 730上へ
+ディスパッチしてCPU参照実装`a[i]+b[i]`と数値一致することを検証した。
+依然として1つの既知シェーダー形状専用であり汎用SM6.0デコーダではない
+(特に、SPIR-Vのワークグループサイズは現状DXILメタデータから抽出せず
+決め打ちのまま——詳細は下記「未実装(正直な開示)」節を参照)。全文は
+`CLAUDE.md`の2026-07-25「続き7」HANDOFFエントリを参照。
+
 ## 現状(2026-07-25続き: DXILのbitstreamレベルパース + D3D11 VS/PSのDXBCパース)
 
 下記フェーズ1(Compute Shader垂直スライス)に加え、今回2つ着手した:
@@ -187,17 +201,24 @@ pwsh tools/compile-dxbc-shaders.ps1
   される(誤翻訳ではなく明示的なエラー)。真の汎用デコーダの実装
   (または既存実装、例えば`dxbc-spirv`/`dxil-spirv`のアプローチのより
   深い調査・移植)が引き続き本当の次のマイルストーン。
-- **DXIL(Shader Model 6+、D3D12)の解析・翻訳——7個の`Call`の意味解決
-  までは実装済み、DXIL→SPIR-V変換・実Vulkanディスパッチは未着手。**
-  `dxil.rs`の`resolve_type_table`/`decode_function_instructions`が、実
-  `vector_add.dxil`のTYPE_BLOCK/FUNCTION_BLOCKをLLVM公式のレコード
-  コード表に基づいて実際にデコードし、`resolve_vector_add_dxil_calls`
-  (新設)が`VALUE_SYMTAB_BLOCK`の関数名解決とLLVM相対値オペランドの
-  デコードにより7個の`Call`それぞれ(`CreateHandle`x3・`ThreadId`x1・
-  `BufferLoad`x2・`BufferStore`x1)とそのUAVバインドポイント
-  (`range_id`)を実際に特定する。**それでもSPIR-V変換に届かない**——
-  この解決結果を使って実際にSPIR-Vの`OpAccessChain`/`OpLoad`/`OpStore`
-  を組み立てる処理、および実Vulkanでの数値一致検証が次にやるべきこと。
+- **DXIL(Shader Model 6+、D3D12)——`vector_add.dxil`の垂直スライスは
+  実機で完了、ただし依然としてこの1シェーダー形状専用で汎用SM6.0デコーダ
+  ではない。** `dxil.rs`の`resolve_type_table`/`decode_function_instructions`/
+  `resolve_vector_add_dxil_calls`が実`vector_add.dxil`のTYPE_BLOCK/
+  FUNCTION_BLOCK/VALUE_SYMTAB_BLOCKをLLVM公式のレコードコード表に基づいて
+  デコードし、7個の`Call`すべてを実際の`dx.op.*`意味(`CreateHandle`/
+  `ThreadId`/`BufferLoad`/`BufferStore`とそのUAVバインドポイント)へ解決
+  する。新設の`translate_dxil_vector_add_to_spirv`がこの解決結果を
+  `spirv_gen.rs`の共有関数`emit_spirv_for_kernel`(DXBC側`emit_spirv`から
+  切り出した、両バックエンド共通のSPIR-V組み立てロジック)へ渡して実際に
+  SPIR-Vを生成し、`tests/vector_add_dxil_real_vulkan.rs`がこのマシンの
+  実NVIDIA GT 730へディスパッチしてCPU参照実装`a[i]+b[i]`と256要素すべて
+  で数値一致することを検証済み(DXBC側`vector_add`テストと同じ厳密さ)。
+  **既知の未解決点**: SPIR-Vのワークグループサイズ(`64,1,1`)はDXILの
+  `METADATA_BLOCK`(`dx.entryPoints`)から抽出せず決め打ちのままで、
+  DXBC側の「宣言命令からの実抽出、決め打ち無し」という原則からの唯一の
+  逸脱。add以外の演算・複数基本ブロック・境界チェック・異なる`numthreads`
+  等、他の形状は引き続き正直に拒否される(誤翻訳しない)。
 - フルグラフィックスパイプライン(ラスタライザ・テクスチャサンプラ・
   ブレンドステート)——それまでスコープ外。
 - PlayStationファミリー対応——法務・利用規約上の懸念から明示的に

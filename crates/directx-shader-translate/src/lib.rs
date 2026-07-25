@@ -22,7 +22,10 @@ use thiserror::Error;
 
 pub mod dxil;
 pub mod spirv_gen;
-pub use dxil::{parse_dxil_container, DxilModule, DxilParseError};
+pub use dxil::{
+    parse_dxil_container, translate_dxil_vector_add_to_spirv, DxilModule, DxilParseError,
+    DxilSpirvError,
+};
 pub use spirv_gen::{
     translate_shader, translate_vector_add_shader, BinaryOp, SpirvGenError, TranslatedKernel,
 };
