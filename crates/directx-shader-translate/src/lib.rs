@@ -20,7 +20,9 @@
 use dxbc::{scan_dxbc as dxbc_scan, ChunkData};
 use thiserror::Error;
 
+pub mod dxil;
 pub mod spirv_gen;
+pub use dxil::{parse_dxil_container, DxilModule, DxilParseError};
 pub use spirv_gen::{
     translate_shader, translate_vector_add_shader, BinaryOp, SpirvGenError, TranslatedKernel,
 };
@@ -125,5 +127,58 @@ mod tests {
     fn rejects_truncated_dxbc_header() {
         let truncated = &VECTOR_ADD_DXBC[..8];
         assert!(parse_dxbc(truncated).is_err(), "truncated container must fail to parse, not panic silently");
+    }
+
+    /// タスク2(D3D11グラフィックスパイプライン)着手分。
+    /// `shaders/triangle_vs.hlsl`を`fxc.exe /T vs_5_0 /E main`で実際に
+    /// コンパイルして得た本物のDXBCバイト列(頂点シェーダー)。
+    ///
+    /// **正直な開示**: `parse_dxbc`はDXBCコンテナ/チャンクの存在確認のみで、
+    /// Compute Shaderかグラフィックスシェーダーかを区別しない(区別する
+    /// 必要がない——コンテナ形式自体は共通)。ここで確認したいのは、
+    /// 既存のコンテナパーサーがVS/PSのDXBCにもそのまま使えること、および
+    /// `examples/dump_shex.rs`で実際にダンプしたSHEX命令列が、Compute
+    /// Shaderとは異なるオペコード集合(`dcl_input`/`dcl_output`/
+    /// `dcl_output_siv`(SV_POSITION)/`mov`等、`dcl_uav_structured`や
+    /// `ld_structured`/`store_structured`は一切出てこない)であることの
+    /// 記録。SPIR-Vへの変換(`spirv_gen`)はCompute Shader専用(3パターン)の
+    /// ままで、VS/PSには非対応(`translate_shader`に渡せば
+    /// `SpirvGenError::UnsupportedShader`で拒否される、意図した動作)。
+    const TRIANGLE_VS_DXBC: &[u8] = include_bytes!("../shaders/triangle_vs.dxbc");
+    const TRIANGLE_PS_DXBC: &[u8] = include_bytes!("../shaders/triangle_ps.dxbc");
+
+    #[test]
+    fn parses_real_fxc_compiled_vertex_shader_dxbc_container() {
+        let module = parse_dxbc(TRIANGLE_VS_DXBC).expect("real fxc-compiled vertex shader DXBC must parse");
+        assert!(module.has_input_signature, "vertex shader must have an ISGN chunk (POSITION/COLOR inputs)");
+        assert!(module.has_output_signature, "vertex shader must have an OSGN chunk (SV_POSITION/COLOR outputs)");
+        assert!(
+            module.instruction_count.unwrap_or(0) > 0,
+            "vertex shader SHEX chunk must decode to a non-empty instruction stream"
+        );
+    }
+
+    #[test]
+    fn parses_real_fxc_compiled_pixel_shader_dxbc_container() {
+        let module = parse_dxbc(TRIANGLE_PS_DXBC).expect("real fxc-compiled pixel shader DXBC must parse");
+        assert!(module.has_input_signature, "pixel shader must have an ISGN chunk (interpolated COLOR input)");
+        assert!(module.has_output_signature, "pixel shader must have an OSGN chunk (SV_TARGET output)");
+        assert!(
+            module.instruction_count.unwrap_or(0) > 0,
+            "pixel shader SHEX chunk must decode to a non-empty instruction stream"
+        );
+    }
+
+    #[test]
+    fn vertex_shader_spirv_translation_is_honestly_unimplemented_not_silently_wrong() {
+        // translate_shader は現状Compute Shaderの3パターン専用デコーダしか
+        // 持たないため、VS/PSを渡すと必ずUnsupportedShaderで拒否されることを
+        // 確認する(黙って的外れなSPIR-Vを生成しない、というCLAUDE.md方針の
+        // 継続的な保証)。
+        let result = translate_shader(TRIANGLE_VS_DXBC);
+        assert!(
+            result.is_err(),
+            "vertex shader SHEX opcodes (dcl_input/dcl_output_siv/mov) do not match any of the 3 compute-shader shapes, so translation must be honestly rejected"
+        );
     }
 }

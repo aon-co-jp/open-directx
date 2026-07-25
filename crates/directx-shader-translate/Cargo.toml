@@ -12,6 +12,13 @@ description = "DXBC (D3D9/10/11 shader bytecode) container parsing, as the front
 # (車輪の再発明を避ける、CLAUDE.md方針)。RDEF/ISGN/OSGN/SHEX等の
 # 標準チャンクをフルパースでき、fxc.exe出力での往復検証済み(2026-03公開、MIT)。
 dxbc = "0.1.0"
+# DXIL(SM6+, D3D12)の`DXIL`チャンク内に埋め込まれたLLVM bitcodeの、
+# コンテナ/ブロック/レコードレベル(意味解析なし)のパースに使う。
+# `dxbc`クレートは`DXIL`チャンクのヘッダ(ProgramVersion/BitcodeHeader)は
+# パースするが、その中身のbitcodeバイト列自体は不透明なまま保持するのみ
+# (`DxilData::bitcode`)——`llvm-bitcode`はその先、bitstream自体の
+# ブロック/レコード木を読む(LLVM IRの型・命令の意味までは解釈しない)。
+llvm-bitcode = "0.4.0"
 rspirv = "0.13.0"
 thiserror = "1"
 
