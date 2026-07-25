@@ -147,3 +147,39 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **DXIL(SM6+, D3D12)パースは未着手**(`dxbc`クレートが`DXIL`チャンクを不透明バイト列として保持するのみ)。
      - **実Vulkan実行・CPU参照実装との数値一致は未検証**(そもそもSPIR-Vが存在しないため検証しようがない)。
   - 次にすべきこと: (1) DXBCの`SHEX`命令列(`dxbc`クレートの`Program`/`Instruction`型)を実際に走査し、`vector_add.hlsl`程度の単純な命令列(バッファ読み込み2回+加算+書き込み)に対応する最小限のSPIR-Vモジュールを手書き生成するコードを書く(汎用命令セット全体を一度に狙わず、この1シェーダーが動くことをまず実証する)。(2) 生成したSPIR-Vバイト列を`opencuda_core::CompiledKernel::spirv`経由で`open-cuda`の実`VulkanDevice`(`../open-cuda/crates/opencuda-vulkan`をpath依存追加)へディスパッチし、CPU側の単純な加算結果と数値一致することを実機(このマシンのNVIDIA GT 730)で検証する——これができて初めて「フェーズ1垂直スライス達成」と報告できる。(3) 上記が動いてから、DXILパース(SM6+)・D3D11最小グラフィックスパイプラインへ進む(現時点ではまだ手を出さない)。
+
+- **2026-07-25(続き) フェーズ1垂直スライス達成: DXBC(SM5.0)->SPIR-V翻訳+実Vulkan(NVIDIA GT 730)ディスパッチ+CPU参照実装との数値一致を実機で確認**:
+  1. **実際のSHEX命令列を確認(ハードコード前提を排除)**: `vector_add.dxbc`(実fxc.exe出力)の`SHEX`チャンクを`dxbc`クレートで実際にデコードして中身を確認した。実際に出てくるオペコード列は`dcl_globalFlags` -> `dcl_uav_structured`(u0/u1/u2, stride=4) -> `dcl_input`(vThreadID) -> `dcl_temps`(1) -> `dcl_thread_group`(64,1,1) -> `ld_structured`(u0) -> `ld_structured`(u1) -> `add` -> `store_structured`(u2) -> `ret` という非常に狭い列だった。**Path A(狭いが実物のSM5.0デコーダ+実SPIR-Vコード生成)を選択**——このシェーダーが実際に使うオペコードだけを対象にした本物のデコーダが十分書ける規模だと確認できたため、Path B(既知シェーダーの手書きSPIR-V)へ逃げる必要はなかった。
+  2. **実装**: `crates/directx-shader-translate/src/spirv_gen.rs`新設。
+     - `decode_vector_add_shape(instructions: &[Instruction]) -> Result<VectorAddShape, SpirvGenError>`: 上記の狭いオペコード列を実際に1命令ずつ走査し、`dcl_uav_structured`/`ld_structured`/`store_structured`からUAVバインドポイント(u#の#)を、`dcl_thread_group`からスレッドグループサイズを抽出する。**1つでも想定外のオペコード・オペランド形状が混ざっていれば`SpirvGenError::UnsupportedShader`を返し処理を止める**(未対応命令を無視して"動いたふり"をしない)。
+     - `emit_spirv(shape: &VectorAddShape) -> Vec<u32>`: `rspirv::dr::Builder`(手書きバイナリ列の直接構築ではなく、車輪の再発明を避けてrspirvクレートを採用、CLAUDE.md方針通り)を使い、抽出した実データ(UAVバインドポイント・スレッドグループサイズ)を反映したSPIR-Vモジュールを組み立てる。レイアウトは`opencuda-vulkan`の`vector_add`契約(storage buffer 3本、set=0/binding=実バインドポイント、push constant `uint n`、entry point `"main"`)に合わせた。
+     - `translate_vector_add_shader(bytes: &[u8]) -> Result<TranslatedKernel, SpirvGenError>`(公開API): 上記2つを繋ぎ、`TranslatedKernel { spirv_words, entry_point, local_size, uav_bind_points }`を返す。
+     - **正直な開示**: これは汎用SM5.0デコーダではない。`vector_add.hlsl`が実際に生成する狭いオペコード列(上記10命令種)専用。他のシェーダーを渡せば(対応外オペコードに遭遇した時点で)確実にエラーになる——これはモジュールのdocコメントとエラーメッセージに明記済み。
+     - **境界チェック無し**: 実DXBCの命令列に比較・分岐命令が一切無かった(numthreads(64,1,1)×正確なグリッド数だけをディスパッチする前提)ため、生成したSPIR-Vにも境界チェックを入れていない。呼び出し側は`numthreads`の倍数でディスパッチする責任を負う(この点はテストのコメントにも明記)。
+  3. **`opencuda-vulkan`への実配線**: `crates/directx-shader-translate/tests/vector_add_real_vulkan.rs`新設。`Cargo.toml`に`[dev-dependencies]`として`opencuda-core`/`opencuda-vulkan`(`real-vulkan`フィーチャ)へのcross-repoパス依存を追加(`../../../open-cuda/crates/opencuda-vulkan`、aruaru-dbの`open_raid_z_core`/`rust-json`パス依存と同じパターン)。**open-cuda側のコード・テストは一切変更していない**(依存するのみ)。テストは`open-cuda`の`examples/vector_add_vulkan_real`と同じ実機テストパターン(実GPU/Vulkanドライバが無ければ`eprintln!`してスキップ、フェイク成功にしない)に従う。
+  4. **実際に`cargo test --workspace`で確認した結果(誇張なし、実出力そのまま、このマシンの実NVIDIA GT 730で実行)**:
+     ```
+     running 5 tests
+     test spirv_gen::tests::rejects_garbage_bytes_honestly_instead_of_pretending_to_translate ... ok
+     test tests::rejects_truncated_dxbc_header ... ok
+     test tests::rejects_garbage_bytes_that_are_not_a_dxbc_container ... ok
+     test tests::parses_real_fxc_compiled_vector_add_dxbc_container ... ok
+     test spirv_gen::tests::translates_real_fxc_compiled_vector_add_dxbc_to_valid_spirv ... ok
+
+     test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     running 1 test
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した
+     c[0]=128, c[255]=255.5
+     test dxbc_vector_add_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `dxbc_vector_add_matches_cpu_reference_on_real_vulkan_hardware`は、実fxc.exe出力のDXBCバイト列を実際にパース->実際にSPIR-V生成->実`VulkanDevice`(`ash`経由、`NVIDIA GeForce GT 730`)でディスパッチ->256要素すべてでCPU参照実装(`a[i]+b[i]`)と`1e-3`以内の一致を確認している。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
+  5. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **汎用SM5.0デコーダは無い**。今回実装したのは`vector_add.hlsl`が実際に生成する狭いオペコード列(10命令種)専用の変換器。異なるシェーダー(分岐・テクスチャサンプル・複数演算等を含むもの)を渡せば`SpirvGenError::UnsupportedShader`で拒否される(これは意図した動作であり、バグではない)。
+     - **DXIL(SM6+, D3D12)パースは未着手**。
+     - **境界チェック無し**——`numthreads`の倍数以外のNでディスパッチすると範囲外書き込みになりうる(現状のテストは256=64×4の倍数のみ検証)。
+     - **D3D11グラフィックスパイプライン(頂点/ピクセルシェーダー・ラスタライズ)は未着手**。
+  - 次にすべきこと: (1) 2つ目・3つ目の実DXBC Compute Shader(異なる演算・異なるUAV数・境界チェック付き等)を`fxc.exe`で実際にコンパイルし、`decode_vector_add_shape`相当のデコーダをそれらにも対応するよう一般化していく(1つの狭い専用デコーダから、実際に遭遇したオペコードを1つずつ追加していく漸進的なアプローチを継続する)。(2) DXILパース(SM6+, D3D12向け)に着手する。(3) この垂直スライスが安定してから、D3D11最小グラフィックスパイプラインへ進む。

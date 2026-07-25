@@ -20,6 +20,9 @@
 use dxbc::{scan_dxbc as dxbc_scan, ChunkData};
 use thiserror::Error;
 
+pub mod spirv_gen;
+pub use spirv_gen::{translate_vector_add_shader, SpirvGenError, TranslatedKernel};
+
 #[derive(Debug, Error)]
 pub enum TranslateError {
     #[error("DXBCコンテナの解析に失敗した: {0}")]

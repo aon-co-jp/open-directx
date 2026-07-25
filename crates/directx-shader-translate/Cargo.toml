@@ -12,6 +12,12 @@ description = "DXBC (D3D9/10/11 shader bytecode) container parsing, as the front
 # (車輪の再発明を避ける、CLAUDE.md方針)。RDEF/ISGN/OSGN/SHEX等の
 # 標準チャンクをフルパースでき、fxc.exe出力での往復検証済み(2026-03公開、MIT)。
 dxbc = "0.1.0"
+rspirv = "0.13.0"
 thiserror = "1"
 
 [dev-dependencies]
+# open-cudaへのcross-repo path依存(aruaru-dbのopen_raid_z_coreパターンに準拠)。
+# 実Vulkanディスパッチ検証テストでのみ使う(このクレート自体はopen-cudaに
+# 依存しない、ライブラリ本体はDXBC->SPIR-V翻訳のみを提供する)。
+opencuda-core = { path = "../../../open-cuda/crates/opencuda-core" }
+opencuda-vulkan = { path = "../../../open-cuda/crates/opencuda-vulkan", features = ["real-vulkan"] }
