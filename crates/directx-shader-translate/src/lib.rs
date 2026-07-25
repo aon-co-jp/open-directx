@@ -21,7 +21,9 @@ use dxbc::{scan_dxbc as dxbc_scan, ChunkData};
 use thiserror::Error;
 
 pub mod spirv_gen;
-pub use spirv_gen::{translate_vector_add_shader, SpirvGenError, TranslatedKernel};
+pub use spirv_gen::{
+    translate_shader, translate_vector_add_shader, BinaryOp, SpirvGenError, TranslatedKernel,
+};
 
 #[derive(Debug, Error)]
 pub enum TranslateError {

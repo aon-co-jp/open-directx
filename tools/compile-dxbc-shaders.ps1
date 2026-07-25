@@ -31,3 +31,7 @@ Write-Host "using fxc: $fxc"
 $shaderDir = Join-Path $root "crates\directx-shader-translate\shaders"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add.hlsl") /Fo (Join-Path $shaderDir "vector_add.dxbc") /nologo
 Write-Host "OK: compiled vector_add.hlsl -> vector_add.dxbc (DXBC, SM5.0)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_mul.hlsl") /Fo (Join-Path $shaderDir "vector_mul.dxbc") /nologo
+Write-Host "OK: compiled vector_mul.hlsl -> vector_mul.dxbc (DXBC, SM5.0)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_sub_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_sub_bounded.dxbc") /nologo
+Write-Host "OK: compiled vector_sub_bounded.hlsl -> vector_sub_bounded.dxbc (DXBC, SM5.0)"

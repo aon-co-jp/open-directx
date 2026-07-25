@@ -183,3 +183,58 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **境界チェック無し**——`numthreads`の倍数以外のNでディスパッチすると範囲外書き込みになりうる(現状のテストは256=64×4の倍数のみ検証)。
      - **D3D11グラフィックスパイプライン(頂点/ピクセルシェーダー・ラスタライズ)は未着手**。
   - 次にすべきこと: (1) 2つ目・3つ目の実DXBC Compute Shader(異なる演算・異なるUAV数・境界チェック付き等)を`fxc.exe`で実際にコンパイルし、`decode_vector_add_shape`相当のデコーダをそれらにも対応するよう一般化していく(1つの狭い専用デコーダから、実際に遭遇したオペコードを1つずつ追加していく漸進的なアプローチを継続する)。(2) DXILパース(SM6+, D3D12向け)に着手する。(3) この垂直スライスが安定してから、D3D11最小グラフィックスパイプラインへ進む。
+
+- **2026-07-25(続き2) デコーダを3シェーダー形状(add/mul/境界チェック付きsub)へ一般化、実Vulkanで3本とも数値一致確認**:
+  1. **新規シェーダー2本を実際に`fxc.exe /T cs_5_0 /E main`でコンパイル**(`tools/compile-dxbc-shaders.ps1`更新済み):
+     - `shaders/vector_mul.hlsl`: `vector_add.hlsl`と同じ契約(UAV3本、256要素)だが演算が乗算。
+     - `shaders/vector_sub_bounded.hlsl`: 定数バッファ(`cbuffer Params : register(b0) { uint ElementCount; }`)+`if (id.x < ElementCount)`境界チェック付きの減算。
+  2. **実SHEX命令列を`examples/dump_shex.rs`(今回新設した調査用ツール)で実際にダンプして確認**(思い込みでデコーダを書かない、CLAUDE.md方針):
+     - `vector_mul.dxbc`: `vector_add.dxbc`と全く同じ命令列で、`Opcode::Add`が`Opcode::Mul`に変わっているだけだった。
+     - `vector_sub_bounded.dxbc`: **重要な発見**——`a - b`はfxcによって専用の`sub`オペコードではなく`add dest, -b, a`(第1ソースオペランド`operands[1]`に`negate: true`が立った`add`)へ最適化されることが実機出力で判明した。加えて`dcl_constantbuffer`(b0, immediateIndexed)・`ult`(定数バッファとの比較)・`if`/`endif`が実際に出現した。
+  3. **`crates/directx-shader-translate/src/spirv_gen.rs`を一般化**: `decode_vector_add_shape`/`VectorAddShape`/`translate_vector_add_shader`を、共通骨格(`dcl_globalFlags` -> `dcl_constantbuffer`? -> `dcl_uav_structured`x3 -> `dcl_input` -> `dcl_temps` -> `dcl_thread_group` -> (`ult`+`if`)? -> `ld_structured`x2 -> (`add`|`mul`) -> `store_structured` -> `endif`? -> `ret`)を検証する`decode_shader_shape`/`ShaderShape`/`translate_shader`へ置き換えた。`BinaryOp::{Add,Mul,Sub}`を新設し、`add`命令の第1ソースオペランドの`negate`フラグでSubを検出する。`translate_vector_add_shader`は後方互換のため`translate_shader`への薄いエイリアスとして残した。**引き続き「対応している」という誤ったシグナルは出さない**——3パターンいずれにも一致しない命令・境界チェック構成が中途半端(定数バッファはあるのに`ult`/`if`/`endif`が揃っていない等)な場合は`SpirvGenError::UnsupportedShader`で拒否する。
+  4. **`emit_spirv`を拡張**: `BinaryOp`に応じて`OpFAdd`/`OpFMul`/`OpFSub`を選択。境界チェック付きの場合は、従来「宣言のみで未使用」だったpush constant(`uint n`)を実際に`OpULessThan`の比較へ使い、`OpSelectionMerge`+`OpBranchConditional`+then/mergeブロックという本物の制御フローをSPIR-Vへ生成する(見せかけのpush constantではなく、実際に分岐を左右する)。
+  5. **実Vulkanテストを2本追加**(`vector_add_real_vulkan.rs`と同じパターン): `tests/vector_mul_real_vulkan.rs`・`tests/vector_sub_bounded_real_vulkan.rs`。後者は320スレッドをディスパッチしつつpush constantの論理要素数を256に留め、256..320がセンチネル値(-1.0)のまま書き込まれないことをassertすることで、**境界チェックが実際に実行をゲートしていること**(単にコンパイルが通るだけでなく)を検証している。`opencuda-vulkan::VulkanDevice::launch_kernel`はカーネル名で引数配線を選ぶ実装(`"vector_add"`/`"matmul"`のみ認識)のため、mul/sub_boundedテストも引数レイアウトが同一な`"vector_add"`名を(コメントで理由を明記した上で)再利用している——実行される演算はSPIR-Vバイト列側で決まる。
+  6. **実際に`cargo test --workspace -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     running 7 tests
+     test spirv_gen::tests::rejects_garbage_bytes_honestly_instead_of_pretending_to_translate ... ok
+     test tests::rejects_garbage_bytes_that_are_not_a_dxbc_container ... ok
+     test tests::rejects_truncated_dxbc_header ... ok
+     test tests::parses_real_fxc_compiled_vector_add_dxbc_container ... ok
+     test spirv_gen::tests::translates_real_fxc_compiled_vector_mul_dxbc_to_valid_spirv ... ok
+     test spirv_gen::tests::translates_real_fxc_compiled_vector_add_dxbc_to_valid_spirv ... ok
+     test spirv_gen::tests::translates_real_fxc_compiled_vector_sub_bounded_dxbc_to_valid_spirv ... ok
+
+     test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     running 1 test
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した
+     c[0]=128, c[255]=255.5
+     test dxbc_vector_add_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+
+     running 1 test
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, mul)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]*b[i])と256要素すべてで数値一致した
+     c[0]=64, c[255]=6.625
+     test dxbc_vector_mul_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s
+
+     running 1 test
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, sub+境界チェック)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]-b[i])と有効範囲256要素すべてで数値一致し、境界外の64要素はセンチネル値のまま(書き込まれなかった)ことを確認した
+     c[0]=10, c[255]=137.5, c[319]=-1
+     test dxbc_vector_sub_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s
+     ```
+     `cargo clippy --workspace --all-targets`は警告0件(初回`needless_range_loop`警告1件を`iter().enumerate().skip()`へ書き換えて解消済み)。`cargo build --workspace`も警告0件。
+  7. **DXIL調査(時間の許す範囲、フェーズ0相当・コンテナレベルのみ、日英Web検索)**: LLVM公式ドキュメントに`DirectX Container`(`llvm.org/docs/DirectX/DXContainer.html`)・`Architecture and Design of DXIL Support in LLVM`(`.../DXILArchitecture.html`)というページが存在することを確認——DXILパートは`ProgramHeader`+`BitcodeHeader`+シリアライズされたLLVM 3.7 IRモジュールから成り、マジック値`0x4C495844`(`'DXIL'`)を持つ。これは以前(同日の初回調査時点)より新しい・より公式な情報源で、LLVM本体がDXILバックエンドのアーキテクチャを文書化し始めていることが分かった。Rust側では`llvm-bitcode`という汎用bitcodeパーサークレートがcrates.ioに存在することも確認(未使用・未検証、候補として記録するのみ)。**実装は一切行っていない**——`dxbc`クレートは引き続き`DXIL`チャンクを不透明バイト列として保持するのみ。
+  8. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **汎用SM5.0デコーダは依然として無い**。3パターン(add/mul/境界チェック付きnegated-add-as-sub)以外は`SpirvGenError::UnsupportedShader`で拒否される。真の`sub`オペコード(fxcが最適化しないケース)・`div`・`if`が複数ある形・elseブロック・ループ等は未対応。
+     - **DXILパースは今回も実装していない**(container形式の調査のみ、上記7参照)。
+     - **D3D11グラフィックスパイプラインは引き続き未着手**。
+  - 次にすべきこと: (1) 引き続き実DXBCシェーダーを1つずつ`fxc.exe`でコンパイルし遭遇したオペコードを追加していく(次候補: 実際の`div`オペコード、複数の一時レジスタを使う式、`else`分岐)。(2) DXILの実バイト列パースへ本格着手する場合は`llvm-bitcode`クレートの実際の検証(このワークスペースでの`cargo add`試験)から始める。(3) この垂直スライスの3シェーダーが安定してから、D3D11最小グラフィックスパイプラインへ進む。
