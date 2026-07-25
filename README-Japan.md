@@ -42,11 +42,18 @@ Linux(将来的にAndroid/macOS)上で実際に動かすことを目指す。
   レコードコード表を実`vector_add.dxil`に当てはめ、22個の型
   (`Float`・`StructNamed{"class.RWStructuredBuffer<float>"}`含む)と、
   実際の命令列(`DeclareBlocks -> Call`x5` -> ExtractValue -> Call ->
-  ExtractValue -> BinOp -> Call -> Ret`)を得た。**それでもDXIL→SPIR-V
-  変換は無い**——DXILは組み込み演算をすべて通常のLLVM`Call`として表現
-  するため、`VALUE_SYMTAB_BLOCK`(関数名解決)と相対値参照オペランドの
-  デコードが無い現状では7個の`Call`を区別できない(詳細は下記
-  「未実装」節)。
+  ExtractValue -> BinOp -> Call -> Ret`)を得た。**更新(2026-07-25続き6)**:
+  7個の`Call`すべてを実際に区別できるようになった。`resolve_vector_add_dxil_calls`
+  (新設)が`VALUE_SYMTAB_BLOCK`の関数名(`Record::fields()`ではなく
+  `take_payload()`側にあることを実際に確認)とLLVM相対値オペランド
+  エンコーディング(実バイト列に対して手計算で検証)を解決し、
+  `[CreateHandle{range_id:2}, CreateHandle{range_id:1},
+  CreateHandle{range_id:0}, ThreadId, BufferLoad{handle_range_id:0},
+  BufferLoad{handle_range_id:1}, BufferStore{handle_range_id:2}]`という
+  結果を得た。DXILオペコード番号(`CreateHandle`=57・`BufferLoad`=68・
+  `BufferStore`=69・`ThreadId`=93)はMicrosoft公式`DXIL.rst`をWeb検索して
+  確認し、実際の定数値とも一致した。**それでもDXIL→SPIR-V変換は無い**
+  ——これが次の増分の対象(詳細は下記「未実装」節)。
 - **D3D11グラフィックスパイプライン——DXBCパースのみ、SPIR-V無し。**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl`(最小のパス
   スルー頂点+ピクセルシェーダーの組、`POSITION`/`COLOR`入力→
@@ -180,16 +187,17 @@ pwsh tools/compile-dxbc-shaders.ps1
   される(誤翻訳ではなく明示的なエラー)。真の汎用デコーダの実装
   (または既存実装、例えば`dxbc-spirv`/`dxil-spirv`のアプローチのより
   深い調査・移植)が引き続き本当の次のマイルストーン。
-- **DXIL(Shader Model 6+、D3D12)の解析・翻訳——型テーブルと命令列の
-  大分類までは実装済み、DXIL→SPIR-V変換は未着手。** `dxil.rs`の
-  `resolve_type_table`/`decode_function_instructions`が、実
+- **DXIL(Shader Model 6+、D3D12)の解析・翻訳——7個の`Call`の意味解決
+  までは実装済み、DXIL→SPIR-V変換・実Vulkanディスパッチは未着手。**
+  `dxil.rs`の`resolve_type_table`/`decode_function_instructions`が、実
   `vector_add.dxil`のTYPE_BLOCK/FUNCTION_BLOCKをLLVM公式のレコード
-  コード表に基づいて実際にデコードする。**それでもSPIR-V変換に届かない
-  理由**: DXILは`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`を
-  全て通常のLLVM`Call`として表現するため、`VALUE_SYMTAB_BLOCK`
-  (関数名解決)とLLVM bitcodeの相対値参照オペランドのデコードが無い
-  現状では、どの`Call`がどの組み込みかを区別できず、UAVバインド
-  ポイントも取り出せない。次にやるべきことはこの2点。
+  コード表に基づいて実際にデコードし、`resolve_vector_add_dxil_calls`
+  (新設)が`VALUE_SYMTAB_BLOCK`の関数名解決とLLVM相対値オペランドの
+  デコードにより7個の`Call`それぞれ(`CreateHandle`x3・`ThreadId`x1・
+  `BufferLoad`x2・`BufferStore`x1)とそのUAVバインドポイント
+  (`range_id`)を実際に特定する。**それでもSPIR-V変換に届かない**——
+  この解決結果を使って実際にSPIR-Vの`OpAccessChain`/`OpLoad`/`OpStore`
+  を組み立てる処理、および実Vulkanでの数値一致検証が次にやるべきこと。
 - フルグラフィックスパイプライン(ラスタライザ・テクスチャサンプラ・
   ブレンドステート)——それまでスコープ外。
 - PlayStationファミリー対応——法務・利用規約上の懸念から明示的に

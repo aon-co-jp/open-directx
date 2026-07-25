@@ -47,12 +47,21 @@ vertical slice below:
   22-entry type table including `Float` and
   `StructNamed{"class.RWStructuredBuffer<float>"}`, and a real
   instruction sequence (`DeclareBlocks -> Call*5 -> ExtractValue -> Call
-  -> ExtractValue -> BinOp -> Call -> Ret`). **Still no DXIL-to-SPIR-V
-  translation** — DXIL routes every intrinsic op through an ordinary
-  LLVM `CALL`, so the 7 `Call` records are indistinguishable without
-  resolving `VALUE_SYMTAB_BLOCK` function names and the relative-value
-  operand encoding, neither of which is implemented yet. See "Not
-  implemented" below.
+  -> ExtractValue -> BinOp -> Call -> Ret`). **Update (2026-07-25,
+  continued 6)**: all 7 `Call` records are now disambiguated.
+  `resolve_vector_add_dxil_calls` resolves `VALUE_SYMTAB_BLOCK` function
+  names (found via `Record::take_payload()`, not `fields()` — a real gap
+  in the previous entry's understanding of the crate) and hand-decodes
+  LLVM's relative-value operand encoding (verified by hand against the
+  real bytes), giving `[CreateHandle{range_id:2}, CreateHandle{range_id:1},
+  CreateHandle{range_id:0}, ThreadId, BufferLoad{handle_range_id:0},
+  BufferLoad{handle_range_id:1}, BufferStore{handle_range_id:2}]`. DXIL
+  opcode numbers (`CreateHandle`=57, `BufferLoad`=68, `BufferStore`=69,
+  `ThreadId`=93) were confirmed via web search against Microsoft's
+  `DirectXShaderCompiler/docs/DXIL.rst`, not assumed from memory, and
+  matched the real decoded constants exactly. **Still no DXIL-to-SPIR-V
+  translation** — that's the next increment. See "Not implemented"
+  below.
 - **D3D11 graphics pipeline — DXBC parsing only, no SPIR-V.**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl` (minimal
   passthrough vertex+pixel shader pair, `POSITION`/`COLOR` in,
@@ -193,22 +202,20 @@ pwsh tools/compile-dxbc-shaders.ps1
   adopting/porting an existing one, e.g. studying `dxbc-spirv`/
   `dxil-spirv`'s approach more closely) remains the actual next
   milestone.
-- **DXIL (Shader Model 6+, D3D12): real bytes are now parsed down to a
-  resolved type table and a coarse instruction list — but no further.**
+- **DXIL (Shader Model 6+, D3D12): all 7 `Call` records in
+  `vector_add.dxil` are now disambiguated to real `dx.op.*` meaning, but
+  there is still no DXIL-to-SPIR-V translation.**
   `resolve_type_table`/`decode_function_instructions` in `dxil.rs`
   decode real `TYPE_BLOCK`/`FUNCTION_BLOCK` records against LLVM's
-  documented codes, and `decode_vector_add_dxil_shape` narrowly matches
-  the exact instruction shape `vector_add.dxil` produces. **Still no
-  DXIL-to-SPIR-V translation**: DXIL represents every intrinsic op
-  (`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`) as an ordinary
-  LLVM `Call`, and this code doesn't yet resolve `VALUE_SYMTAB_BLOCK`
-  function names or LLVM bitcode's relative-value operand encoding, so
-  it cannot tell which `Call` is which or recover UAV bind points. D3D12
-  command list/descriptor heap/root signature support (the layer above
-  shader translation) is untouched. Next step if this is picked up
-  again: read `VALUE_SYMTAB_BLOCK` to name-resolve `Call` targets, then
-  decode the relative-value operand encoding, before reusing
-  `spirv_gen.rs`'s `emit_spirv` for a DXIL-sourced `vector_add`.
+  documented codes; `resolve_vector_add_dxil_calls` (new) additionally
+  resolves `VALUE_SYMTAB_BLOCK` function names and hand-decodes LLVM's
+  relative-value operand encoding to identify which `Call` is
+  `CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore` and which UAV
+  bind point (`range_id`) each one touches. **Still no SPIR-V codegen or
+  Vulkan dispatch for the DXIL path** — that requires reusing/adapting
+  `spirv_gen.rs`'s `emit_spirv` to consume `ResolvedDxilCall` output,
+  which is the next step. D3D12 command list/descriptor heap/root
+  signature support (the layer above shader translation) is untouched.
 - **D3D11 graphics pipeline: DXBC container parsing confirmed working
   for VS/PS, but no SPIR-V codegen, no rasterizer, no actual triangle
   drawn on screen.** The full pipeline (rasterizer, texture sampling,

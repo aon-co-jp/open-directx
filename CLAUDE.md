@@ -310,3 +310,35 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **実Vulkanディスパッチ・CPU参照実装との数値一致検証は、DXIL側では未着手**(SPIR-Vが無いため検証しようがない、DXBC側の4シェーダーの検証範囲に変更は無い)。
      - D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま)。
   - 次にすべきこと: (1) `VALUE_SYMTAB_BLOCK`(id=14)を読んで関数名文字列を解決し、`Call`命令がどの`dx.op.*`組み込みか(`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`)を実際に区別できるようにする。(2) LLVM bitcodeの相対値参照デコード(`Call`/`BinOp`/`ExtractValue`のオペランドが指す値を解決する)に着手し、UAVバインドポイント(u0/u1/u2)を実際に取り出す。(3) (1)(2)ができたら、DXBC側の`emit_spirv`(`spirv_gen.rs`)を再利用してDXIL版`vector_add`のSPIR-Vを生成し、実Vulkan(NVIDIA GT 730)でCPU参照実装との数値一致を検証する(DXBC側と同じ「フェーズ1垂直スライス」達成を目指す)。(4) D3D11グラフィックスパイプライン(VS/PS)側も引き続き並行して検討可。
+
+- **2026-07-25(続き6) D3D12track: 7個のCall命令を`VALUE_SYMTAB_BLOCK`解決+LLVM相対値オペランドデコードで実際に全部disambiguate(SPIR-V生成にはまだ未到達、正直な区切り)**:
+  1. **`examples/dump_dxil.rs`をさらに拡張**(調査ツール、思い込みで実装しない方針の継続): `VALUE_SYMTAB_BLOCK`(id=14)のレコードを`Record::take_payload()`まで掘り下げてダンプするようにした。**重要な発見**: `llvm-bitcode`クレートの`Record::fields()`は`VST_CODE_ENTRY`の値ID(1個)しか返さず、実際の関数名文字列は`fields()`には乗らず`payload()`(`Payload::Char6String`)側にあることが実際のダンプで判明した(`fields()`だけを見ていた前回HANDOFFの記述はこの点で不十分だった)。実際にダンプした結果: 値ID0=`main`, 1=`dx.op.threadId.i32`, 2=`dx.op.createHandle`, 3=`dx.op.bufferLoad.f32`, 4=`dx.op.bufferStore.f32`(この5つがモジュール内の全関数、宣言順=値ID順)。同様にモジュールレベル/関数ローカル両方の`CONSTANTS_BLOCK`(id=11)の生レコードも実際にダンプして確認した。
+  2. **DXILオペコード番号をWeb検索で実際に確認**(記憶に頼らない、CLAUDE.md方針): Microsoft `DirectXShaderCompiler/docs/DXIL.rst`・LLVM `DXILOpBuilder`関連ドキュメントを検索し、`CreateHandle`=57・`BufferLoad`=68・`BufferStore`=69・`ThreadId`=93であることを確認した。実際に関数ローカル`CONSTANTS_BLOCK`から得た整数定数(符号付きVBRデコード後: 57, 68, 93, 69)とも完全に一致した。LLVM `CST_CODE_SETTYPE`=1/`CST_CODE_NULL`=2/`CST_CODE_UNDEF`=3/`CST_CODE_INTEGER`=4という定数コード表もLLVM公式`LLVMBitCodes.h`をWeb検索で確認した上で採用した。
+  3. **LLVM相対値オペランド算術を実バイト列に対して手計算で検証**: グローバル値番号付け順序(関数宣言5個(値0-4) -> モジュールレベル定数(`SETTYPE`は値を消費しない、実際に値を消費するのは`NULL`/`UNDEF`/`INTEGER`のみ、値5-15) -> 関数ローカル定数(値16-21))を実際に組み立て、7個の`Call`・2個の`ExtractValue`・1個の`BinOp`の生フィールド列を「`current_value_no`(その時点までに定義済みの値の総数、これから追加するこの命令自身の結果は含まない) - フィールド値 = 絶対値ID」という規約で1つずつ手計算し、以下の対応が実際に導けることを確認した:
+     - `Call`1つ目(基本ブロック内の3番目の要素): `CreateHandle(range_id=2)` — 引数はopcode=57(検証済み)・resourceClass=1(UAV)・range_id=2・index=2・nonUniform=false。
+     - `Call`2つ目: `CreateHandle(range_id=1)`。
+     - `Call`3つ目: `CreateHandle(range_id=0)`。
+     - `Call`4つ目: `ThreadId`(component=0)。
+     - `Call`5つ目: `BufferLoad`、ハンドル引数が`CreateHandle(range_id=0)`の結果を指す(=u0からの読み出し)、座標引数が`ThreadId`の結果を指す。
+     - `ExtractValue`(1つ目): 直前の`BufferLoad`(u0)の集約値から`.x`を取り出す。
+     - `Call`6つ目: `BufferLoad`、ハンドルが`CreateHandle(range_id=1)`の結果(=u1からの読み出し)。
+     - `ExtractValue`(2つ目): u1側`BufferLoad`の集約値から`.x`。
+     - `BinOp`: 上記2つの`ExtractValue`結果を加算(`fadd`、フラグ`31`=高速数学フラグ全部)。
+     - `Call`7つ目: `BufferStore`、ハンドルが`CreateHandle(range_id=2)`の結果(=u2への書き込み)、座標が`ThreadId`の結果、値引数が`BinOp`の結果、マスク=1(x成分のみ書き込み)。
+     この手計算トレースは`range_id`の値(2,1,0という宣言順とは逆の並び)まで含めてこのHANDOFFに転記済み(コード側のコメントにも同内容を記載)。
+  4. **実装**: `crates/directx-shader-translate/src/dxil.rs`に`resolve_vector_add_dxil_calls(bytes) -> Result<Vec<ResolvedDxilCall>, DxilCallResolutionError>`を新設。内部で`DxilValue`(意味解決した値、`Function`/`ConstantInt`/`ConstantZero`/`ConstantUndef`/`CreateHandleResult`/`ThreadIdResult`/`BufferLoadAggregate`/`ExtractedBufferValue`/`BinOpResult`/`Other`)・`resolve_relative`(上記の相対値算術)・`decode_signed_vbr`(LLVMの符号付きVBR規約)・`resolve_module_function_names`(`VALUE_SYMTAB_BLOCK`解決)・`decode_constants_block`(`CONSTANTS_BLOCK`の値消費レコードのみを値リストへ積む)を実装し、`ResolvedDxilCall::{CreateHandle{range_id}, ThreadId, BufferLoad{handle_range_id}, BufferStore{handle_range_id}}`という列挙で7個の`Call`の意味を返す。想定と一致しない場合(未知の呼び出し先・引数数不一致・オペコード不一致・ハンドルが`CreateHandle`由来でない・格納値が`BinOp`結果でない等)は`DxilCallResolutionError`の各バリアントで正直に拒否する(`SpirvGenError::UnsupportedShader`/`DxilShapeError`と同じ設計方針、他の8種のCall/BinOp/ExtractValueパターンは一切対応しない、狭いが実物)。
+  5. **正直な開示(このセクションのスコープ)**: 汎用LLVM値番号付け/相対値デコーダではない。`vector_add_dxil.hlsl`が実際に生成する狭い形状(関数1個・基本ブロック1個、`CreateHandle`x3+`ThreadId`x1+`BufferLoad`x2+`BufferStore`x1)専用。`dx.op.bufferStore.f32`はvoidを返すためLLVMが値番号を割り当てない、という前提はLLVM `BitcodeReader`のドキュメント化された規約に基づく判断であり、このシェーダーの命令列内では(直後が`Ret`のみで何もこの値を参照しないため)実バイト列だけからは検証しきれていない点も正直に記す。
+  6. **テスト(実際に`cargo test --workspace`で確認、誇張なし)**:
+     ```
+     running 22 tests
+     test dxil::tests::resolves_all_seven_calls_in_real_vector_add_dxil_to_their_real_dx_op_meaning ... ok
+     test dxil::tests::resolve_relative_computes_absolute_index_from_current_value_count ... ok
+     test dxil::tests::decode_signed_vbr_matches_llvm_sign_bit_convention ... ok
+     (既存19件含め) test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `resolves_all_seven_calls_in_real_vector_add_dxil_to_their_real_dx_op_meaning`は実`vector_add.dxil`から`[CreateHandle{2}, CreateHandle{1}, CreateHandle{0}, ThreadId, BufferLoad{0}, BufferLoad{1}, BufferStore{2}]`という、上記の手計算トレースと完全に一致する結果が得られることを検証する(ロジック単体のテストではなく実バイト列パイプライン経由)。ワークスペース全体で26テスト全green(実Vulkanディスパッチ4本含む、DXBC側4シェーダーの検証範囲に変更なし)。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
+  7. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **DXIL→SPIR-V変換は依然として存在しない**。今回やったのは7個の`Call`の意味解決までで、これらの情報(どのハンドルがどのUAVバインドポイントか・スレッドID取得方法・加算対象)を使って実際にSPIR-Vの`OpAccessChain`/`OpLoad`/`OpStore`を組み立てる処理は書いていない。タスク指示の「narrow but real」方針通り、ここを正直な区切りとする(SPIR-V生成・実Vulkanディスパッチはこの増分のスコープ外、次回増分の対象)。
+     - `range_id`(2,1,0)が実際のDXBC側`u#`バインドポイント番号と1対1対応するという前提は、DXBC側の`dcl_uav_structured`のバインドポイント抽出ロジックと同じ発想だが、DXIL側で`range_id`が常にレジスタ番号と一致するかどうかの一般則までは検証していない(このシェーダー1本での実測に基づく)。
+     - D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: (1) 今回解決した7個のCallの意味(`ResolvedDxilCall`)を使い、DXBC側`spirv_gen.rs`の`emit_spirv`同等のSPIR-V生成処理をDXIL版`vector_add`向けに実装し、実Vulkan(NVIDIA GT 730)でCPU参照実装との数値一致を検証する(DXBC側と同じ「フェーズ1垂直スライス」達成が次の目標)。(2) D3D11グラフィックスパイプライン(VS/PS)側も引き続き並行して検討可。(3) 余裕があれば2つ目のDXILシェーダー(mul/sub/div等)を`dxc.exe`で実際にコンパイルし、`resolve_vector_add_dxil_calls`を一般化する土台を作る(DXBC側で採用した「1つずつ実バイト列を確認して対応を広げる」漸進的アプローチを継続)。

@@ -49,7 +49,7 @@ fn main() {
                             // TYPE_BLOCK_ID_NEW(17) と FUNCTION_BLOCK(12) は
                             // 今回の翻訳作業で実際に必要な中身なので、レコード単位
                             // (code + fields値そのもの)まで掘り下げてダンプする。
-                            if sub.id == 17 || sub.id == 12 {
+                            if sub.id == 17 || sub.id == 12 || sub.id == 11 {
                                 for (idx, deeper) in sub.elements.iter().enumerate() {
                                     if let Some(rec) = deeper.as_record() {
                                         println!(
@@ -65,11 +65,40 @@ fn main() {
                                             deeper_block.id,
                                             deeper_block.elements.len()
                                         );
+                                        if deeper_block.id == 11 {
+                                            for (jdx, deepest) in deeper_block.elements.iter().enumerate() {
+                                                if let Some(rec) = deepest.as_record() {
+                                                    println!(
+                                                        "        [{}] const record code={} fields={:?}",
+                                                        jdx,
+                                                        rec.id,
+                                                        rec.fields()
+                                                    );
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
                         } else if let Some(rec) = inner.as_record() {
-                            println!("    record id={} fields={}", rec.id, rec.fields().len());
+                            println!("    record id={} fields={:?}", rec.id, rec.fields());
+                        }
+                        if let Some(sub) = inner.as_block() {
+                            if sub.id == 14 {
+                                let mut sub_clone = sub.clone();
+                                for (idx, deeper) in sub_clone.elements.iter_mut().enumerate() {
+                                    if let Some(rec) = deeper.as_record_mut() {
+                                        let payload = rec.take_payload();
+                                        println!(
+                                            "      [{}] VST record code={} fields={:?} payload={:?}",
+                                            idx,
+                                            rec.id,
+                                            rec.fields(),
+                                            payload
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -78,5 +107,15 @@ fn main() {
         Err(e) => {
             println!("llvm-bitcode: FAILED to parse: {:?}", e);
         }
+    }
+
+    let module = directx_shader_translate::dxil::parse_dxil_container(&bytes).unwrap();
+    let _ = module;
+    let bc2 = Bitcode::new(&dxil_chunk.bitcode).unwrap();
+    let module_block = bc2.elements.iter().find_map(|el| el.as_block()).unwrap();
+    let type_block = module_block.elements.iter().filter_map(|el| el.as_block()).find(|b| b.id == 17).unwrap();
+    let types = directx_shader_translate::dxil::resolve_type_table(type_block);
+    for (idx, ty) in types.iter().enumerate() {
+        println!("type[{idx}] = {ty:?}");
     }
 }

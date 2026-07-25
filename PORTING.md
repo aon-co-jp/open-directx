@@ -176,20 +176,46 @@ block, exactly one `BinOp`, at least one trailing `Call` after it, ends
 in `Ret`) and honestly rejects anything else via `DxilShapeError`,
 mirroring `SpirvGenError::UnsupportedShader` on the DXBC side.
 
-**Where this still stops, honestly**: DXIL represents every intrinsic
-op (`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`) as an
-ordinary LLVM `CALL` to a `dx.op.*` function, so all 7 real `Call`
-records in `vector_add.dxil` are indistinguishable from each other in
-this code — `VALUE_SYMTAB_BLOCK` (function-name resolution) is not read
-yet, and LLVM bitcode's relative-value-reference operand encoding is
-not decoded, so no UAV bind point can be recovered from a `Call`'s
-`fields`. Without that, there is **still no DXIL-to-SPIR-V translation
-of any kind** — the type table and instruction list exist, but nothing
-consumes them to emit SPIR-V. If this is picked up again, the natural
-next step is reading `VALUE_SYMTAB_BLOCK` to name-resolve the `Call`
-targets, then decoding the relative-value operand encoding to recover
-actual UAV bindings, before attempting to reuse `spirv_gen.rs`'s
-`emit_spirv` for a DXIL-sourced `vector_add`.
+**Update (2026-07-25, continued 6): all 7 `Call` records are now
+disambiguated.** DXIL represents every intrinsic op
+(`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`) as an ordinary
+LLVM `CALL` to a `dx.op.*` function; `resolve_vector_add_dxil_calls` in
+`dxil.rs` resolves this by:
+1. Reading `VALUE_SYMTAB_BLOCK` (id=14) — found that `llvm-bitcode`'s
+   `Record::fields()` only returns the value ID for `VST_CODE_ENTRY`
+   records; the actual name string is in `Record::take_payload()`
+   (`Payload::Char6String`), confirmed by extending `examples/dump_dxil.rs`
+   to dump it. Real result: value IDs 0-4 map to `main`,
+   `dx.op.threadId.i32`, `dx.op.createHandle`, `dx.op.bufferLoad.f32`,
+   `dx.op.bufferStore.f32`.
+2. Hand-decoding LLVM's relative-value operand encoding (operand field
+   = `current_value_no - relative`, where `current_value_no` is the
+   count of values defined so far, not including this instruction's own
+   result) — verified by manual arithmetic against the real byte
+   sequence (global value numbering: 5 function decls -> module-level
+   constants, skipping value-free `CST_CODE_SETTYPE` -> function-local
+   constants).
+3. DXIL opcode numbers (`CreateHandle`=57, `BufferLoad`=68,
+   `BufferStore`=69, `ThreadId`=93) confirmed via web search against
+   Microsoft's `DirectXShaderCompiler/docs/DXIL.rst`, and cross-checked
+   against the real decoded constant values (all matched).
+
+Result for `vector_add.dxil`: `[CreateHandle{range_id:2},
+CreateHandle{range_id:1}, CreateHandle{range_id:0}, ThreadId,
+BufferLoad{handle_range_id:0}, BufferLoad{handle_range_id:1},
+BufferStore{handle_range_id:2}]` — i.e. the first `BufferLoad` reads
+u0, the second reads u1, and the `BufferStore` writes u2, exactly
+mirroring the DXBC side's `vector_add` shape. Unexpected callees, arg
+counts, opcode constants, or operand shapes are rejected via
+`DxilCallResolutionError`, matching `SpirvGenError::UnsupportedShader`'s
+pattern.
+
+**Where this still stops, honestly**: there is **still no
+DXIL-to-SPIR-V translation of any kind** — `ResolvedDxilCall` values
+exist, but nothing yet consumes them to emit SPIR-V or dispatch on
+Vulkan. That is the next step, reusing `spirv_gen.rs`'s `emit_spirv`
+machinery where the target SPIR-V shape matches the DXBC `vector_add`
+case.
 
 ## D3D11 graphics pipeline (vertex/pixel shaders) — DXBC parsing only, added 2026-07-25
 

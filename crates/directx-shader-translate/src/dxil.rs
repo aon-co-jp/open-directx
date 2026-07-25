@@ -428,6 +428,393 @@ pub fn decode_vector_add_dxil(bytes: &[u8]) -> Result<DxilVectorAddShape, String
     decode_vector_add_dxil_shape(&types, &instructions).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------
+// ここから先(Call命令の意味解決: VALUE_SYMTAB_BLOCK + 相対値オペランド
+// デコード)は今回新規に追加した部分。前セクション(型テーブル/命令列の
+// 「大分類」)の続きで、7個の`Call`命令それぞれが実際にどの`dx.op.*`
+// 組み込みかを実バイト列から解決する。
+// ---------------------------------------------------------------------
+//
+// **調査で確認した前提**(推測ではなく実際に検証した内容):
+// - `llvm-bitcode`クレートは`VALUE_SYMTAB_BLOCK`のレコードから名前文字列を
+//   自動では取り出さない。`Record::fields()`は値ID(1個)しか返さず、実際の
+//   名前は`Record::take_payload()`(`Payload::Char6String`等)側に載っている
+//   ことを、実際に`examples/dump_dxil.rs`を拡張してダンプして確認した
+//   (`resolve_module_function_names`はこの実測に基づく)。
+// - LLVM bitcode(このDXILが使うバージョン)の命令オペランドは「相対値
+//   参照」方式(オペランドのフィールド値は、現在までに定義された値の総数
+//   〈`values.len()`、これから追加されるこの命令自身の結果は含まない〉から
+//   の差分)であることを、`vector_add.dxil`の実バイト列に対して手計算で
+//   検証した(以下`resolve_relative`のコメント参照、この検証はLLVM公式
+//   `BitcodeReader`のドキュメント化された規約と一致する)。
+// - グローバル値の番号付け順序(関数宣言5個 -> モジュールレベル定数
+//   〈`SETTYPE`は値を消費しない〉 -> 関数ローカル定数)も、実際に
+//   `examples/dump_dxil.rs`でモジュールレベル/関数ローカル両方の
+//   `CONSTANTS_BLOCK`をダンプして確認した上で実装している。
+// - DXILオペコード番号(`CreateHandle`=57, `BufferLoad`=68, `BufferStore`=69,
+//   `ThreadId`=93)は、Web検索でMicrosoft `DirectXShaderCompiler/docs/DXIL.rst`
+//   および LLVM `DXILOpBuilder`関連資料を確認した上で採用した(記憶に頼って
+//   いない)。実際にこのシェーダーの定数プールから得た値ともすべて一致した。
+//
+// **正直な開示(このセクションのスコープ)**: 汎用LLVM値番号付けデコーダ
+// ではない。`vector_add_dxil.hlsl`が実際に生成する狭い形状専用
+// (関数1個・基本ブロック1個・`CreateHandle`x3+`ThreadId`x1+`BufferLoad`x2+
+// `BufferStore`x1という7回の`Call`、`BinOp`は`fadd`1回のみ)。この形状と
+// 一致しない場合は`DxilCallResolutionError`で正直に拒否する
+// (`SpirvGenError::UnsupportedShader`/`DxilShapeError`と同じ設計方針)。
+
+use llvm_bitcode::bitcode::Payload;
+use std::collections::HashMap;
+
+/// グローバル/ローカルな「値」を、意味解決した範囲でだけ表現する。
+/// 生のLLVM値番号付けを完全に再現するわけではなく、このシェーダーの
+/// 命令列を解釈するのに必要な種類だけを区別する。
+#[derive(Debug, Clone, PartialEq)]
+enum DxilValue {
+    /// 宣言された関数(`dx.op.*`組み込みまたは`main`自身)。
+    Function { name: Option<String> },
+    /// 符号付き整数定数(`CST_CODE_INTEGER`、LLVMの符号ビットデコード済み)。
+    ConstantInt { value: i64 },
+    /// `CST_CODE_NULL`(現在の型のゼロ値)。
+    ConstantZero,
+    /// `CST_CODE_UNDEF`。
+    ConstantUndef,
+    /// `CreateHandle`呼び出しの戻り値(リソースハンドル)。`range_id`は
+    /// 実際に解決したレンジID定数(u#のバインドポイントに対応する想定)。
+    CreateHandleResult { range_id: i64 },
+    /// `ThreadId`呼び出しの戻り値。
+    ThreadIdResult,
+    /// `BufferLoad`呼び出しの戻り値(集約値、`ExtractValue`で`.x`を取り出す
+    /// 前段)。`source_range_id`は読み出し元ハンドルの`range_id`。
+    BufferLoadAggregate { source_range_id: i64 },
+    /// `BufferLoad`の集約値から`ExtractValue`で取り出した実際のfloat値。
+    ExtractedBufferValue { source_range_id: i64 },
+    /// `BinOp`(このシェーダーでは`fadd`のみ想定)の結果。
+    BinOpResult,
+    /// 上記以外(意味解決していない値、もしくは型設定専用レコード等)。
+    Other,
+}
+
+/// LLVM `CST_CODE_INTEGER`の符号付きVBRエンコーディングをデコードする
+/// (`llvm-bitcode`クレートの`RecordIter::i64()`と同じ規約、`fields()`は
+/// このデコード前の生の値をそのまま返すため、ここで自前デコードする)。
+fn decode_signed_vbr(raw: u64) -> i64 {
+    if raw & 1 == 0 {
+        (raw >> 1) as i64
+    } else if raw != 1 {
+        -((raw >> 1) as i64)
+    } else {
+        i64::MIN
+    }
+}
+
+/// 相対値参照を解決する。LLVM bitcode(このDXILが使うバージョン)の
+/// 命令オペランドは、「これまでに定義された値の総数(`current_value_no`、
+/// これから追加されるこの命令自身の結果は含まない)からの差分」として
+/// エンコードされている——`vector_add.dxil`の実バイト列に対して手計算で
+/// 検証済み(このモジュールのdocコメント参照)。
+fn resolve_relative(values: &[DxilValue], current_value_no: usize, relative: u64) -> Option<&DxilValue> {
+    let relative = relative as usize;
+    if relative == 0 || relative > current_value_no {
+        return None;
+    }
+    values.get(current_value_no - relative)
+}
+
+/// `VALUE_SYMTAB_BLOCK`(id=14、`MODULE_BLOCK`直下)を実際に読み、
+/// `VST_CODE_ENTRY`(code=1)レコードの`fields()[0]`(値ID)と
+/// `take_payload()`(名前文字列)から「値ID -> 関数名」の対応を得る。
+fn resolve_module_function_names(module_block: &Block) -> HashMap<u64, String> {
+    let mut names = HashMap::new();
+    let Some(vst) = module_block.elements.iter().filter_map(|el| el.as_block()).find(|b| b.id == 14) else {
+        return names;
+    };
+    let mut vst_clone = vst.clone();
+    for el in &mut vst_clone.elements {
+        let Some(rec) = el.as_record_mut() else { continue };
+        if rec.id != 1 {
+            continue;
+        }
+        let Some(&value_id) = rec.fields().first() else { continue };
+        let Some(payload) = rec.take_payload() else { continue };
+        let name = match payload {
+            Payload::Char6String(s) => s,
+            Payload::Blob(b) => String::from_utf8_lossy(&b).to_string(),
+            Payload::Array(chars) => chars.iter().filter_map(|&c| u8::try_from(c).ok()).map(|b| b as char).collect(),
+        };
+        names.insert(value_id, name);
+    }
+    names
+}
+
+/// `MODULE_BLOCK`直下の`MODULE_CODE_FUNCTION`(record id=8)を実際に数え、
+/// 関数宣言の個数(=グローバル値番号付けの先頭を占める値の数)を得る。
+fn count_module_functions(module_block: &Block) -> usize {
+    module_block.elements.iter().filter(|el| el.as_record().is_some_and(|r| r.id == 8)).count()
+}
+
+/// `CONSTANTS_BLOCK`(id=11)の中身を、実際に値を消費するレコード
+/// (`CST_CODE_NULL`/`CST_CODE_UNDEF`/`CST_CODE_INTEGER`)だけ`values`へ
+/// 追加する。`CST_CODE_SETTYPE`(id=1)は後続レコードの型を切り替えるだけで
+/// 値を消費しない(LLVM公式の規約通り、実バイト列でも整合性を確認済み)。
+fn decode_constants_block(block: &Block, values: &mut Vec<DxilValue>) {
+    for el in &block.elements {
+        let Some(rec) = el.as_record() else { continue };
+        match rec.id {
+            1 => { /* CST_CODE_SETTYPE: 値を消費しない */ }
+            2 => values.push(DxilValue::ConstantZero),
+            3 => values.push(DxilValue::ConstantUndef),
+            4 => {
+                let raw = rec.fields().first().copied().unwrap_or(0);
+                values.push(DxilValue::ConstantInt { value: decode_signed_vbr(raw) });
+            }
+            _ => values.push(DxilValue::Other),
+        }
+    }
+}
+
+/// 実際に解決した、1回の`Call`命令の意味。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedDxilCall {
+    /// `dx.op.createHandle`。`range_id`はDXBC側の`u#`バインドポイントに
+    /// 対応する想定のレンジID定数。
+    CreateHandle { range_id: i64 },
+    /// `dx.op.threadId.i32`。
+    ThreadId,
+    /// `dx.op.bufferLoad.f32`。`handle_range_id`は読み出し元ハンドルを
+    /// 生成した`CreateHandle`呼び出しの`range_id`。
+    BufferLoad { handle_range_id: i64 },
+    /// `dx.op.bufferStore.f32`。`handle_range_id`は書き込み先ハンドルを
+    /// 生成した`CreateHandle`呼び出しの`range_id`。
+    BufferStore { handle_range_id: i64 },
+}
+
+/// この解決処理が正直に拒否する、未対応の形状。
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DxilCallResolutionError {
+    #[error("MODULE_BLOCKまたはFUNCTION_BLOCK/TYPE_BLOCKが見つからない: {0}")]
+    MissingBlock(String),
+    #[error("未知の呼び出し先関数(dx.op.*として認識できない): {0:?}")]
+    UnknownCallee(Option<String>),
+    #[error("Call命令の引数の個数が想定と一致しない(関数={0}, 実際の引数数={1})")]
+    UnexpectedArgCount(String, usize),
+    #[error("dx.op呼び出しの第1引数(オペコード定数)が想定値と一致しない(関数={0}, 期待={1}, 実際={2:?})")]
+    OpcodeMismatch(String, i64, Option<i64>),
+    #[error("BufferLoad/BufferStoreのハンドル引数がCreateHandleの結果を指していない")]
+    HandleNotFromCreateHandle,
+    #[error("BufferStoreの書き込み値がBinOp(加算)の結果を指していない")]
+    StoredValueNotBinOpResult,
+    #[error("ExtractValueの対象がBufferLoadの集約値ではない")]
+    ExtractValueNotFromBufferLoad,
+    #[error("想定した命令列形状と一致しない: {0}")]
+    UnexpectedShape(String),
+}
+
+/// [`DxilModule`]と同じ実バイト列(`vector_add.dxil`)から、7個の`Call`命令
+/// それぞれの意味を実際に解決する。`decode_vector_add_dxil_shape`が確認する
+/// 「大分類」(Call/ExtractValue/BinOp/Retの並び)を前提に、その`Call`が
+/// 実際にどの`dx.op.*`組み込みかを、`VALUE_SYMTAB_BLOCK`の関数名解決と
+/// LLVM相対値オペランドのデコードによって突き止める。
+pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCall>, DxilCallResolutionError> {
+    let containers = dxbc::scan_dxbc(bytes);
+    let container = containers.into_iter().next().ok_or_else(|| DxilCallResolutionError::MissingBlock("DXBC container".to_string()))?;
+    let dxil_chunk = container
+        .chunks
+        .iter()
+        .find_map(|c| match c.parse() {
+            ChunkData::Dxil(d) => Some(d),
+            _ => None,
+        })
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("DXIL chunk".to_string()))?;
+    let bc = Bitcode::new(&dxil_chunk.bitcode).map_err(|e| DxilCallResolutionError::MissingBlock(format!("bitcode: {e:?}")))?;
+    let module_block = bc
+        .elements
+        .iter()
+        .find_map(|el| el.as_block())
+        .filter(|b| b.id == 8)
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("MODULE_BLOCK".to_string()))?;
+    let function_block = module_block
+        .elements
+        .iter()
+        .filter_map(|el| el.as_block())
+        .find(|b| b.id == 12)
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("FUNCTION_BLOCK".to_string()))?;
+    let module_constants_block = module_block.elements.iter().filter_map(|el| el.as_block()).find(|b| b.id == 11);
+
+    let function_names = resolve_module_function_names(module_block);
+    let num_functions = count_module_functions(module_block);
+
+    // グローバル値番号付け: 関数宣言(0..num_functions) -> モジュールレベル定数。
+    let mut values: Vec<DxilValue> = (0..num_functions)
+        .map(|id| DxilValue::Function { name: function_names.get(&(id as u64)).cloned() })
+        .collect();
+    if let Some(block) = module_constants_block {
+        decode_constants_block(block, &mut values);
+    }
+
+    // FUNCTION_BLOCK内: DeclareBlocksをスキップし、ネストしたローカル
+    // CONSTANTS_BLOCKで値番号付けを継続してから、命令列を順に解決する。
+    let mut resolved_calls = Vec::new();
+    for el in &function_block.elements {
+        if let Some(sub) = el.as_block() {
+            if sub.id == 11 {
+                decode_constants_block(sub, &mut values);
+            }
+            continue;
+        }
+        let Some(rec) = el.as_record() else { continue };
+        let fields = rec.fields().to_vec();
+        match rec.id {
+            1 => { /* DeclareBlocks: 既に大分類側で検証済み、ここでは無視 */ }
+            34 => {
+                // FUNC_CODE_INST_CALL: [paramattrs, cc, (explicit_type)?, callee, args...]
+                let current_value_no = values.len();
+                let paramattrs_and_cc_len = 2;
+                if fields.len() < paramattrs_and_cc_len + 1 {
+                    return Err(DxilCallResolutionError::UnexpectedShape("Call命令のフィールド数が不足".to_string()));
+                }
+                let cc = fields[1];
+                let explicit_type_flag = cc & 0x8000 != 0;
+                let mut idx = paramattrs_and_cc_len;
+                if explicit_type_flag {
+                    idx += 1; // explicit function type index(呼び出し先の型検証には使わず、位置合わせのためだけスキップ)。
+                }
+                let callee_field = *fields.get(idx).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("Call命令にcallee相対値が無い".to_string()))?;
+                idx += 1;
+                let arg_fields = &fields[idx..];
+
+                let callee = resolve_relative(&values, current_value_no, callee_field);
+                let Some(DxilValue::Function { name: Some(callee_name) }) = callee else {
+                    let name = match callee {
+                        Some(DxilValue::Function { name }) => name.clone(),
+                        _ => None,
+                    };
+                    return Err(DxilCallResolutionError::UnknownCallee(name));
+                };
+                let callee_name = callee_name.clone();
+
+                let resolved_args: Vec<DxilValue> =
+                    arg_fields.iter().map(|&f| resolve_relative(&values, current_value_no, f).cloned().unwrap_or(DxilValue::Other)).collect();
+
+                let expect_int = |v: &DxilValue| -> Option<i64> {
+                    match v {
+                        DxilValue::ConstantInt { value } => Some(*value),
+                        DxilValue::ConstantZero => Some(0),
+                        _ => None,
+                    }
+                };
+
+                match callee_name.as_str() {
+                    "dx.op.createHandle" => {
+                        if resolved_args.len() != 5 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(57) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 57, opcode));
+                        }
+                        let range_id = expect_int(&resolved_args[2])
+                            .ok_or_else(|| DxilCallResolutionError::UnexpectedShape("CreateHandleのrange_idが定数でない".to_string()))?;
+                        resolved_calls.push(ResolvedDxilCall::CreateHandle { range_id });
+                        values.push(DxilValue::CreateHandleResult { range_id });
+                    }
+                    "dx.op.threadId.i32" => {
+                        if resolved_args.len() != 2 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(93) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 93, opcode));
+                        }
+                        resolved_calls.push(ResolvedDxilCall::ThreadId);
+                        values.push(DxilValue::ThreadIdResult);
+                    }
+                    "dx.op.bufferLoad.f32" => {
+                        if resolved_args.len() != 4 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(68) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 68, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("BufferLoadの座標がThreadIdの結果ではない".to_string()));
+                        }
+                        resolved_calls.push(ResolvedDxilCall::BufferLoad { handle_range_id: range_id });
+                        values.push(DxilValue::BufferLoadAggregate { source_range_id: range_id });
+                    }
+                    "dx.op.bufferStore.f32" => {
+                        if resolved_args.len() != 9 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(69) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 69, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("BufferStoreの座標がThreadIdの結果ではない".to_string()));
+                        }
+                        if !matches!(resolved_args[4], DxilValue::BinOpResult) {
+                            return Err(DxilCallResolutionError::StoredValueNotBinOpResult);
+                        }
+                        resolved_calls.push(ResolvedDxilCall::BufferStore { handle_range_id: range_id });
+                        // dx.op.bufferStoreはvoidを返すため、LLVMは値番号を割り当てない
+                        // (値リストへは追加しない、LLVM BitcodeReaderの規約通り)。
+                    }
+                    other => {
+                        return Err(DxilCallResolutionError::UnknownCallee(Some(other.to_string())));
+                    }
+                }
+            }
+            26 => {
+                // FUNC_CODE_INST_EXTRACTVAL: [aggregate_relative, idx0]
+                let current_value_no = values.len();
+                let agg_relative = *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("ExtractValueにオペランドが無い".to_string()))?;
+                let index0 = fields.get(1).copied().unwrap_or(u64::MAX);
+                let aggregate = resolve_relative(&values, current_value_no, agg_relative);
+                let source_range_id = match aggregate {
+                    Some(DxilValue::BufferLoadAggregate { source_range_id }) if index0 == 0 => *source_range_id,
+                    _ => return Err(DxilCallResolutionError::ExtractValueNotFromBufferLoad),
+                };
+                values.push(DxilValue::ExtractedBufferValue { source_range_id });
+            }
+            2 => {
+                // FUNC_CODE_INST_BINOP: [lhs_relative, rhs_relative, opcode, flags]
+                let current_value_no = values.len();
+                let lhs_relative =
+                    *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpにオペランドが無い".to_string()))?;
+                let rhs_relative =
+                    *fields.get(1).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpに2つ目のオペランドが無い".to_string()))?;
+                let lhs = resolve_relative(&values, current_value_no, lhs_relative);
+                let rhs = resolve_relative(&values, current_value_no, rhs_relative);
+                if !matches!(lhs, Some(DxilValue::ExtractedBufferValue { .. })) || !matches!(rhs, Some(DxilValue::ExtractedBufferValue { .. })) {
+                    return Err(DxilCallResolutionError::UnexpectedShape(
+                        "BinOpのオペランドがBufferLoad由来の値ではない".to_string(),
+                    ));
+                }
+                values.push(DxilValue::BinOpResult);
+            }
+            10 => { /* Ret: 終端、値を生成しない */ }
+            other => {
+                return Err(DxilCallResolutionError::UnexpectedShape(format!("想定外の命令コード{other}")));
+            }
+        }
+    }
+
+    if resolved_calls.len() != 7 {
+        return Err(DxilCallResolutionError::UnexpectedShape(format!("Call命令は7個を期待したが実際は{}個", resolved_calls.len())));
+    }
+    Ok(resolved_calls)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +937,54 @@ mod tests {
     /// このテストは、命令形状の判定ロジック(`decode_vector_add_dxil_shape`)
     /// 単体を、実バイト列パイプラインを経由せず直接検証する
     /// (ロジックと実バイト列取得を分離してテストする)。
+    /// 実際に`vector_add.dxil`から7つの`Call`命令すべてを解決し、手計算で
+    /// 検証した通りの`dx.op.*`分類・range_idになることを確認する
+    /// (このHANDOFFエントリのコメントに転記した手動トレースと一致するはず)。
+    #[test]
+    fn resolves_all_seven_calls_in_real_vector_add_dxil_to_their_real_dx_op_meaning() {
+        let calls = resolve_vector_add_dxil_calls(VECTOR_ADD_DXIL).expect("real dxc-compiled DXIL must resolve all 7 calls");
+        assert_eq!(
+            calls,
+            vec![
+                ResolvedDxilCall::CreateHandle { range_id: 2 },
+                ResolvedDxilCall::CreateHandle { range_id: 1 },
+                ResolvedDxilCall::CreateHandle { range_id: 0 },
+                ResolvedDxilCall::ThreadId,
+                ResolvedDxilCall::BufferLoad { handle_range_id: 0 },
+                ResolvedDxilCall::BufferLoad { handle_range_id: 1 },
+                ResolvedDxilCall::BufferStore { handle_range_id: 2 },
+            ],
+            "expected 3x CreateHandle(range_id=2,1,0) + ThreadId + BufferLoad(u0) + BufferLoad(u1) + BufferStore(u2), got {:?}",
+            calls
+        );
+    }
+
+    /// 手で構築した合成`DxilValue`列に対して`resolve_relative`単体の
+    /// 相対値算術を検証する(実バイト列パイプラインを経由せず、算術規約
+    /// 自体を独立してテストする)。
+    #[test]
+    fn resolve_relative_computes_absolute_index_from_current_value_count() {
+        let values = vec![DxilValue::ConstantZero, DxilValue::ConstantInt { value: 42 }, DxilValue::ConstantUndef];
+        // current_value_no=3, relative=1 -> index 2 (ConstantUndef)。
+        assert_eq!(resolve_relative(&values, 3, 1), Some(&DxilValue::ConstantUndef));
+        // current_value_no=3, relative=3 -> index 0 (ConstantZero)。
+        assert_eq!(resolve_relative(&values, 3, 3), Some(&DxilValue::ConstantZero));
+        // relative=0または現在値数を超える場合は正直にNoneを返す。
+        assert_eq!(resolve_relative(&values, 3, 0), None);
+        assert_eq!(resolve_relative(&values, 3, 4), None);
+    }
+
+    #[test]
+    fn decode_signed_vbr_matches_llvm_sign_bit_convention() {
+        // 実バイト列で実際に出現した値: 114 -> 57 (CreateHandleオペコード)。
+        assert_eq!(decode_signed_vbr(114), 57);
+        assert_eq!(decode_signed_vbr(136), 68);
+        assert_eq!(decode_signed_vbr(186), 93);
+        assert_eq!(decode_signed_vbr(138), 69);
+        // 負の値(奇数ビットが立っている場合)。
+        assert_eq!(decode_signed_vbr(3), -1);
+    }
+
     #[test]
     fn shape_matcher_honestly_rejects_unexpected_instruction_orderings() {
         let types = vec![DxilType::Float, DxilType::StructNamed { name: "class.RWStructuredBuffer<float>".to_string() }];
