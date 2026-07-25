@@ -36,9 +36,17 @@ Linux(将来的にAndroid/macOS)上で実際に動かすことを目指す。
   `PARAMATTR_GROUP_BLOCK`(10)・`PARAMATTR_BLOCK`(9)・
   `CONSTANTS_BLOCK`(11)・`FUNCTION_BLOCK`(12、`main`の基本ブロックの数
   だけ5個)・`VALUE_SYMTAB_BLOCK`(14)・`METADATA_BLOCK`(15、2個)。
-  **ここで止まっている**——LLVM型システムの解決・命令オペコードの
-  意味解釈は一切行っていないため、DXIL→SPIR-V変換は存在しない
-  (詳細は下記「未実装」節)。
+  **更新(2026-07-25続き5、D3D12track)**: この後、型テーブル解決と
+  命令列の大分類デコードを追加した(同ファイルの`resolve_type_table`/
+  `decode_function_instructions`)。LLVM公式の`TYPE_BLOCK`/`FUNC_CODE`
+  レコードコード表を実`vector_add.dxil`に当てはめ、22個の型
+  (`Float`・`StructNamed{"class.RWStructuredBuffer<float>"}`含む)と、
+  実際の命令列(`DeclareBlocks -> Call`x5` -> ExtractValue -> Call ->
+  ExtractValue -> BinOp -> Call -> Ret`)を得た。**それでもDXIL→SPIR-V
+  変換は無い**——DXILは組み込み演算をすべて通常のLLVM`Call`として表現
+  するため、`VALUE_SYMTAB_BLOCK`(関数名解決)と相対値参照オペランドの
+  デコードが無い現状では7個の`Call`を区別できない(詳細は下記
+  「未実装」節)。
 - **D3D11グラフィックスパイプライン——DXBCパースのみ、SPIR-V無し。**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl`(最小のパス
   スルー頂点+ピクセルシェーダーの組、`POSITION`/`COLOR`入力→
@@ -151,10 +159,13 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 `cargo clippy --workspace --all-targets`: 警告0件。
 
-今回のDXIL/VS/PS追加分を含めると、`cargo test --workspace`は合計18件
-(単体テスト15件+実Vulkan統合テスト3件)が全て成功する。新規追加分は
-`dxil::tests::*`5件+`src/lib.rs`のDXBC VS/PSコンテナテスト2件+
-「Compute専用翻訳器がVSを正直に拒否する」テスト1件の計8件。
+DXIL型テーブル/命令列デコード追加分(2026-07-25続き5、D3D12track)を
+含めると、`cargo test --workspace`は合計23件(単体テスト19件+実Vulkan
+統合テスト4件)が全て成功する。既存20件に加え新規3件:
+`dxil::tests::resolves_real_dxil_type_table_and_finds_float_and_
+resource_struct`・`dxil::tests::decodes_real_dxil_function_block_into_
+matching_vector_add_shape`・`dxil::tests::shape_matcher_honestly_
+rejects_unexpected_instruction_orderings`。
 
 DXBCフィクスチャをHLSLから再生成する場合(Windows SDK付属の`fxc.exe`が
 必要——`dxc.exe`はDXIL/SM6+専用でDXBCは出力できない点に注意):
@@ -169,20 +180,16 @@ pwsh tools/compile-dxbc-shaders.ps1
   される(誤翻訳ではなく明示的なエラー)。真の汎用デコーダの実装
   (または既存実装、例えば`dxbc-spirv`/`dxil-spirv`のアプローチのより
   深い調査・移植)が引き続き本当の次のマイルストーン。
-- **DXIL(Shader Model 6+、D3D12)の解析・翻訳——2026-07-25にコンテナ
-  レベルの調査のみ実施、実装は未着手。** DXILはLLVM 3.7時代のbitcode
-  で、DXBCと同じ外枠のDXContainer形式の中に`DXIL`パートとして格納
-  される(ProgramHeader + BitcodeHeader + シリアライズされたLLVM IR
-  モジュール、マジック値`0x4C495844`)。LLVM公式ドキュメントが今では
-  このコンテナ形式とネイティブLLVM DXILバックエンドのアーキテクチャを
-  記載している(`llvm.org/docs/DirectX/DXContainer.html`・
-  `.../DXILArchitecture.html`)——これは以前この件を調査した時点より
-  新しい・より公式な情報源である。今後着手する場合の候補となるRust側の
-  部品: 本プロジェクトが既に使っている`dxbc`クレートは`DXIL`チャンクを
-  不透明バイト列として保持するのみ(デコードしない)。bitcode層自体を
-  扱う汎用`llvm-bitcode`クレートがcrates.ioに存在する。このリポジトリ
-  ではDXILバイト列を一切パースしていない——この節はPhase 0のDXBC
-  コンテナ調査と同じ深さの、コンテナ形式レベルの調査結果のみである。
+- **DXIL(Shader Model 6+、D3D12)の解析・翻訳——型テーブルと命令列の
+  大分類までは実装済み、DXIL→SPIR-V変換は未着手。** `dxil.rs`の
+  `resolve_type_table`/`decode_function_instructions`が、実
+  `vector_add.dxil`のTYPE_BLOCK/FUNCTION_BLOCKをLLVM公式のレコード
+  コード表に基づいて実際にデコードする。**それでもSPIR-V変換に届かない
+  理由**: DXILは`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`を
+  全て通常のLLVM`Call`として表現するため、`VALUE_SYMTAB_BLOCK`
+  (関数名解決)とLLVM bitcodeの相対値参照オペランドのデコードが無い
+  現状では、どの`Call`がどの組み込みかを区別できず、UAVバインド
+  ポイントも取り出せない。次にやるべきことはこの2点。
 - フルグラフィックスパイプライン(ラスタライザ・テクスチャサンプラ・
   ブレンドステート)——それまでスコープ外。
 - PlayStationファミリー対応——法務・利用規約上の懸念から明示的に

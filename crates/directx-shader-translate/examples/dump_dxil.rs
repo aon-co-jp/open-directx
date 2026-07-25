@@ -46,6 +46,28 @@ fn main() {
                     for inner in &block.elements {
                         if let Some(sub) = inner.as_block() {
                             println!("    sub-block id={} elements={}", sub.id, sub.elements.len());
+                            // TYPE_BLOCK_ID_NEW(17) と FUNCTION_BLOCK(12) は
+                            // 今回の翻訳作業で実際に必要な中身なので、レコード単位
+                            // (code + fields値そのもの)まで掘り下げてダンプする。
+                            if sub.id == 17 || sub.id == 12 {
+                                for (idx, deeper) in sub.elements.iter().enumerate() {
+                                    if let Some(rec) = deeper.as_record() {
+                                        println!(
+                                            "      [{}] record code={} fields={:?}",
+                                            idx,
+                                            rec.id,
+                                            rec.fields()
+                                        );
+                                    } else if let Some(deeper_block) = deeper.as_block() {
+                                        println!(
+                                            "      [{}] sub-sub-block id={} elements={}",
+                                            idx,
+                                            deeper_block.id,
+                                            deeper_block.elements.len()
+                                        );
+                                    }
+                                }
+                            }
                         } else if let Some(rec) = inner.as_record() {
                             println!("    record id={} fields={}", rec.id, rec.fields().len());
                         }

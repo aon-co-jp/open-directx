@@ -158,17 +158,38 @@ This was found empirically with `examples/dump_dxil.rs` before writing
 the assertions in `dxil.rs`'s tests, the same "dump first, decode
 narrowly second" discipline used for the DXBC/SM5.0 SHEX opcode work.
 
-**Where this stops, honestly**: no LLVM type-system resolution (the
-`TYPE_BLOCK` records' fields are raw `u64` varints, not decoded into an
-actual type table), no instruction-opcode decoding inside
-`FUNCTION_BLOCK` records, and therefore **no DXIL-to-SPIR-V translation
-of any kind**. `DxilModule` only exposes `shader_kind`,
-`shader_model_major/minor`, `dxil_version`, `bitcode_has_llvm_magic`,
-and `top_level_blocks: Vec<BitcodeBlockSummary>` (each just `block_id`,
-`child_count`, `child_block_ids` — raw IDs, no semantics). If this is
-picked up again, the natural next step is decoding `TYPE_BLOCK` records
-into an actual type table for this one known shader, mirroring how
-`decode_shader_shape` started narrow for DXBC/SM5.0.
+**Update (2026-07-25, continued, D3D12 track)**: type-table resolution
+and coarse instruction decoding have since been added on top of the
+above (still in `src/dxil.rs`). `resolve_type_table(&Block) ->
+Vec<DxilType>` applies LLVM's documented `TYPE_BLOCK` record codes
+(`VOID`=2, `FLOAT`=3, `INTEGER`=7, `POINTER`=8, `FUNCTION`=21,
+`STRUCT_NAME`=19/`STRUCT_NAMED`=20, `METADATA`=16) to the real
+`vector_add.dxil` type table (22 resolved types), confirming type#12 is
+`Float` and type#19 is `StructNamed{"class.RWStructuredBuffer<float>"}`.
+`decode_function_instructions(&Block) -> Vec<DxilInstruction>` applies
+LLVM's `FUNC_CODE_*` table (`DECLAREBLOCKS`=1, `BINOP`=2, `RET`=10,
+`EXTRACTVAL`=26, `CALL`=34) to the real `FUNCTION_BLOCK`, yielding
+`DeclareBlocks(1) -> Call*5 -> ExtractValue -> Call -> ExtractValue ->
+BinOp -> Call -> Ret` for `vector_add.dxil`'s `main`. `decode_
+vector_add_dxil_shape` narrowly validates this exact shape (one basic
+block, exactly one `BinOp`, at least one trailing `Call` after it, ends
+in `Ret`) and honestly rejects anything else via `DxilShapeError`,
+mirroring `SpirvGenError::UnsupportedShader` on the DXBC side.
+
+**Where this still stops, honestly**: DXIL represents every intrinsic
+op (`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`) as an
+ordinary LLVM `CALL` to a `dx.op.*` function, so all 7 real `Call`
+records in `vector_add.dxil` are indistinguishable from each other in
+this code — `VALUE_SYMTAB_BLOCK` (function-name resolution) is not read
+yet, and LLVM bitcode's relative-value-reference operand encoding is
+not decoded, so no UAV bind point can be recovered from a `Call`'s
+`fields`. Without that, there is **still no DXIL-to-SPIR-V translation
+of any kind** — the type table and instruction list exist, but nothing
+consumes them to emit SPIR-V. If this is picked up again, the natural
+next step is reading `VALUE_SYMTAB_BLOCK` to name-resolve the `Call`
+targets, then decoding the relative-value operand encoding to recover
+actual UAV bindings, before attempting to reuse `spirv_gen.rs`'s
+`emit_spirv` for a DXIL-sourced `vector_add`.
 
 ## D3D11 graphics pipeline (vertex/pixel shaders) — DXBC parsing only, added 2026-07-25
 
@@ -211,9 +232,10 @@ this pipeline stage.
   `SV_DispatchThreadID` indexing, a real dedicated `sub`/`div` opcode
   instead of negated-`add`, more than one bounds check, etc.) will be
   rejected by `decode_shader_shape`, not silently mistranslated.
-- **DXIL (SM6+) is parsed down to the LLVM bitstream block/record tree
-  (see the dedicated section above, added 2026-07-25) but no further —
-  no type/instruction semantic decoding, no DXIL-to-SPIR-V translation.**
+- **DXIL (SM6+) is parsed down to a resolved type table + a coarse
+  instruction list (see the dedicated section above, updated
+  2026-07-25) but no further — no `Call`-target name resolution, no
+  operand/relative-value decoding, no DXIL-to-SPIR-V translation.**
   D3D12's higher-level layers (command lists, descriptor heaps, root
   signatures) remain entirely unimplemented, Phase 3+ per `CLAUDE.md`'s
   roadmap.

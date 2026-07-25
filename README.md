@@ -39,9 +39,20 @@ vertical slice below:
   `TYPE_BLOCK_ID_NEW`(17), `PARAMATTR_GROUP_BLOCK`(10),
   `PARAMATTR_BLOCK`(9), `CONSTANTS_BLOCK`(11), `FUNCTION_BLOCK`(12, x5 —
   one per basic block of `main`), `VALUE_SYMTAB_BLOCK`(14),
-  `METADATA_BLOCK`(15, x2). **This stops at block/record structure —
-  no LLVM type-system or instruction-opcode decoding**, so no
-  DXIL-to-SPIR-V translation exists. See "Not implemented" below.
+  `METADATA_BLOCK`(15, x2). **Update (2026-07-25, continued, D3D12
+  track)**: type-table resolution and coarse instruction decoding have
+  since been added (`resolve_type_table`/`decode_function_instructions`
+  in the same file), applying LLVM's documented `TYPE_BLOCK`/`FUNC_CODE`
+  record tables to the real `vector_add.dxil` bytes — confirmed a
+  22-entry type table including `Float` and
+  `StructNamed{"class.RWStructuredBuffer<float>"}`, and a real
+  instruction sequence (`DeclareBlocks -> Call*5 -> ExtractValue -> Call
+  -> ExtractValue -> BinOp -> Call -> Ret`). **Still no DXIL-to-SPIR-V
+  translation** — DXIL routes every intrinsic op through an ordinary
+  LLVM `CALL`, so the 7 `Call` records are indistinguishable without
+  resolving `VALUE_SYMTAB_BLOCK` function names and the relative-value
+  operand encoding, neither of which is implemented yet. See "Not
+  implemented" below.
 - **D3D11 graphics pipeline — DXBC parsing only, no SPIR-V.**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl` (minimal
   passthrough vertex+pixel shader pair, `POSITION`/`COLOR` in,
@@ -156,11 +167,13 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 
 `cargo clippy --workspace --all-targets`: 0 warnings.
 
-After today's DXIL/VS/PS additions, `cargo test --workspace` runs 18
-tests total (15 unit + 3 real-Vulkan integration tests), all passing,
-including 8 new ones: `dxil::tests::*` (5), plus 2 new DXBC VS/PS
-container tests and 1 "VS is honestly rejected by the compute-only
-translator" test in `src/lib.rs`.
+After the DXIL type-table/instruction-decoding work (2026-07-25,
+continued, D3D12 track), `cargo test --workspace` runs 23 tests total
+(19 unit + 4 real-Vulkan integration tests), all passing, including 3
+new ones on top of the earlier 20: `dxil::tests::resolves_real_dxil_
+type_table_and_finds_float_and_resource_struct`, `dxil::tests::decodes_
+real_dxil_function_block_into_matching_vector_add_shape`, and `dxil::
+tests::shape_matcher_honestly_rejects_unexpected_instruction_orderings`.
 
 To regenerate the DXBC fixtures from HLSL (requires the Windows SDK's
 `fxc.exe` — note `dxc.exe` only targets DXIL/SM6+ and cannot produce
@@ -180,19 +193,22 @@ pwsh tools/compile-dxbc-shaders.ps1
   adopting/porting an existing one, e.g. studying `dxbc-spirv`/
   `dxil-spirv`'s approach more closely) remains the actual next
   milestone.
-- **DXIL (Shader Model 6+, D3D12): real bytes are now parsed down to the
-  LLVM bitstream block/record tree — but no further.** No LLVM
-  type-system resolution, no instruction-opcode decoding, and therefore
-  **no DXIL-to-SPIR-V translation** — `dxil.rs` only exposes
-  `DxilModule { shader_kind, shader_model_major/minor, dxil_version,
-  bitcode_has_llvm_magic, top_level_blocks: Vec<BitcodeBlockSummary> }`,
-  where each block just carries its raw numeric LLVM block ID and child
-  block IDs, not decoded semantics. D3D12 command list/descriptor
-  heap/root signature support (the layer above shader translation) is
-  untouched. Next step if this is picked up again: decode `TYPE_BLOCK`
-  records into an actual type table, and `FUNCTION_BLOCK` records into
-  an actual instruction list, for the same narrow single-shader case
-  (`vector_add_dxil.hlsl`) the DXBC/SM5.0 path started with.
+- **DXIL (Shader Model 6+, D3D12): real bytes are now parsed down to a
+  resolved type table and a coarse instruction list — but no further.**
+  `resolve_type_table`/`decode_function_instructions` in `dxil.rs`
+  decode real `TYPE_BLOCK`/`FUNCTION_BLOCK` records against LLVM's
+  documented codes, and `decode_vector_add_dxil_shape` narrowly matches
+  the exact instruction shape `vector_add.dxil` produces. **Still no
+  DXIL-to-SPIR-V translation**: DXIL represents every intrinsic op
+  (`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`) as an ordinary
+  LLVM `Call`, and this code doesn't yet resolve `VALUE_SYMTAB_BLOCK`
+  function names or LLVM bitcode's relative-value operand encoding, so
+  it cannot tell which `Call` is which or recover UAV bind points. D3D12
+  command list/descriptor heap/root signature support (the layer above
+  shader translation) is untouched. Next step if this is picked up
+  again: read `VALUE_SYMTAB_BLOCK` to name-resolve `Call` targets, then
+  decode the relative-value operand encoding, before reusing
+  `spirv_gen.rs`'s `emit_spirv` for a DXIL-sourced `vector_add`.
 - **D3D11 graphics pipeline: DXBC container parsing confirmed working
   for VS/PS, but no SPIR-V codegen, no rasterizer, no actual triangle
   drawn on screen.** The full pipeline (rasterizer, texture sampling,

@@ -286,3 +286,27 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      ワークスペース全体で計20テスト全green(実Vulkanディスパッチ4本を含む)。`cargo clippy --workspace --all-targets`警告0件。
   6. **正直な開示**: 対応する2項演算はadd/mul/negated-add-as-sub/divの4種のみ。この4パターン以外のオペコード・オペランド形状は引き続き`SpirvGenError::UnsupportedShader`で拒否される。DXIL側・D3D11グラフィックスパイプライン側は前回エントリから変更なし(未着手のまま)。
   - 次にすべきこと: 前回エントリの(1)(2)(3)は変更なし(DXILの型/命令デコード、VS/PS向けSPIR-V生成、両タスクとも「実バイト列確認→対応追加」の継続)。Compute Shader側の演算網羅については、次候補として複数の一時レジスタを使う式(例: `(a+b)*c`のような3入力演算、UAV数が3以外になるケース)や`else`分岐を検討する。
+
+- **2026-07-25(続き5) D3D12track: DXILの型テーブル解決+FUNCTION_BLOCK命令列デコードへ前進(SPIR-V変換にはまだ未到達、正直な区切り)**:
+  - ユーザー指示「D3D11が終わったらD3D12などに作業を移して下さい」を受け、D3D12track=DXIL(SM6+)パースの深化に着手。SM5.0/DXBC側(Compute Shader4形状・実Vulkan検証済み)は変更していない。
+  1. **調査**: `llvm-bitcode`クレート(`0.4.0`、ローカルの`~/.cargo/registry/src/.../llvm-bitcode-0.4.0/src`)自体のソースを実際に読み、`Block { id, elements }`/`Record { id, fields() }`という生のブロック/レコードまでしか提供しない(DXIL/LLVM型・命令の意味解釈は一切していない)ことを確認した——前回HANDOFFで「候補として記録するのみ」だった点を実ソースで裏取りした形。
+  2. **`examples/dump_dxil.rs`を拡張**: `TYPE_BLOCK_ID_NEW`(17)・`FUNCTION_BLOCK`(12)については、子ブロックIDだけでなくレコードの`code`と`fields()`の実際の値まで出力するようにした。これで`shaders/vector_add.dxil`のTYPE_BLOCK(26要素)・FUNCTION_BLOCK(13要素)の生レコードを実際に確認できた(値はコード側のdocコメントにも転記済み)。
+  3. **型テーブル解決**: `crates/directx-shader-translate/src/dxil.rs`に`DxilType`(`Void`/`Float`/`Double`/`Integer{bits}`/`Pointer{pointee,address_space}`/`Function`/`StructNamed{name}`/`Metadata`/`Other{code}`/`StructNameMarker`)と`resolve_type_table(&Block) -> Vec<DxilType>`を追加。LLVM公式のTYPE_BLOCKレコードコード表(`llvm.org/docs/BitCodeFormat.html`のtype codes、`NUMENTRY=1`/`VOID=2`/`FLOAT=3`/`INTEGER=7`/`POINTER=8`/`FUNCTION=21`/`STRUCT_NAME=19`/`STRUCT_NAMED=20`/`METADATA=16`)をそのまま当てはめた。実`vector_add.dxil`に対して実際に解決した結果、型#12が`Float`、型#19が`StructNamed{name: "class.RWStructuredBuffer<float>"}`であることを確認した(推測ではなく実バイト列から得た値)。
+  4. **命令列デコード**: `DxilInstruction`(`DeclareBlocks{basic_block_count}`/`BinOp{fields}`/`Ret`/`Call{fields}`/`ExtractValue{fields}`/`Other{code,fields}`)と`decode_function_instructions(&Block) -> Vec<DxilInstruction>`を追加。LLVM公式のFUNC_CODE表(`DECLAREBLOCKS=1`/`INST_BINOP=2`/`INST_RET=10`/`INST_EXTRACTVAL=26`/`INST_CALL=34`)を適用。実`vector_add.dxil`のFUNCTION_BLOCK(基本ブロック1つ)を実際にデコードした結果、`DeclareBlocks(1)` -> `Call`x5 -> `ExtractValue` -> `Call` -> `ExtractValue` -> `BinOp` -> `Call` -> `Ret`という並びが得られた。DXILは組み込み演算(`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`)をすべて`dx.op.*`という通常のLLVM関数呼び出し(`FUNC_CODE_INST_CALL`)として表現するため、これらは全部`Call`としてしか区別できない(呼び出し先関数のシンボル解決は今回未実装、正直な開示)。
+  5. **`decode_vector_add_dxil_shape`/`decode_vector_add_dxil`**: 上記の実際に観測した並び(`DeclareBlocks(1)` -> `Call`/`ExtractValue`の混在 -> ちょうど1回の`BinOp` -> `BinOp`後に少なくとも1回の`Call` -> `Ret`)を検証する狭いマッチャーを実装。1つでも想定外の並び(`BinOp`が2回、基本ブロックが2つ以上、`Other`命令が混ざる等)なら`DxilShapeError`で正直に拒否する(DXBC側`SpirvGenError::UnsupportedShader`と同じ設計方針)。`decode_vector_add_dxil(bytes)`は`parse_dxil_container`と同様にDXBCコンテナ->DXILチャンク->bitstream->MODULE_BLOCK->TYPE_BLOCK/FUNCTION_BLOCKまで一気通貫で辿る便宜関数として追加。
+  6. **テスト(実際に`cargo test --workspace`で確認、誇張なし)**:
+     ```
+     running 19 tests
+     test dxil::tests::resolves_real_dxil_type_table_and_finds_float_and_resource_struct ... ok
+     test dxil::tests::decodes_real_dxil_function_block_into_matching_vector_add_shape ... ok
+     test dxil::tests::shape_matcher_honestly_rejects_unexpected_instruction_orderings ... ok
+     (既存16件含め) test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `resolves_real_dxil_type_table_and_finds_float_and_resource_struct`は実`vector_add.dxil`から22個の型を解決し、`Float`と`StructNamed{"class.RWStructuredBuffer<float>"}`が実際に含まれることを検証。`decodes_real_dxil_function_block_into_matching_vector_add_shape`は同じ実バイト列から`binop_count=1`/`extract_value_count=2`/`call_count=7`を得ることを検証。`shape_matcher_honestly_rejects_unexpected_instruction_orderings`はロジック単体(手構築した`DxilInstruction`列)に対して、`BinOp`2回・基本ブロック2つ・float型無しの3パターンがそれぞれ正しいエラーで拒否されることを確認。ワークスペース全体で23テスト全green(実Vulkanディスパッチ4本を含む、既存分に変更なし)。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
+  7. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **DXIL→SPIR-V変換は依然として存在しない**。今回やったのは型テーブル解決と命令列の「大分類」(Call/ExtractValue/BinOp/Ret)までで、`Call`命令の引数(LLVM bitcodeの相対値参照方式でエンコードされたオペランド列)を解決して「どの呼び出しがCreateHandleで、どのUAVバインドポイントを指すか」を突き止める処理は書いていない。これが無いとSPIR-Vの`OpAccessChain`/`OpLoad`/`OpStore`のバインディング先が決められないため、SPIR-V生成には未着手のまま。
+     - **VALUE_SYMTAB_BLOCK(関数名解決)は読んでいない**——`dx.op.createHandle`等の実際の関数名を文字列として確認していないため、上記の`Call`区別ができないのはこれが理由(呼び出し先を名前で引けない)。
+     - **`Call`命令のフィールド(`fields: Vec<u64>`)は生のまま保持しているのみ**——LLVM bitcodeの相対値参照(直前の値からの差分インデックス方式)のデコードは未実装。
+     - **実Vulkanディスパッチ・CPU参照実装との数値一致検証は、DXIL側では未着手**(SPIR-Vが無いため検証しようがない、DXBC側の4シェーダーの検証範囲に変更は無い)。
+     - D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: (1) `VALUE_SYMTAB_BLOCK`(id=14)を読んで関数名文字列を解決し、`Call`命令がどの`dx.op.*`組み込みか(`CreateHandle`/`ThreadId`/`BufferLoad`/`BufferStore`)を実際に区別できるようにする。(2) LLVM bitcodeの相対値参照デコード(`Call`/`BinOp`/`ExtractValue`のオペランドが指す値を解決する)に着手し、UAVバインドポイント(u0/u1/u2)を実際に取り出す。(3) (1)(2)ができたら、DXBC側の`emit_spirv`(`spirv_gen.rs`)を再利用してDXIL版`vector_add`のSPIR-Vを生成し、実Vulkan(NVIDIA GT 730)でCPU参照実装との数値一致を検証する(DXBC側と同じ「フェーズ1垂直スライス」達成を目指す)。(4) D3D11グラフィックスパイプライン(VS/PS)側も引き続き並行して検討可。
