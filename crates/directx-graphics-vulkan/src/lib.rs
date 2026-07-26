@@ -51,6 +51,75 @@ pub struct Rgba8 {
     pub a: u8,
 }
 
+/// Diagnostic info about a Vulkan physical device usable for graphics
+/// (i.e. it has at least one queue family with `GRAPHICS` support — the
+/// same selection criterion [`render_uniform_triangle_and_read_back`] uses).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphicsDeviceInfo {
+    pub name: String,
+    pub vendor_id: u32,
+    /// Human-readable vendor name, best-effort from the PCI vendor ID
+    /// (2026-07-27 addition, closing a parity gap noted in this repo's
+    /// CLAUDE.md: `open-cuda`'s `opencuda-vulkan::real::vendor_from_id`
+    /// already reports this for the Compute path, but the independent
+    /// Graphics path here had no equivalent diagnostic. This is a
+    /// deliberately small, standalone duplicate of that same PCI vendor ID
+    /// table — not a dependency on `opencuda-vulkan`, consistent with this
+    /// crate's existing documented decision to keep the Graphics and
+    /// Compute Vulkan contexts fully independent).
+    pub vendor: &'static str,
+}
+
+fn vendor_name_from_id(vendor_id: u32) -> &'static str {
+    match vendor_id {
+        0x10DE => "NVIDIA",
+        0x1002 | 0x1022 => "AMD",
+        0x8086 => "Intel",
+        0x5143 => "Qualcomm",
+        0x13B5 => "ARM",
+        0x1010 => "Imagination PowerVR",
+        _ => "Unknown",
+    }
+}
+
+/// Enumerate every Vulkan physical device with a graphics-capable queue
+/// family (the same criterion used to pick the device that
+/// [`render_uniform_triangle_and_read_back`]/[`render_gradient_triangle_and_read_back`]
+/// actually renders on), returning each device's name and best-effort
+/// vendor. Diagnostics only — does not create a logical device, does not
+/// render anything, and has no effect on the render functions above.
+pub fn enumerate_graphics_devices() -> Result<Vec<GraphicsDeviceInfo>> {
+    let entry = unsafe { Entry::load() }.map_err(|e| GraphicsError::LoaderLoad(e.to_string()))?;
+
+    let app_name = CString::new("open-directx").unwrap();
+    let app_info = vk::ApplicationInfo::builder()
+        .application_name(&app_name)
+        .application_version(vk::make_api_version(0, 0, 1, 0))
+        .engine_name(&app_name)
+        .engine_version(vk::make_api_version(0, 0, 1, 0))
+        .api_version(vk::API_VERSION_1_1);
+    let instance_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+    let instance = unsafe { entry.create_instance(&instance_info, None) }.map_err(|e| GraphicsError::CreateInstance(e.to_string()))?;
+    let guard = InstanceGuard { instance: &instance };
+
+    let physical_devices = unsafe { instance.enumerate_physical_devices() }.map_err(|e| GraphicsError::Vk("vkEnumeratePhysicalDevices", e))?;
+
+    let mut out = Vec::new();
+    for &pd in &physical_devices {
+        let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        let has_graphics = families.iter().any(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS));
+        if !has_graphics {
+            continue;
+        }
+        let props = unsafe { instance.get_physical_device_properties(pd) };
+        let name = unsafe { std::ffi::CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy().into_owned();
+        out.push(GraphicsDeviceInfo { name, vendor_id: props.vendor_id, vendor: vendor_name_from_id(props.vendor_id) });
+    }
+
+    drop(guard);
+    Ok(out)
+}
+
 /// Render a single full-viewport triangle (NDC vertices `(-1,-1)`, `(3,-1)`,
 /// `(-1,3)` — the standard "big triangle" trick that fully covers the
 /// viewport with one triangle instead of two) using the given passthrough

@@ -9,7 +9,7 @@
 //! Per repo policy this is a real-hardware test, not a mock: if no Vulkan
 //! device/driver is present it prints and skips rather than faking success.
 
-use directx_graphics_vulkan::{render_gradient_triangle_and_read_back, render_uniform_triangle_and_read_back};
+use directx_graphics_vulkan::{enumerate_graphics_devices, render_gradient_triangle_and_read_back, render_uniform_triangle_and_read_back};
 use directx_shader_translate::spirv_gen::{translate_pixel_shader, translate_vertex_shader};
 
 // Same real fxc.exe-compiled DXBC bytes already used and verified in
@@ -159,4 +159,27 @@ fn d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulk
          machine — every pixel's r+g+b sums to ~255 and the image is not a single flat color.",
         width, height
     );
+}
+
+/// 2026-07-27 addition: `enumerate_graphics_devices` should report the real
+/// GPU on this machine (an NVIDIA GeForce GT 730) with the correct
+/// best-effort vendor name, closing the diagnostic parity gap noted in
+/// CLAUDE.md (open-cuda's Compute path already reports vendor via
+/// `opencuda-vulkan::real::vendor_from_id`; the Graphics path here had no
+/// equivalent). Skips (does not fail) if no Vulkan graphics device is
+/// present, matching this repo's existing real-hardware-test policy.
+#[test]
+fn enumerate_graphics_devices_reports_the_real_gpu_on_this_machine() {
+    let devices = match enumerate_graphics_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("skipping enumerate_graphics_devices test: no usable real Vulkan graphics device/driver ({e})");
+            return;
+        }
+    };
+    assert!(!devices.is_empty(), "expected at least one graphics-capable Vulkan physical device to be enumerated");
+    for d in &devices {
+        assert!(!d.name.is_empty(), "device name should not be empty");
+    }
+    println!("OK: enumerate_graphics_devices reported {} graphics-capable device(s): {:?}", devices.len(), devices);
 }
