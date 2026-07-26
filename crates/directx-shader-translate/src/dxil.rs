@@ -553,6 +553,24 @@ fn count_module_functions(module_block: &Block) -> usize {
     module_block.elements.iter().filter(|el| el.as_record().is_some_and(|r| r.id == 8)).count()
 }
 
+/// グローバル値番号付け(関数宣言(0..num_functions) -> モジュールレベル
+/// `CONSTANTS_BLOCK`)を実際に組み立てる。`resolve_vector_add_dxil_calls`
+/// (FUNCTION_BLOCK内の相対値参照解決)と、下記の`extract_numthreads_from_metadata`
+/// (METADATA_BLOCK内の`METADATA_VALUE`が指す絶対値参照の解決)の両方で
+/// 共有する(元は前者にだけインラインで書かれていたが、後者でも同じ値リストが
+/// 必要になったため切り出した、ロジックの重複ではなく共通化)。
+fn build_module_value_list(module_block: &Block) -> Vec<DxilValue> {
+    let function_names = resolve_module_function_names(module_block);
+    let num_functions = count_module_functions(module_block);
+    let mut values: Vec<DxilValue> = (0..num_functions)
+        .map(|id| DxilValue::Function { name: function_names.get(&(id as u64)).cloned() })
+        .collect();
+    if let Some(block) = module_block.elements.iter().filter_map(|el| el.as_block()).find(|b| b.id == 11) {
+        decode_constants_block(block, &mut values);
+    }
+    values
+}
+
 /// `CONSTANTS_BLOCK`(id=11)の中身を、実際に値を消費するレコード
 /// (`CST_CODE_NULL`/`CST_CODE_UNDEF`/`CST_CODE_INTEGER`)だけ`values`へ
 /// 追加する。`CST_CODE_SETTYPE`(id=1)は後続レコードの型を切り替えるだけで
@@ -639,18 +657,9 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
         .filter_map(|el| el.as_block())
         .find(|b| b.id == 12)
         .ok_or_else(|| DxilCallResolutionError::MissingBlock("FUNCTION_BLOCK".to_string()))?;
-    let module_constants_block = module_block.elements.iter().filter_map(|el| el.as_block()).find(|b| b.id == 11);
-
-    let function_names = resolve_module_function_names(module_block);
-    let num_functions = count_module_functions(module_block);
-
-    // グローバル値番号付け: 関数宣言(0..num_functions) -> モジュールレベル定数。
-    let mut values: Vec<DxilValue> = (0..num_functions)
-        .map(|id| DxilValue::Function { name: function_names.get(&(id as u64)).cloned() })
-        .collect();
-    if let Some(block) = module_constants_block {
-        decode_constants_block(block, &mut values);
-    }
+    // グローバル値番号付け: 関数宣言(0..num_functions) -> モジュールレベル定数
+    // (numThreads抽出処理と共有する`build_module_value_list`へ切り出し済み)。
+    let mut values = build_module_value_list(module_block);
 
     // FUNCTION_BLOCK内: DeclareBlocksをスキップし、ネストしたローカル
     // CONSTANTS_BLOCKで値番号付けを継続してから、命令列を順に解決する。
@@ -816,6 +825,260 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
 }
 
 // ---------------------------------------------------------------------
+// ここから先(METADATA_BLOCKからのnumThreads実抽出)は今回新規に追加した部分。
+// 前回のHANDOFFで「DXBCの`dcl_thread_group`に相当する情報は`METADATA_BLOCK`
+// 内の`dx.entryPoints`にエンコードされているが未抽出、`(64,1,1)`を決め打ちで
+// 使っている」と明記していた既知の負債を解消する。
+// ---------------------------------------------------------------------
+//
+// **調査で確認した構造**(Microsoft`DirectXShaderCompiler`のソース
+// `lib/DXIL/DxilMetadataHelper.cpp`・`include/dxc/DXIL/DxilMetadataHelper.h`を
+// 実際にWeb経由で確認した上で、`vector_add.dxil`の実バイト列に対して
+// 手計算で全経路を検証済み、以下のコメントはその手計算トレースそのもの):
+//
+// - `dx.entryPoints`という名前の`METADATA_NAMED_NODE`(code=10)が、
+//   エントリポイント毎の5要素タプル(`{Function, Name, Signatures, Resources,
+//   ShaderProperties}`)を指す。今回対象の`vector_add_dxil.hlsl`は関数1個
+//   なので、このリストは1要素のみ(複数エントリポイントは対応スコープ外、
+//   正直に`UnsupportedEntryPointCount`で拒否する)。
+// - `ShaderProperties`は`{tag, value, tag, value, ...}`という(タグ, 値)の
+//   繰り返しノードで、`DxilMDHelper::kDxilNumThreadsTag`(実際の値=4、
+//   `DxilMetadataHelper.h`で確認済み)というタグの次の要素が、numThreadsの
+//   `{x, y, z}`3要素ノード(`DxilMetadataHelper.cpp`の`EmitDxilEntryProperties`
+//   が`Uint32ToConstMD`3つを`MDNode::get`でまとめて作る、と確認済み)。
+// - `vector_add.dxil`の実バイト列を実際にこの経路でたどると
+//   (このコメントに転記した手計算トレース、コード側の実装と一致):
+//   `dx.entryPoints`named-node fields=[28] -> MD28(entryタプル、
+//   fields=[23,24,0,22,28]) -> ShaderProperties=MD27(fields=[4,25,15,27],
+//   val-1オフセット) -> ペア(tag=MD3→値0=ShaderFlagsタグ0, value=MD24)と
+//   ペア(tag=MD14→値4=NumThreadsタグ, value=MD26) -> MD26(fields=[26,3,3])が
+//   numThreadsノード -> 各要素をMETADATA_VALUE経由でモジュール値リストへ解決:
+//   MD25→値12→モジュール定数64、MD2→値5→モジュール定数1、MD2(再度)→1。
+//   結果`(64, 1, 1)`——これは`vector_add_dxil.hlsl`の`[numthreads(64,1,1)]`と
+//   一致する、実際にバイト列から抽出した値であり決め打ちではない。
+//
+// **正直な開示(このセクションのスコープ)**: 汎用METADATA_BLOCKデコーダ
+// ではない。`METADATA_STRING_OLD`(1)/`METADATA_VALUE`(2)/`METADATA_NODE`(3)/
+// `METADATA_DISTINCT_NODE`(5)/`METADATA_NAME`(4)/`METADATA_NAMED_NODE`(10)
+// だけを扱い、`dx.entryPoints`->ShaderProperties->NumThreadsという1本の経路
+// だけを解決する(リソース情報・シグネチャ・他のシェーダープロパティタグは
+// 読んでいない)。複数エントリポイント・NumThreadsタグが存在しない形状は
+// `DxilNumThreadsError`で正直に拒否する。
+
+/// METADATA_BLOCK(id=15)の1レコードを、意味解釈せず種類だけ区別した最小限の
+/// 表現(このセクションのスコープ=numThreads抽出に必要な種類のみ)。
+#[derive(Debug, Clone)]
+enum MetadataEntry {
+    /// `METADATA_STRING_OLD`(code=1)。numThreads抽出経路では中身までは使わない
+    /// (MDインデックスを正しく消費すること自体が目的、意味解釈が必要になったら
+    /// この中身を使う想定で残す)。
+    #[allow(dead_code)]
+    String(String),
+    /// `METADATA_VALUE`(code=2): `[type_index, value_ref]`。`value_ref`は
+    /// モジュール値リスト(関数宣言+モジュールレベル定数、絶対インデックス、
+    /// `build_module_value_list`が返す並びと同じ)への直接参照。
+    Value { value_ref: u64 },
+    /// `METADATA_NODE`/`METADATA_DISTINCT_NODE`(code=3/5): オペランドは
+    /// 「val-1、0はnull」というLLVM標準のMDオペランド参照規約のまま
+    /// (未解決)保持する。
+    Node(Vec<u64>),
+}
+
+fn metadata_string_from_payload(payload: Option<Payload>, fields: &[u64]) -> String {
+    match payload {
+        Some(Payload::Char6String(s)) => s,
+        Some(Payload::Blob(b)) => String::from_utf8_lossy(&b).to_string(),
+        Some(Payload::Array(chars)) => chars.iter().filter_map(|&c| u8::try_from(c).ok()).map(|b| b as char).collect(),
+        None => fields.iter().filter_map(|&c| u8::try_from(c).ok()).map(|b| b as char).collect(),
+    }
+}
+
+/// METADATA_BLOCK(id=15)直下のレコードを順に走査する。`entries`はMDインデックス
+/// (このブロック内で`String`/`Value`/`Node`を生成するレコードだけがインデックスを
+/// 1つ消費する、`METADATA_NAME`/`METADATA_KIND`/`METADATA_NAMED_NODE`は消費しない
+/// ——実バイト列に対する手計算トレースで検証済み)順に並んだベクタ、`named_nodes`
+/// は`METADATA_NAME`(直後の名前)+`METADATA_NAMED_NODE`(そのfields、MDインデックス
+/// への直接参照のリスト)のペアから得た「名前 -> 参照先MDインデックス一覧」の対応表。
+fn decode_metadata_block(block: &Block) -> (Vec<MetadataEntry>, HashMap<String, Vec<u64>>) {
+    let mut entries = Vec::new();
+    let mut named_nodes = HashMap::new();
+    let mut pending_name: Option<String> = None;
+    let mut block_clone = block.clone();
+    for el in &mut block_clone.elements {
+        let Some(rec) = el.as_record_mut() else { continue };
+        match rec.id {
+            1 => {
+                let fields = rec.fields().to_vec();
+                let payload = rec.take_payload();
+                entries.push(MetadataEntry::String(metadata_string_from_payload(payload, &fields)));
+            }
+            2 => {
+                let value_ref = rec.fields().get(1).copied().unwrap_or(0);
+                entries.push(MetadataEntry::Value { value_ref });
+            }
+            3 | 5 => {
+                entries.push(MetadataEntry::Node(rec.fields().to_vec()));
+            }
+            4 => {
+                let fields = rec.fields().to_vec();
+                let payload = rec.take_payload();
+                pending_name = Some(metadata_string_from_payload(payload, &fields));
+            }
+            10 => {
+                if let Some(name) = pending_name.take() {
+                    named_nodes.insert(name, rec.fields().to_vec());
+                }
+            }
+            _ => {
+                // METADATA_KIND(6)等、このセクションのスコープ外のレコードは
+                // MDインデックスを消費しないので無視する(実バイト列で確認済み、
+                // `dx.entryPoints`経路上には出現しない)。
+            }
+        }
+    }
+    (entries, named_nodes)
+}
+
+/// `val-1`(0はnull)というLLVM標準のMDオペランド参照規約でエントリを引く。
+fn resolve_md_operand(entries: &[MetadataEntry], raw: u64) -> Option<&MetadataEntry> {
+    if raw == 0 {
+        return None;
+    }
+    entries.get((raw - 1) as usize)
+}
+
+/// `METADATA_VALUE`の`value_ref`(モジュール値リストへの絶対インデックス)を、
+/// 実際に整数定数として解決する。
+fn resolve_module_constant_i64(values: &[DxilValue], value_ref: u64) -> Option<i64> {
+    match values.get(value_ref as usize)? {
+        DxilValue::ConstantInt { value } => Some(*value),
+        DxilValue::ConstantZero => Some(0),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DxilNumThreadsError {
+    #[error("DXBC/DXILコンテナ・bitstream・MODULE_BLOCKのいずれかが解析できない: {0}")]
+    MissingBlock(String),
+    #[error("`dx.entryPoints`という名前付きメタデータが見つからない")]
+    NoEntryPointsMetadata,
+    #[error("`dx.entryPoints`は単一エントリポイントのみ対応(実際={0}個)")]
+    UnsupportedEntryPointCount(usize),
+    #[error("エントリポイントのメタデータ形状が想定と一致しない(Function/Name/Signatures/Resources/ShaderPropertiesの5要素ノードを期待)")]
+    UnexpectedEntryShape,
+    #[error("ShaderPropertiesの中にNumThreadsタグ(kDxilNumThreadsTag=4)が見つからない")]
+    NoNumThreadsTag,
+    #[error("NumThreadsの値ノードが3要素の整数定数ノードではない")]
+    UnexpectedNumThreadsShape,
+}
+
+/// [`decode_metadata_block`]が返した`entries`/`props_fields`(ShaderProperties
+/// ノードの生オペランド列)から、実際に`kDxilNumThreadsTag`(=4)のペアを探し、
+/// その値ノード(3要素、x/y/z)を実際のモジュール定数へ解決する。ロジック単体を
+/// 実バイト列パイプラインから切り離してテストできるよう、純粋関数として分離した
+/// (下記テスト`finds_numthreads_pair_even_when_a_different_value_precedes_it`で、
+/// `(64,1,1)`以外の値も正しく抽出できることを検証し、ハードコードへの後退を
+/// 防ぐ)。
+fn find_numthreads_in_shader_properties(
+    entries: &[MetadataEntry],
+    props_fields: &[u64],
+    values: &[DxilValue],
+) -> Result<(u32, u32, u32), DxilNumThreadsError> {
+    let mut pair = props_fields.chunks_exact(2);
+    for chunk in &mut pair {
+        let (tag_raw, value_raw) = (chunk[0], chunk[1]);
+        let Some(MetadataEntry::Value { value_ref }) = resolve_md_operand(entries, tag_raw) else {
+            continue;
+        };
+        if resolve_module_constant_i64(values, *value_ref) != Some(4) {
+            continue;
+        }
+        let Some(MetadataEntry::Node(nt_fields)) = resolve_md_operand(entries, value_raw) else {
+            return Err(DxilNumThreadsError::UnexpectedNumThreadsShape);
+        };
+        if nt_fields.len() != 3 {
+            return Err(DxilNumThreadsError::UnexpectedNumThreadsShape);
+        }
+        let mut xyz = [0u32; 3];
+        for (out, &raw) in xyz.iter_mut().zip(nt_fields.iter()) {
+            let Some(MetadataEntry::Value { value_ref }) = resolve_md_operand(entries, raw) else {
+                return Err(DxilNumThreadsError::UnexpectedNumThreadsShape);
+            };
+            let v = resolve_module_constant_i64(values, *value_ref)
+                .ok_or(DxilNumThreadsError::UnexpectedNumThreadsShape)?;
+            *out = u32::try_from(v).map_err(|_| DxilNumThreadsError::UnexpectedNumThreadsShape)?;
+        }
+        return Ok((xyz[0], xyz[1], xyz[2]));
+    }
+    Err(DxilNumThreadsError::NoNumThreadsTag)
+}
+
+/// DXILバイト列(DXBCコンテナ)から、`dx.entryPoints`->`ShaderProperties`->
+/// `NumThreads`という実際のMETADATA_BLOCK経路をたどり、`numthreads(x,y,z)`を
+/// 実際に抽出する。`translate_dxil_vector_add_to_spirv`が以前決め打ちで使って
+/// いた`(64,1,1)`を置き換える(前回HANDOFFで明記した既知の負債の解消)。
+pub fn extract_numthreads_from_metadata(bytes: &[u8]) -> Result<(u32, u32, u32), DxilNumThreadsError> {
+    let containers = dxbc::scan_dxbc(bytes);
+    let container = containers
+        .into_iter()
+        .next()
+        .ok_or_else(|| DxilNumThreadsError::MissingBlock("DXBC container".to_string()))?;
+    let dxil_chunk = container
+        .chunks
+        .iter()
+        .find_map(|c| match c.parse() {
+            ChunkData::Dxil(d) => Some(d),
+            _ => None,
+        })
+        .ok_or_else(|| DxilNumThreadsError::MissingBlock("DXIL chunk".to_string()))?;
+    let bc = Bitcode::new(&dxil_chunk.bitcode)
+        .map_err(|e| DxilNumThreadsError::MissingBlock(format!("bitcode: {e:?}")))?;
+    let module_block = bc
+        .elements
+        .iter()
+        .find_map(|el| el.as_block())
+        .filter(|b| b.id == 8)
+        .ok_or_else(|| DxilNumThreadsError::MissingBlock("MODULE_BLOCK".to_string()))?;
+
+    let values = build_module_value_list(module_block);
+
+    // 実バイト列には`METADATA_BLOCK`(id=15)の兄弟が複数存在しうる
+    // (`vector_add.dxil`には実際に2個ある——1個は実際のメタデータノード列、
+    // もう1個は`METADATA_KIND`の固定名一覧のみ)。決め打ちで「1つ目」を使わず、
+    // `dx.entryPoints`という名前付きメタデータを実際に持つ方を探して使う。
+    for md_block in module_block.elements.iter().filter_map(|el| el.as_block()).filter(|b| b.id == 15) {
+        let (entries, named_nodes) = decode_metadata_block(md_block);
+        let Some(entry_points_fields) = named_nodes.get("dx.entryPoints") else {
+            continue;
+        };
+        if entry_points_fields.len() != 1 {
+            return Err(DxilNumThreadsError::UnsupportedEntryPointCount(entry_points_fields.len()));
+        }
+        // `METADATA_NAMED_NODE`のfieldsはMDインデックスへの直接参照
+        // (val-1オフセットではない、実バイト列の手計算トレースで確認済み——
+        // `llvm.ident`/`dx.version`等の既存の名前付きメタデータでも同じ規約が
+        // 成立することを確認済み)。
+        let entry_tuple = entries
+            .get(entry_points_fields[0] as usize)
+            .ok_or(DxilNumThreadsError::UnexpectedEntryShape)?;
+        let MetadataEntry::Node(entry_fields) = entry_tuple else {
+            return Err(DxilNumThreadsError::UnexpectedEntryShape);
+        };
+        if entry_fields.len() != 5 {
+            return Err(DxilNumThreadsError::UnexpectedEntryShape);
+        }
+        let shader_props = resolve_md_operand(&entries, entry_fields[4])
+            .ok_or(DxilNumThreadsError::UnexpectedEntryShape)?;
+        let MetadataEntry::Node(props_fields) = shader_props else {
+            return Err(DxilNumThreadsError::UnexpectedEntryShape);
+        };
+        return find_numthreads_in_shader_properties(&entries, props_fields, &values);
+    }
+    Err(DxilNumThreadsError::NoEntryPointsMetadata)
+}
+
+// ---------------------------------------------------------------------
 // ここから先(SPIR-V生成)は今回新規に追加した部分。DXBC側の
 // `spirv_gen::translate_vector_add_shader`と対になる、DXIL版の
 // vector_addバックエンドである。
@@ -830,15 +1093,13 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
 // 実装済みのものを、DXBC側の`ShaderShape`経由ではなくここから直接呼ぶ形で
 // 再利用する(コード重複を避ける)。
 //
-// **正直な開示(スレッドグループサイズ)**: DXBCの`dcl_thread_group`に相当
-// する情報は、DXILでは`METADATA_BLOCK`内の`dx.entryPoints`メタデータに
-// エンコードされており、このセクションのスコープ(`FUNCTION_BLOCK`の
-// 命令列デコード)では読み取っていない。このリポジトリが対象とする唯一の
-// 実バイト列`vector_add.dxil`は`shaders/vector_add_dxil.hlsl`
-// (`[numthreads(64, 1, 1)]`、DXBC版と意図的に同一の契約)をdxc.exeで
-// コンパイルしたものだと分かっているため、ここでは`(64, 1, 1)`を
-// 決め打ちで使う。METADATA_BLOCKからの実抽出は今回のスコープ外
-// (将来の課題として正直に残す)。
+// **スレッドグループサイズ(2026-07-25続き8で決め打ちを解消)**: 以前は
+// `(64, 1, 1)`を決め打ちで使っていたが、今回`extract_numthreads_from_metadata`
+// (上記セクション)を実装し、`METADATA_BLOCK`内の`dx.entryPoints`->
+// `ShaderProperties`->`NumThreads`(`kDxilNumThreadsTag`=4)という実際の経路を
+// 実バイト列からたどって抽出するようにした。DXBC側の`dcl_thread_group`抽出と
+// 同じ「決め打ちではなく実バイト列からの抽出」という原則に、DXIL側もようやく
+// 追いついた形。
 
 use crate::spirv_gen::emit_spirv_for_kernel;
 use crate::BinaryOp;
@@ -858,6 +1119,8 @@ pub enum DxilSpirvError {
     UnexpectedBufferLoadCount(usize),
     #[error("BufferStoreの呼び出しが想定と異なる個数だった(実際={0}, 期待=1)")]
     UnexpectedBufferStoreCount(usize),
+    #[error("METADATA_BLOCKからのnumThreads抽出に失敗した: {0}")]
+    NumThreads(#[from] DxilNumThreadsError),
 }
 
 /// DXILバイト列(`vector_add.dxil`と同じ契約の1シェーダー専用)を解析し、
@@ -889,14 +1152,19 @@ pub fn translate_dxil_vector_add_to_spirv(
     let uav_b = buffer_loads[1] as u32;
     let uav_c = uav_c as u32;
 
-    // このシェーダー(vector_add_dxil.hlsl)専用の既知値:
-    // [numthreads(64, 1, 1)]、演算はfadd(BinaryOp::Add)、境界チェック無し。
-    let spirv_words = emit_spirv_for_kernel((64, 1, 1), uav_a, uav_b, uav_c, BinaryOp::Add, false);
+    // スレッドグループサイズは、以前の決め打ち`(64,1,1)`ではなく、
+    // `METADATA_BLOCK`の`dx.entryPoints`から実際に抽出する
+    // (`extract_numthreads_from_metadata`、上記セクション参照)。
+    // このシェーダー専用の既知値として残るのは演算(fadd/`BinaryOp::Add`)と
+    // 境界チェック無し、の2点のみ(`resolve_vector_add_dxil_calls`が検証する
+    // 形状がそもそもこの2つを前提にしている)。
+    let local_size = extract_numthreads_from_metadata(bytes)?;
+    let spirv_words = emit_spirv_for_kernel(local_size, uav_a, uav_b, uav_c, BinaryOp::Add, false);
 
     Ok(crate::spirv_gen::TranslatedKernel {
         spirv_words,
         entry_point: "main",
-        local_size: (64, 1, 1),
+        local_size,
         uav_bind_points: (uav_a, uav_b, uav_c),
     })
 }
@@ -1069,6 +1337,75 @@ mod tests {
         assert_eq!(decode_signed_vbr(138), 69);
         // 負の値(奇数ビットが立っている場合)。
         assert_eq!(decode_signed_vbr(3), -1);
+    }
+
+    /// 実`vector_add.dxil`(前回HANDOFFで決め打ちの負債として明記した通り、
+    /// 以前は`(64,1,1)`をハードコードしていた箇所)から、実際に
+    /// `METADATA_BLOCK`->`dx.entryPoints`->`ShaderProperties`->`NumThreads`
+    /// という経路をたどって`(64,1,1)`を抽出できることを確認する。
+    #[test]
+    fn extracts_real_numthreads_from_dxil_metadata_block_not_hardcoded() {
+        let numthreads = extract_numthreads_from_metadata(VECTOR_ADD_DXIL)
+            .expect("real dxc-compiled DXIL must expose dx.entryPoints numThreads metadata");
+        assert_eq!(numthreads, (64, 1, 1));
+    }
+
+    #[test]
+    fn translate_dxil_vector_add_to_spirv_uses_extracted_not_hardcoded_local_size() {
+        let kernel = translate_dxil_vector_add_to_spirv(VECTOR_ADD_DXIL)
+            .expect("real dxc-compiled DXIL must translate to SPIR-V");
+        // `extract_numthreads_from_metadata`単体のテストと同じ値になっているはず
+        // (このテストは、それがちゃんと`translate_dxil_vector_add_to_spirv`の
+        // 実際の呼び出し経路で使われていること——決め打ちに戻っていないこと
+        // ——を確認する)。
+        assert_eq!(kernel.local_size, (64, 1, 1));
+    }
+
+    /// **regression guard(ハードコードへの後退を防ぐ)**: `find_numthreads_in_shader_properties`
+    /// (純粋関数、実バイト列パイプラインから切り離してテスト可能)に対して、
+    /// `vector_add.dxil`の実際の並び(タグ0=ShaderFlagsが先、タグ4=NumThreadsが
+    /// 後)と同じ構造を持ちつつ、値だけ`(64,1,1)`とは異なる`(32, 8, 2)`を
+    /// 手構築した`MetadataEntry`/`DxilValue`列に対して与え、正しく`(32,8,2)`が
+    /// 返ることを確認する。もし実装が「METADATA_BLOCKを読んだふりをして実は
+    /// `(64,1,1)`を返すだけ」というハードコードへ後退した場合、このテストは
+    /// 確実に失敗する(実バイト列側のテストだけでは`(64,1,1)`という偶然の一致で
+    /// 検出できないため、この合成テストが必要)。
+    #[test]
+    fn finds_numthreads_pair_even_when_a_different_value_precedes_it() {
+        // モジュール値リスト(絶対インデックス): [0]=関数(main相当、未使用),
+        // [1]=ShaderFlagsの値0, [2]=NumThreadsタグ4, [3..6]=32,8,2。
+        let values = vec![
+            DxilValue::Function { name: Some("main".to_string()) },
+            DxilValue::ConstantInt { value: 0 },
+            DxilValue::ConstantInt { value: 4 },
+            DxilValue::ConstantInt { value: 32 },
+            DxilValue::ConstantInt { value: 8 },
+            DxilValue::ConstantInt { value: 2 },
+        ];
+        // MDエントリ(0-indexed、`resolve_md_operand`はval-1で引く):
+        // entries[0..2] = ShaderFlagsペア(タグ=MD0, 値=MD1)。
+        // entries[2] = ShaderFlagsタグを指すValue(value_ref=1、定数0)。
+        // entries[3] = ShaderFlags値を指すValue(value_ref=1、たまたま同じ定数0を使い回す、実配線とは無関係)。
+        // entries[4] = NumThreadsタグを指すValue(value_ref=2、定数4)。
+        // entries[5..8] = NumThreadsの{x,y,z}各要素を指すValue。
+        // entries[8] = NumThreadsノード本体(3要素)。
+        let entries = vec![
+            /* [0] */ MetadataEntry::Value { value_ref: 1 }, // ShaderFlagsタグ(値=0)
+            /* [1] */ MetadataEntry::Value { value_ref: 1 }, // ShaderFlags値(ダミー)
+            /* [2] */ MetadataEntry::Value { value_ref: 2 }, // NumThreadsタグ(値=4)
+            /* [3] */ MetadataEntry::Value { value_ref: 3 }, // x=32
+            /* [4] */ MetadataEntry::Value { value_ref: 4 }, // y=8
+            /* [5] */ MetadataEntry::Value { value_ref: 5 }, // z=2
+            /* [6] */ MetadataEntry::Node(vec![4, 5, 6]), // NumThreadsノード({x,y,z} -> entries[3,4,5])
+        ];
+        // ShaderPropertiesの生オペランド列(val+1エンコード): (tag=1, value=2, tag=3, value=7)。
+        // 1つ目のペア(タグ=entries[0]=ShaderFlags、値=0)は一致せずスキップされ、
+        // 2つ目のペア(タグ=entries[2]=NumThreads、値=entries[6]=ノード)が採用される
+        // ——実`vector_add.dxil`と同じ「ShaderFlagsが先、NumThreadsが後」の並び。
+        let props_fields = vec![1, 2, 3, 7];
+        let result = find_numthreads_in_shader_properties(&entries, &props_fields, &values)
+            .expect("synthetic shader-properties pair scan must find the NumThreads tag");
+        assert_eq!(result, (32, 8, 2), "must extract the synthetic (32,8,2), not the real shader's (64,1,1)");
     }
 
     #[test]

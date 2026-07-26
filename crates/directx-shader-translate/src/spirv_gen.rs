@@ -38,11 +38,12 @@
 //! 宣言のみで未使用のまま——呼び出し側が`numthreads`の倍数でディスパッチ
 //! する責任を負う)。
 
-use dxbc::shex::{Instruction, InstructionKind, Opcode, OperandIndex, RegisterType};
+use dxbc::shex::{ComponentSelect, Instruction, InstructionKind, Opcode, Operand, OperandIndex, RegisterType};
 use dxbc::{scan_dxbc, ChunkData};
 use rspirv::binary::Assemble;
 use rspirv::dr::{Builder, Operand as DrOperand};
 use rspirv::spirv;
+use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::TranslateError;
@@ -528,6 +529,458 @@ fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
     module.assemble()
 }
 
+// ---------------------------------------------------------------------
+// ここから先(「N個の逐次2項演算」パターンクラス)は今回新規に追加した部分。
+// ---------------------------------------------------------------------
+//
+// 既存の`decode_shader_shape`(UAV3本固定・2項演算1回固定、`ShaderShape`)は
+// 一切変更していない(既存4形状+境界チェック版の実Vulkanテストへの回帰リスクを
+// ゼロにするため)。今回追加したのは、それとは別の、より一般化されたパターン
+// クラス`decode_chain_shape`/`ChainShape`である。
+//
+// **一般化の軸**: `shaders/vector_add_mul_chain.hlsl`
+// (`t = InputA[i] + InputB[i]; Output[i] = t * InputA[i];`、UAV3本・
+// 2項演算2回)を実際に`fxc.exe /T cs_5_0`でコンパイルし、
+// `examples/dump_shex.rs`で実SHEX命令列をダンプして確認したところ、
+// **予想に反して`dcl_temps`は1個のまま**だった(`t`という1つの一時変数しか
+// HLSL上には無いにもかかわらず、fxcは`InputA[i]`の2回目の参照を「ロード
+// し直す」のではなく「最初の`ld_structured`の結果(`r0.y`)を単純に再利用する
+// (共通部分式除去/CSE)」という最適化をしていた——2回目の`ld_structured`は
+// 実バイト列に存在しない)。そのため一般化の軸は「N+1個の一時レジスタ」でも
+// 「N回の`ld_structured`」でもなく、**「一時レジスタの各コンポーネントへ、
+// バッファ読み込みまたは2項演算の結果を割り当てていく評価式の木
+// (制御フロー無し)」**とした——`store_structured`が最終的に参照する
+// コンポーネントから逆算して式木を実際に構築し、そこに含まれる
+// `ld_structured`(読み込み元UAV)・2項演算(`add`/`mul`、既存3パターンと同じ
+// 検出方式)の数も、同じ一時レジスタコンポーネントが何回再利用されるかも
+// 問わない(1回でも2回でもN回でも、fxcがCSEで詰め込んでいても同じロジックで
+// 扱える)。これは「シェーダー5個目の形をそのままハードコードする」のでは
+// なく、マッチングロジック自体を「N個の逐次2項演算」というパターンクラスへ
+// 一般化したものである。
+//
+// **正直な開示(UAV本数)**: 当初はUAV4本(A/B/C/Out)の式`(a+b)*c`を狙ったが、
+// `opencuda-vulkan::VulkanDevice::launch_kernel`が`"vector_add"`/`"matmul"`
+// のいずれも厳密に3バッファ固定の引数配線しか持たない(`real.rs`の
+// `ensure_vector_add_args`/`ensure_matmul_args`実装で確認済み、
+// `open-cuda`側は今回変更しない方針のため)ため、実Vulkan実機テストに乗せる
+// 都合上、UAV3本(`InputA`を2回参照する`t = A+B; Out = t*A;`)へ設計を変更した。
+// UAV本数自体を増やす一般化ではなく、「同一UAVの多重参照込みの2項演算チェーン」
+// という軸に絞った——これも正直な開示の通り、当初想定より小さいが実物の
+// 一般化である。
+//
+// **正直な開示(スコープ)**: 対応する2項演算は`add`/`mul`のみ(このシェーダーが
+// 実際に使うのがこの2つのため)。`sub`(negated-add最適化)・`div`は、既存の
+// `decode_shader_shape`側でのみ対応済みで、この一般化されたチェーン内での
+// 混在(例: `(a+b)/c`)は未検証のため今回のクラスでは明示的に拒否する
+// (`sub`はoperandの`negate`規約、`div`はoperand順序が`add`/`mul`と異なる
+// ことが既存コードで判明済みで、チェーン内での正しい順序をこの1シェーダー
+// だけでは検証しきれないため——「対応している」という誤ったシグナルを出さない)。
+// 境界チェック(`ult`/`if`/`endif`)も今回のクラスでは対象外(既存クラス側の
+// みが対応)。
+
+/// 一時レジスタコンポーネントが実際に評価する式。`ld_structured`で読み込んだ
+/// 値そのもの(`Load`)か、既存の2つの式を入力に取る2項演算(`BinOp`)の
+/// いずれか——制御フローを含まない評価式の木。
+#[derive(Debug, Clone)]
+enum RegExpr {
+    /// このUAVバインドポイントから読み込んだ値。
+    Load(u32),
+    /// 2つの部分式に対する2項演算の結果。
+    BinOp(BinaryOp, Box<RegExpr>, Box<RegExpr>),
+}
+
+/// [`RegExpr`]の木を実際に辿り、含まれる`Load`(読み込み元UAV)を出現順に集める。
+fn collect_loads(expr: &RegExpr, out: &mut Vec<u32>) {
+    match expr {
+        RegExpr::Load(uav) => out.push(*uav),
+        RegExpr::BinOp(_, lhs, rhs) => {
+            collect_loads(lhs, out);
+            collect_loads(rhs, out);
+        }
+    }
+}
+
+/// 検証済みの「N個の逐次2項演算」シェーダー形状。
+struct ChainShape {
+    thread_group: (u32, u32, u32),
+    write_uav: u32,
+    /// `store_structured`が最終的に参照する式木(制御フロー無し)。
+    root: RegExpr,
+}
+
+/// 一時レジスタのオペランドから`(temp_index, component_index)`キーを取り出す
+/// (書き込み側は単一コンポーネントの`Mask`、読み込み側は`Scalar`選択のみ対応
+/// ——`vector_add_mul_chain.dxbc`の実オペランド形状で確認済み)。
+fn temp_key(op: &Operand, want_write: bool) -> Option<(u32, u32)> {
+    if op.reg_type != RegisterType::Temp {
+        return None;
+    }
+    let temp_index = match op.indices.first()? {
+        OperandIndex::Imm32(i) => *i,
+        _ => return None,
+    };
+    let component = if want_write {
+        match op.components {
+            ComponentSelect::Mask(m) if m.count_ones() == 1 => m.trailing_zeros(),
+            _ => return None,
+        }
+    } else {
+        match op.components {
+            ComponentSelect::Scalar(c) => c as u32,
+            _ => return None,
+        }
+    };
+    Some((temp_index, component))
+}
+
+/// 実際のSHEX命令列を、「N個の逐次2項演算(制御フロー無し)」パターンクラスと
+/// 突き合わせる。1命令でも想定外の形状があれば正直に拒否する。
+fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvGenError> {
+    let mut declared_uavs: Vec<u32> = Vec::new();
+    let mut thread_group: Option<(u32, u32, u32)> = None;
+    let mut reg_map: HashMap<(u32, u32), RegExpr> = HashMap::new();
+    let mut store_uav: Option<u32> = None;
+    let mut root: Option<RegExpr> = None;
+    let mut saw_ret = false;
+
+    for ins in instructions {
+        match &ins.kind {
+            InstructionKind::DclGlobalFlags { .. } => {}
+            InstructionKind::DclUavStructured { stride, operands, .. } => {
+                if *stride != 4 {
+                    return Err(SpirvGenError::UnsupportedShader(format!(
+                        "dcl_uav_structuredのstrideが4(float)ではない: {stride}"
+                    )));
+                }
+                let op0 = operands.first().ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("dcl_uav_structuredにオペランドが無い".to_string())
+                })?;
+                if op0.reg_type != RegisterType::Uav {
+                    return Err(SpirvGenError::UnsupportedShader(
+                        "dcl_uav_structuredの対象レジスタがUAVではない".to_string(),
+                    ));
+                }
+                let idx = uav_index(&op0.indices).ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("UAVバインドポイントを解決できない".to_string())
+                })?;
+                declared_uavs.push(idx);
+            }
+            InstructionKind::DclInput { operands, .. } => {
+                let op0 = operands.first().ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("dcl_inputにオペランドが無い".to_string())
+                })?;
+                if op0.reg_type != RegisterType::ThreadID {
+                    return Err(SpirvGenError::UnsupportedShader(
+                        "対応しているのはvThreadID(SV_DispatchThreadID)入力のみ".to_string(),
+                    ));
+                }
+            }
+            InstructionKind::DclTemps { .. } => {}
+            InstructionKind::DclThreadGroup { x, y, z } => {
+                thread_group = Some((*x, *y, *z));
+            }
+            InstructionKind::Generic { operands } => match ins.opcode {
+                Opcode::LdStructured => {
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("ld_structuredの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "ld_structuredの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let idx_operand = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("ld_structuredの添字オペランドが無い".to_string())
+                    })?;
+                    if idx_operand.reg_type != RegisterType::ThreadID {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "対応しているのはvThreadIDによる添字のみ".to_string(),
+                        ));
+                    }
+                    let src_uav = operands.get(3).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("ld_structuredのUAVオペランドが無い".to_string())
+                    })?;
+                    if src_uav.reg_type != RegisterType::Uav {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "ld_structuredの読み込み元がUAVではない".to_string(),
+                        ));
+                    }
+                    let uav = uav_index(&src_uav.indices).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("ld_structuredのUAVバインドポイントを解決できない".to_string())
+                    })?;
+                    reg_map.insert(dest_key, RegExpr::Load(uav));
+                }
+                Opcode::Add | Opcode::Mul => {
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mulの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "add/mulの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let src1 = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mulの第1ソースオペランドが無い".to_string())
+                    })?;
+                    if src1.negate {
+                        // 既存`decode_shader_shape`が扱う「negated-add-as-sub」は、
+                        // このチェーンクラスでは対応スコープ外(上記docコメント参照)。
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "チェーン内でのnegateフラグ(sub最適化)は対応スコープ外".to_string(),
+                        ));
+                    }
+                    let src2 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mulの第2ソースオペランドが無い".to_string())
+                    })?;
+                    let src1_key = temp_key(src1, false).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "add/mulの第1ソースが一時レジスタのスカラー選択ではない".to_string(),
+                        )
+                    })?;
+                    let src2_key = temp_key(src2, false).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "add/mulの第2ソースが一時レジスタのスカラー選択ではない".to_string(),
+                        )
+                    })?;
+                    let rhs = reg_map.get(&src1_key).cloned().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mulの第1ソースがまだ定義されていない一時レジスタを参照している".to_string())
+                    })?;
+                    let lhs = reg_map.get(&src2_key).cloned().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mulの第2ソースがまだ定義されていない一時レジスタを参照している".to_string())
+                    })?;
+                    let op = if ins.opcode == Opcode::Add { BinaryOp::Add } else { BinaryOp::Mul };
+                    reg_map.insert(dest_key, RegExpr::BinOp(op, Box::new(lhs), Box::new(rhs)));
+                }
+                Opcode::StoreStructured => {
+                    let dest_uav = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("store_structuredの書き込み先オペランドが無い".to_string())
+                    })?;
+                    if dest_uav.reg_type != RegisterType::Uav {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "store_structuredの書き込み先がUAVではない".to_string(),
+                        ));
+                    }
+                    let idx = uav_index(&dest_uav.indices).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("store_structuredのUAVバインドポイントを解決できない".to_string())
+                    })?;
+                    store_uav = Some(idx);
+                    let idx_operand = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("store_structuredの添字オペランドが無い".to_string())
+                    })?;
+                    if idx_operand.reg_type != RegisterType::ThreadID {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "対応しているのはvThreadIDによる添字のみ".to_string(),
+                        ));
+                    }
+                    let val_operand = operands.get(3).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("store_structuredの書き込み値オペランドが無い".to_string())
+                    })?;
+                    let val_key = temp_key(val_operand, false).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "store_structuredの書き込み値が一時レジスタのスカラー選択ではない".to_string(),
+                        )
+                    })?;
+                    root = Some(reg_map.get(&val_key).cloned().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("store_structuredがまだ定義されていない一時レジスタを参照している".to_string())
+                    })?);
+                }
+                Opcode::Ret => {
+                    saw_ret = true;
+                }
+                other => {
+                    return Err(SpirvGenError::UnsupportedShader(format!(
+                        "チェーンクラスの対応スコープ外のオペコード: {other:?}"
+                    )));
+                }
+            },
+            other => {
+                return Err(SpirvGenError::UnsupportedShader(format!(
+                    "チェーンクラスの対応スコープ外の宣言命令: {other:?}"
+                )));
+            }
+        }
+    }
+
+    if declared_uavs.len() < 2 {
+        return Err(SpirvGenError::UnsupportedShader(format!(
+            "チェーンクラスはUAV2本以上(N入力+1出力)を想定するが{}本だった",
+            declared_uavs.len()
+        )));
+    }
+    let thread_group = thread_group
+        .ok_or_else(|| SpirvGenError::UnsupportedShader("dcl_thread_groupが見つからない".to_string()))?;
+    let write_uav = store_uav
+        .ok_or_else(|| SpirvGenError::UnsupportedShader("store_structuredが見つからない".to_string()))?;
+    let root = root.ok_or_else(|| {
+        SpirvGenError::UnsupportedShader("store_structuredが式を書き込んでいない".to_string())
+    })?;
+    if !saw_ret {
+        return Err(SpirvGenError::UnsupportedShader("ret命令が見つからない".to_string()));
+    }
+    // 少なくとも1回の2項演算(N>=1)を要求する(0回=単純コピーは対象外、
+    // 既存の`decode_shader_shape`ともパターンが重ならないようにするため)。
+    let mut loads = Vec::new();
+    collect_loads(&root, &mut loads);
+    if matches!(root, RegExpr::Load(_)) {
+        return Err(SpirvGenError::UnsupportedShader(
+            "2項演算を1回も含まない(単純コピー)シェーダーは対応スコープ外".to_string(),
+        ));
+    }
+
+    Ok(ChainShape { thread_group, write_uav, root })
+}
+
+/// [`translate_chain_shader`]が返す翻訳結果。既存の[`TranslatedKernel`]は
+/// 読み込みUAVがちょうど2本という前提の3要素タプルを持つため、N本(N>=1)の
+/// 読み込みUAVを表現できるよう別の型として定義する。
+#[derive(Debug, Clone)]
+pub struct ChainTranslatedKernel {
+    pub spirv_words: Vec<u32>,
+    pub entry_point: &'static str,
+    pub local_size: (u32, u32, u32),
+    /// 式木を実際に辿って集めた、読み込み元UAVバインドポイントの一覧
+    /// (出現順、重複あり得る)。
+    pub read_uav_bind_points: Vec<u32>,
+    pub write_uav_bind_point: u32,
+}
+
+/// DXBCバイト列を解析し、「N個の逐次2項演算(制御フロー無し)」パターンクラス
+/// (`decode_chain_shape`)に一致すれば実際のSHEX命令列を検証しながらSPIR-Vへ
+/// 翻訳する。一致しなければ`SpirvGenError::UnsupportedShader`を返す
+/// (既存の`translate_shader`とは独立した、別のエントリポイント)。
+pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, SpirvGenError> {
+    let containers = scan_dxbc(bytes);
+    let container = containers.into_iter().next().ok_or_else(|| {
+        SpirvGenError::Translate(TranslateError::Parse("DXBCコンテナが見つからない".to_string()))
+    })?;
+
+    let mut instructions: Option<Vec<Instruction>> = None;
+    for chunk in &container.chunks {
+        if let ChunkData::Shader(program) = chunk.parse() {
+            instructions = Some(program.instructions);
+        }
+    }
+    let instructions = instructions.ok_or(SpirvGenError::Translate(TranslateError::MissingChunk("SHEX")))?;
+
+    let shape = decode_chain_shape(&instructions)?;
+    let mut read_uav_bind_points = Vec::new();
+    collect_loads(&shape.root, &mut read_uav_bind_points);
+    let spirv_words = emit_chain_spirv(&shape);
+
+    Ok(ChainTranslatedKernel {
+        spirv_words,
+        entry_point: "main",
+        local_size: shape.thread_group,
+        read_uav_bind_points,
+        write_uav_bind_point: shape.write_uav,
+    })
+}
+
+/// [`ChainShape`]から実際にSPIR-Vバイナリを組み立てる。`RegExpr`の木を
+/// 実際に(post-order、`Load`は毎回新しく`OpAccessChain`+`OpLoad`を発行、
+/// 共有部分式の再利用は行わない——このシェーダーの式木に共有部分式が
+/// 無いため、正しさに影響は無い)辿って対応するSPIR-V命令列を発行する。
+fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let uint_ty = b.type_int(32, 0);
+    let uvec3_ty = b.type_vector(uint_ty, 3);
+
+    let rt_array_ty = b.type_runtime_array(float_ty);
+    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(4)]);
+    let buf_struct_ty = b.type_struct(vec![rt_array_ty]);
+    b.decorate(buf_struct_ty, spirv::Decoration::BufferBlock, vec![]);
+    b.member_decorate(buf_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let buf_ptr_ty = b.type_pointer(None, spirv::StorageClass::Uniform, buf_struct_ty);
+
+    // 実際に式木に登場するUAVバインドポイント(読み込み+書き込み)ごとに、1つの
+    // storage bufferバリアブルを作る(重複作成しないよう、既に作った分は
+    // 再利用する)。
+    let mut buffer_vars: HashMap<u32, u32> = HashMap::new();
+    let ensure_buffer_var = |b: &mut Builder, binding: u32, vars: &mut HashMap<u32, u32>| -> u32 {
+        *vars.entry(binding).or_insert_with(|| {
+            let var = b.variable(buf_ptr_ty, None, spirv::StorageClass::Uniform, None);
+            b.decorate(var, spirv::Decoration::DescriptorSet, vec![DrOperand::LiteralBit32(0)]);
+            b.decorate(var, spirv::Decoration::Binding, vec![DrOperand::LiteralBit32(binding)]);
+            var
+        })
+    };
+
+    let mut all_uavs = Vec::new();
+    collect_loads(&shape.root, &mut all_uavs);
+    all_uavs.push(shape.write_uav);
+    for uav in &all_uavs {
+        ensure_buffer_var(&mut b, *uav, &mut buffer_vars);
+    }
+
+    let gid_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, uvec3_ty);
+    let var_gid = b.variable(gid_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_gid, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::GlobalInvocationId)]);
+
+    let float_ptr_uniform_ty = b.type_pointer(None, spirv::StorageClass::Uniform, float_ty);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let const_0 = b.constant_bit32(uint_ty, 0);
+    let gid_vec = b.load(uvec3_ty, None, var_gid, None, vec![]).expect("OpLoad gid");
+    let idx = b.composite_extract(uint_ty, None, gid_vec, vec![0]).expect("OpCompositeExtract .x");
+
+    fn emit_expr(
+        b: &mut Builder,
+        expr: &RegExpr,
+        buffer_vars: &HashMap<u32, u32>,
+        float_ptr_uniform_ty: u32,
+        float_ty: u32,
+        const_0: u32,
+        idx: u32,
+    ) -> u32 {
+        match expr {
+            RegExpr::Load(uav) => {
+                let var = *buffer_vars.get(uav).expect("buffer var must exist for every referenced UAV");
+                let ac = b.access_chain(float_ptr_uniform_ty, None, var, vec![const_0, idx]).expect("OpAccessChain");
+                b.load(float_ty, None, ac, None, vec![]).expect("OpLoad")
+            }
+            RegExpr::BinOp(op, lhs, rhs) => {
+                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+                match op {
+                    BinaryOp::Add => b.f_add(float_ty, None, l, r).expect("OpFAdd"),
+                    BinaryOp::Mul => b.f_mul(float_ty, None, l, r).expect("OpFMul"),
+                    BinaryOp::Sub => b.f_sub(float_ty, None, l, r).expect("OpFSub"),
+                    BinaryOp::Div => b.f_div(float_ty, None, l, r).expect("OpFDiv"),
+                }
+            }
+        }
+    }
+
+    let result = emit_expr(&mut b, &shape.root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+
+    let write_var = *buffer_vars.get(&shape.write_uav).expect("write buffer var must exist");
+    let ac_out =
+        b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
+    b.store(ac_out, result, None, vec![]).expect("OpStore out");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::GLCompute, main_fn, "main", vec![var_gid]);
+    b.execution_mode(
+        main_fn,
+        spirv::ExecutionMode::LocalSize,
+        [shape.thread_group.0, shape.thread_group.1, shape.thread_group.2],
+    );
+
+    let module = b.module();
+    module.assemble()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,5 +1080,55 @@ mod tests {
         let mut loader = rspirv::dr::Loader::new();
         rspirv::binary::parse_bytes(&bytes, &mut loader)
             .expect("emitted SPIR-V (div) must be well-formed and re-parseable");
+    }
+
+    /// `shaders/vector_add_mul_chain.dxbc`(実fxc.exe出力、UAV3本・
+    /// `t = A[i]+B[i]; Out[i] = t*A[i];`という2項演算2回のチェーン、
+    /// `A`を2回参照するがfxcがCSEで2回目のロードを省略する実バイト列)。
+    /// 既存の`translate_shader`(単一演算・UAV3本固定)ではなく、新設した
+    /// `translate_chain_shader`(N個の逐次2項演算パターンクラス)を使う。
+    const VECTOR_ADD_MUL_CHAIN_DXBC: &[u8] = include_bytes!("../shaders/vector_add_mul_chain.dxbc");
+
+    #[test]
+    fn translates_real_fxc_compiled_vector_add_mul_chain_dxbc_to_valid_spirv() {
+        let kernel = translate_chain_shader(VECTOR_ADD_MUL_CHAIN_DXBC)
+            .expect("real fxc-compiled 2-op chain (add then mul, 3 UAVs, CSE'd reload) must translate");
+        // 実際にDXBCから抽出した値であることの検証(決め打ちではない):
+        // 式木は`(A+B)*A`なので、木を辿って集めた読み込み順は[A(u0), B(u1), A(u0)]
+        // (fxcが2回目のA読み込みを`ld_structured`として出さずCSEで再利用したため、
+        // ここでの「2回出現」は式木そのものの構造から来ている、決め打ちの重複ではない)。
+        assert_eq!(kernel.read_uav_bind_points, vec![0, 1, 0]);
+        assert_eq!(kernel.write_uav_bind_point, 2);
+        assert_eq!(kernel.local_size, (64, 1, 1));
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203);
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_bytes(&bytes, &mut loader)
+            .expect("emitted SPIR-V (2-op chain) must be well-formed and re-parseable");
+    }
+
+    #[test]
+    fn chain_translator_honestly_rejects_garbage_bytes() {
+        let garbage = [0u8; 16];
+        assert!(translate_chain_shader(&garbage).is_err());
+    }
+
+    /// **既存4形状+境界チェック版に回帰が無いことの確認**: 新設した
+    /// `translate_chain_shader`(N個の逐次2項演算)へ、既存の単一演算専用
+    /// シェーダー(`vector_add.dxbc`)を渡すと、`decode_chain_shape`の
+    /// 「2本以上のUAV(N入力+1出力)」等の要件自体は満たすものの、実際には
+    /// 単一演算のみでチェーンを構成しないため——このシェーダー自体はチェーン
+    /// クラスの要件(2項演算1回以上)も満たしてしまう。したがって`translate_shader`
+    /// (既存)と`translate_chain_shader`(新設)は同じ入力を「両方とも」正しく
+    /// 翻訳できてよい(排他的である必要はない、単に別のパターンクラスとして
+    /// 共存するだけ)ことを確認する——既存側の挙動に手を入れていないことの
+    /// 追加確認。
+    #[test]
+    fn chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader() {
+        let kernel = translate_chain_shader(VECTOR_ADD_DXBC)
+            .expect("a single add is a valid (trivial, N=1) instance of the chain pattern class too");
+        assert_eq!(kernel.read_uav_bind_points, vec![0, 1]);
+        assert_eq!(kernel.write_uav_bind_point, 2);
     }
 }

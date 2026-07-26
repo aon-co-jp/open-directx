@@ -214,11 +214,30 @@ pwsh tools/compile-dxbc-shaders.ps1
   SPIR-Vを生成し、`tests/vector_add_dxil_real_vulkan.rs`がこのマシンの
   実NVIDIA GT 730へディスパッチしてCPU参照実装`a[i]+b[i]`と256要素すべて
   で数値一致することを検証済み(DXBC側`vector_add`テストと同じ厳密さ)。
-  **既知の未解決点**: SPIR-Vのワークグループサイズ(`64,1,1`)はDXILの
-  `METADATA_BLOCK`(`dx.entryPoints`)から抽出せず決め打ちのままで、
-  DXBC側の「宣言命令からの実抽出、決め打ち無し」という原則からの唯一の
-  逸脱。add以外の演算・複数基本ブロック・境界チェック・異なる`numthreads`
-  等、他の形状は引き続き正直に拒否される(誤翻訳しない)。
+  **ワークグループサイズは決め打ちを解消し、実際に抽出するようになった**:
+  `extract_numthreads_from_metadata`(`dxil.rs`)が実際の`METADATA_BLOCK`
+  経路(`dx.entryPoints`->エントリポイントタプル->`ShaderProperties`->
+  `kDxilNumThreadsTag`(=4、Microsoft`DirectXShaderCompiler`の
+  `DxilMetadataHelper.h`/`.cpp`で確認済み))をたどり、`{x,y,z}`ノードを
+  モジュールの実値リストへ解決して`vector_add.dxil`の実バイト列から
+  `(64,1,1)`を得る——以前の決め打ちという既知の負債を解消した。合成
+  メタデータで異なる値を与えると異なる値を正しく返すことを検証する回帰
+  防止テストも追加済み。add以外の演算・複数基本ブロック・境界チェック等、
+  他の形状は引き続き正直に拒否される(誤翻訳しない)。
+- **DXBCデコーダを「N個の逐次2項演算(制御フロー無し)」というパターン
+  クラスへ一般化した(既存4形状は無変更で共存)。**
+  `spirv_gen::translate_chain_shader`/`decode_chain_shape`が、一時
+  レジスタの各コンポーネントへの割り当てを実際に式木として構築する
+  (`ld_structured`=読み込み、`add`/`mul`=2項演算)ため、演算回数が1回でも
+  2回でもN回でも同じロジックで扱える。実際に新規コンパイルしたシェーダー
+  (`vector_add_mul_chain.hlsl`、`t=A[i]+B[i]; Out[i]=t*A[i];`)で検証した
+  ところ、fxcが`A[i]`の2回目の参照を`ld_structured`の再発行ではなく
+  「共通部分式除去(CSE)による一時レジスタコンポーネントの再利用」へ
+  最適化していた、という予期しなかった実発見があり、式木ベースの
+  デコーダは追加の特殊対応なしにこれを正しく扱えた。このマシンの実
+  NVIDIA GT 730でCPU参照実装`(a[i]+b[i])*a[i]`との数値一致を検証済み。
+  `sub`/`div`はチェーン内では意図的に未対応のまま(単一演算ケースでしか
+  オペランド順序の意味を検証していないため)。
 - フルグラフィックスパイプライン(ラスタライザ・テクスチャサンプラ・
   ブレンドステート)——それまでスコープ外。
 - PlayStationファミリー対応——法務・利用規約上の懸念から明示的に

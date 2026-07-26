@@ -49,7 +49,7 @@ fn main() {
                             // TYPE_BLOCK_ID_NEW(17) と FUNCTION_BLOCK(12) は
                             // 今回の翻訳作業で実際に必要な中身なので、レコード単位
                             // (code + fields値そのもの)まで掘り下げてダンプする。
-                            if sub.id == 17 || sub.id == 12 || sub.id == 11 {
+                            if sub.id == 17 || sub.id == 12 || sub.id == 11 || sub.id == 15 {
                                 for (idx, deeper) in sub.elements.iter().enumerate() {
                                     if let Some(rec) = deeper.as_record() {
                                         println!(
@@ -95,6 +95,34 @@ fn main() {
                                             rec.id,
                                             rec.fields(),
                                             payload
+                                        );
+                                    }
+                                }
+                            }
+                            if sub.id == 15 {
+                                // METADATA_BLOCK(id=15): dx.entryPointsは`numthreads`
+                                // (numthreads(64,1,1)等)をエンコードする。ここでは
+                                // レコードのfields()に加えてpayload(文字列メタデータ等)
+                                // まで掘り下げてダンプする(思い込みで対応を書かない、
+                                // CLAUDE.md方針)。子ブロック(METADATA_KIND_BLOCK等)も
+                                // 併せてダンプする。
+                                let mut sub_clone = sub.clone();
+                                for (idx, deeper) in sub_clone.elements.iter_mut().enumerate() {
+                                    if let Some(rec) = deeper.as_record_mut() {
+                                        let payload = rec.take_payload();
+                                        println!(
+                                            "      [{}] METADATA record code={} fields={:?} payload={:?}",
+                                            idx,
+                                            rec.id,
+                                            rec.fields(),
+                                            payload
+                                        );
+                                    } else if let Some(deeper_block) = deeper.as_block() {
+                                        println!(
+                                            "      [{}] METADATA sub-block id={} elements={}",
+                                            idx,
+                                            deeper_block.id,
+                                            deeper_block.elements.len()
                                         );
                                     }
                                 }

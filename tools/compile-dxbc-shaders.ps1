@@ -40,6 +40,8 @@ Write-Host "OK: compiled vector_mul.hlsl -> vector_mul.dxbc (DXBC, SM5.0)"
 Write-Host "OK: compiled vector_sub_bounded.hlsl -> vector_sub_bounded.dxbc (DXBC, SM5.0)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_div.hlsl") /Fo (Join-Path $shaderDir "vector_div.dxbc") /nologo
 Write-Host "OK: compiled vector_div.hlsl -> vector_div.dxbc (DXBC, SM5.0)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_chain.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_chain.dxbc") /nologo
+Write-Host "OK: compiled vector_add_mul_chain.hlsl -> vector_add_mul_chain.dxbc (DXBC, SM5.0, 2 sequential ops / 3 UAVs, reg-expr chain decoder)"
 
 # D3D11グラフィックスパイプライン(タスク2): 頂点/ピクセルシェーダーも
 # fxc.exe(SM<=5.1、DXBC)でコンパイルする。dxc.exeではない(dxc.exeは

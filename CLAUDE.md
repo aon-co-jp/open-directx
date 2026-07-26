@@ -356,3 +356,62 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      標準出力: `device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)` / `OK: DXIL(dxc.exe実コンパイル、SM6.0)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した`。DXBC側4シェーダー分の実機テストも引き続き全green(既存分に変更なし)。ワークスペース全体: unittests 22件 + 実機テスト5本(DXBC4本+DXIL1本)全green。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
   6. **達成した内容(正直な棚卸し)**: D3D12/DXILパイプラインが、D3D11/DXBCパイプラインと同じ「実dxc.exeコンパイル済みシェーダー -> 実際のコンテナ/bitstream解析 -> 実SPIR-V生成 -> 実Vulkanディスパッチ -> CPU参照実装との数値一致」という垂直スライスの終端に到達した。**ただし依然として1つの既知シェーダー形状(`vector_add_dxil.hlsl`)専用**であり、汎用SM6.0デコーダではない(add以外の演算・複数基本ブロック・境界チェック・numthreads以外の値には非対応、いずれも今回の型テーブル/命令列/Call解決ロジックがそのまま拒否する)。
   - 次にすべきこと: (1) `METADATA_BLOCK`から実際に`numthreads`(および将来的にはリソースバインディング情報)を抽出し、DXIL側の決め打ち値を無くす。(2) DXBC側で先に対応したmul/sub_bounded/div相当のDXILシェーダーを`dxc.exe`で追加コンパイルし、`resolve_vector_add_dxil_calls`/`translate_dxil_vector_add_to_spirv`を一般化する(DXBC側で採用した「1つずつ実バイト列を確認して対応を広げる」漸進的アプローチを継続)。(3) D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま、引き続き並行で検討可)。
+
+- **2026-07-25(続き8) 独立した2つの完成度改善タスクを実施: (1)DXILのnumThreadsをMETADATA_BLOCKから実抽出(前回HANDOFFで明記した決め打ちの負債を解消)、(2)DXBCデコーダを「N個の逐次2項演算」パターンクラスへ一般化(既存4形状は無変更)**:
+  1. **タスク1(DXIL numThreads実抽出)**:
+     - `examples/dump_dxil.rs`を拡張し`METADATA_BLOCK`(id=15)のレコード(fields+`take_payload()`)まで実際にダンプできるようにした。`vector_add.dxil`には実際に`METADATA_BLOCK`が2個(実際のメタデータノード列41件、と`METADATA_KIND`固定名一覧16件)存在することを再確認。
+     - Web検索でMicrosoft`DirectXShaderCompiler`の`lib/DXIL/DxilMetadataHelper.cpp`(`EmitDxilEntryProperties`/`LoadDxilEntryProperties`)・`include/dxc/DXIL/DxilMetadataHelper.h`を実際に確認し、`kDxilNumThreadsTag=4`という実際の数値と、`ShaderProperties`が`{tag, value, tag, value, ...}`という繰り返しノードで、`NumThreads`の値は`{x,y,z}`3要素の`MDNode`(各要素は`Uint32ToConstMD`)であることを確認した。
+     - `vector_add.dxil`の実バイト列に対して、`dx.entryPoints`(named-node)→エントリポイント5要素タプル(`Function,Name,Signatures,Resources,ShaderProperties`)→`ShaderProperties`ノード(`{tag=MD3(値0=ShaderFlags), value=MD24, tag=MD14(値4=NumThreads), value=MD26}`)→`NumThreads`ノード(`MD26={MD25,MD2,MD2}`)→モジュール値リスト解決(`MD25`→値12→module定数64、`MD2`→値5→module定数1)という経路を実際に手計算でトレースし、`(64,1,1)`が導けることを検証した上でコード化した(推測ではなく実際にバイト列を1つずつ辿って確認)。
+     - 実装(`crates/directx-shader-translate/src/dxil.rs`): `MetadataEntry`(`String`/`Value{value_ref}`/`Node(fields)`)・`decode_metadata_block`(`METADATA_STRING_OLD`(1)/`METADATA_VALUE`(2)/`METADATA_NODE`(3,5)/`METADATA_NAME`(4)/`METADATA_NAMED_NODE`(10)を実際にデコード、`METADATA_KIND`(6)等はMDインデックスを消費しないので無視)・`resolve_md_operand`(val-1、0=null)・`find_numthreads_in_shader_properties`(純粋関数、`{tag,value}`ペアを走査し`kDxilNumThreadsTag`=4と一致するペアの値ノードを解決)・`extract_numthreads_from_metadata(bytes) -> Result<(u32,u32,u32), DxilNumThreadsError>`(公開API、複数の`METADATA_BLOCK`兄弟から`dx.entryPoints`を持つ方を実際に探す、決め打ちで「1つ目」を使わない)。`resolve_vector_add_dxil_calls`が元々インラインで持っていた「関数宣言+モジュール定数」というグローバル値番号付けの構築ロジックを`build_module_value_list`へ切り出し、numThreads抽出側とも共有した(重複実装ではなく共通化)。
+     - `translate_dxil_vector_add_to_spirv`が、以前の決め打ち`(64,1,1)`ではなく`extract_numthreads_from_metadata(bytes)?`を呼ぶよう変更(`DxilSpirvError`に`NumThreads(#[from] DxilNumThreadsError)`を追加)。
+     - **回帰防止テスト**: `finds_numthreads_pair_even_when_a_different_value_precedes_it`は、`vector_add.dxil`とは異なる値`(32,8,2)`を持つ合成`MetadataEntry`/`DxilValue`列(タグ0=ShaderFlagsが先、タグ4=NumThreadsが後という同じ並び)を手構築し、`find_numthreads_in_shader_properties`が正しく`(32,8,2)`を返すことを検証する——実装が「METADATA_BLOCKを読んだふりをして実は`(64,1,1)`を返すだけ」というハードコードへ後退した場合に確実に失敗する(実バイト列側のテストだけでは`(64,1,1)`という偶然の一致で検出できない)。
+  2. **タスク2(DXBCデコーダの一般化)**:
+     - 一般化の軸として「N個の逐次2項演算(制御フロー無し)」を選択。新規シェーダー`shaders/vector_add_mul_chain.hlsl`(`t = InputA[i] + InputB[i]; Output[i] = t * InputA[i];`)を`fxc.exe /T cs_5_0`で実際にコンパイル。**UAV本数は当初4本(A/B/C/Out)を狙ったが、`opencuda-vulkan::VulkanDevice::launch_kernel`が`"vector_add"`/`"matmul"`いずれも厳密に3バッファ固定の引数配線(`ensure_vector_add_args`/`ensure_matmul_args`、`open-cuda`側は今回変更しない方針)しか持たないと実ソースで確認したため、UAV3本(`InputA`を2回参照)へ設計変更した**——正直な開示としてCLAUDE.md/PORTING.mdに明記。
+     - `examples/dump_shex.rs`で実SHEX命令列をダンプして確認したところ、**予想に反して`dcl_temps`は1個のまま**だった。fxcは`t`と`InputA[i]`の2回目の参照を別々の一時レジスタにせず、`r0.x`/`r0.y`という同一レジスタの別コンポーネントへ詰め込んでいた。さらに**2回目の`InputA[i]`参照は`ld_structured`を再発行せず、最初のロード結果(共通部分式除去/CSE)をそのまま再利用していた**——これは予期していなかった実発見。
+     - 実装(`crates/directx-shader-translate/src/spirv_gen.rs`、既存の`decode_shader_shape`/`ShaderShape`/`translate_shader`は一切変更していない、別のパターンクラスとして追加): `RegExpr`(`Load(uav)` / `BinOp(op, lhs, rhs)`という評価式の木)・`decode_chain_shape`(`ld_structured`/`add`/`mul`/`store_structured`を実際に走査し、`HashMap<(temp_index, component), RegExpr>`へ一時レジスタコンポーネントの内容を追跡、`store_structured`が最終的に参照するコンポーネントから逆算して式木全体を構築する。1回でも2回でもN回でも、fxcがCSEで詰め込んでいても同じロジックで扱える——「シェーダー5個目の形をそのままハードコードする」のではなく、マッチングロジック自体を一般化した)。`sub`(negateフラグ)・`div`はチェーン内では意図的に未対応のまま(オペランド順序の意味を単一演算ケースでしか検証していないため、正直な開示)。`translate_chain_shader`(公開API、`ChainTranslatedKernel{read_uav_bind_points: Vec<u32>, write_uav_bind_point: u32, ...}`——既存`TranslatedKernel`の3要素固定タプルでは表現できないため別の型として定義)・`emit_chain_spirv`(式木を実際に再帰(post-order)でSPIR-Vへ翻訳、`Load`ごとに`OpAccessChain`+`OpLoad`、`BinOp`ごとに`OpFAdd`/`OpFMul`)。
+     - **実Vulkanテスト追加**: `tests/vector_add_mul_chain_real_vulkan.rs`(既存4本と同じパターン)、CPU参照実装`(a[i]+b[i])*a[i]`と256要素すべてで数値一致を実機(NVIDIA GT 730)で検証。
+     - **既存4形状+DXILへの回帰が無いことを確認**: `chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader`で、既存の`vector_add.dxbc`が新設のチェーンクラス(N=1の自明な場合)としても正しく翻訳できることを追加確認(排他的である必要はなく、単に別のパターンクラスとして共存する)。
+  3. **実際に`cargo test --workspace --lib`で確認した結果(誇張なし、実出力そのまま)**:
+     ```
+     running 28 tests
+     ...(dxil::tests::extracts_real_numthreads_from_dxil_metadata_block_not_hardcoded ... ok
+      dxil::tests::translate_dxil_vector_add_to_spirv_uses_extracted_not_hardcoded_local_size ... ok
+      dxil::tests::finds_numthreads_pair_even_when_a_different_value_precedes_it ... ok
+      spirv_gen::tests::translates_real_fxc_compiled_vector_add_mul_chain_dxbc_to_valid_spirv ... ok
+      spirv_gen::tests::chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader ... ok
+      spirv_gen::tests::chain_translator_honestly_rejects_garbage_bytes ... ok を含む)
+     test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `cargo test --workspace --test '*' -- --nocapture`(実機、NVIDIA GeForce GT 730、全6本green):
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した
+     test dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, 2項演算2回のチェーン)->SPIR-V(自前生成、式木の再帰翻訳)->実Vulkan経路が、CPU参照実装((a[i]+b[i])*a[i])と256要素すべてで数値一致した
+     c[0]=65, c[255]=708.875
+     test dxbc_vector_add_mul_chain_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル)->SPIR-V(自前生成)->実Vulkan(NVIDIA GT 730)経路が、CPU参照実装(a[i]+b[i])と256要素すべてで数値一致した
+     test dxbc_vector_add_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, div)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]/b[i])と256要素すべてで数値一致した
+     test dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, mul)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]*b[i])と256要素すべてで数値一致した
+     test dxbc_vector_mul_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, sub+境界チェック)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]-b[i])と有効範囲256要素すべてで数値一致し、境界外の64要素はセンチネル値のまま(書き込まれなかった)ことを確認した
+     test dxbc_vector_sub_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+     ```
+     ワークスペース全体: unittests 28件 + 実機テスト6本(DXBC単一演算4本+DXBCチェーン1本+DXIL1本)全green。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
+  4. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **DXIL側**: `numthreads`の実抽出はこのシェーダー(`vector_add_dxil.hlsl`)専用の経路検証。他のDXILシェーダー(mul/sub/div相当・複数エントリポイント等)でも同じ`METADATA_BLOCK`構造が成り立つかは未検証(この1シェーダーでの実測に基づく)。
+     - **DXBC側**: チェーンクラスは`add`/`mul`のみ対応、`sub`/`div`のチェーン内混在・3項以上への一般化(3回以上の逐次演算)は今回実測していない(理屈上`decode_chain_shape`のロジックはN回まで対応できる形にはなっているが、実際に3回以上の演算を持つシェーダーをコンパイルして検証してはいない)。境界チェックはチェーンクラスでは非対応のまま。
+     - D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: (1) DXIL側: `resolve_vector_add_dxil_calls`/`translate_dxil_vector_add_to_spirv`をmul/sub/div相当のDXILシェーダーへ一般化(DXBC側で先行実施済みのアプローチを踏襲)。(2) DXBC側: チェーンクラスへ`sub`/`div`のオペランド順序を実際に検証した上で対応追加、3項以上の実シェーダーでの検証。(3) D3D11グラフィックスパイプライン(VS/PS)は引き続き並行で検討可。

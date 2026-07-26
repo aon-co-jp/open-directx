@@ -228,14 +228,33 @@ second becomes B, and `BufferStore`'s `handle_range_id` becomes C
 operation is fixed to `BinaryOp::Add` with no bounds check, since that
 is what `vector_add_dxil.hlsl` is confirmed to produce.
 
-**Honest gap — workgroup size is hardcoded, not extracted.** DXBC's
-`dcl_thread_group` has no DXIL equivalent in what this project decodes
-so far; `numthreads` is actually encoded in DXIL's `METADATA_BLOCK`
-(`dx.entryPoints`), which is out of scope for this pass. Since the one
-supported byte sequence (`vector_add.dxil`, compiled from
-`vector_add_dxil.hlsl`'s `[numthreads(64,1,1)]`) is known, `(64,1,1)`
-is hardcoded — the one place the DXIL path departs from the DXBC path's
-"everything extracted from real parsed data, nothing hardcoded" rule.
+**Update (2026-07-25, "continued 9"): the workgroup-size hardcode above
+is now closed.** `dxil::extract_numthreads_from_metadata` decodes the
+real `METADATA_BLOCK` path: `dx.entryPoints` (a `METADATA_NAMED_NODE`)
+-> the per-entry-point 5-tuple (`Function, Name, Signatures, Resources,
+ShaderProperties`) -> `ShaderProperties` (a repeating `{tag, value}`
+list) -> the pair whose tag resolves to `kDxilMDHelper::kDxilNumThreadsTag`
+(confirmed = `4` against Microsoft `DirectXShaderCompiler`'s
+`include/dxc/DXIL/DxilMetadataHelper.h` and
+`lib/DXIL/DxilMetadataHelper.cpp` sources) -> a 3-element node whose
+operands resolve (via `METADATA_VALUE` -> absolute value-list index,
+against the same module value list — functions ++ module
+`CONSTANTS_BLOCK` — already built for `resolve_vector_add_dxil_calls`,
+now factored into a shared `build_module_value_list`) to the real
+constants `64, 1, 1`. This was hand-traced end to end against
+`vector_add.dxil`'s actual bytes (not assumed) before being coded, and
+a synthetic unit test (`finds_numthreads_pair_even_when_a_different_value_precedes_it`)
+proves the pair-scanning logic returns a *different* triple `(32,8,2)`
+when given different metadata — guarding against a silent regression to
+hardcoding. `translate_dxil_vector_add_to_spirv` now calls this instead
+of using a literal `(64,1,1)`, and the existing
+`dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware` test
+still passes with the now-extracted value.
+
+Original honest gap being closed here, for historical context: DXBC's
+`dcl_thread_group` has no DXIL equivalent in what this project decoded
+before this pass; `numthreads` is actually encoded in DXIL's
+`METADATA_BLOCK` (`dx.entryPoints`), which was out of scope until now.
 
 `tests/vector_add_dxil_real_vulkan.rs` mirrors
 `vector_add_real_vulkan.rs` exactly: parse real `vector_add.dxil` ->
@@ -262,9 +281,66 @@ are clean (0 warnings).
 
 **This reaches parity with the DXBC `vector_add` milestone, but only
 for this one known DXIL shader shape** — not a general SM6.0 decoder.
-Any operation other than `add`, more than one basic block, bounds
-checks, or a `numthreads` other than the hardcoded `(64,1,1)` is still
-honestly rejected, not mistranslated.
+Any operation other than `add`, more than one basic block, or bounds
+checks is still honestly rejected, not mistranslated. (`numthreads` is
+no longer hardcoded — see the update above.)
+
+## DXBC decoder generalized: sequential binary-op chains (2026-07-25, "continued 9")
+
+The 4 single-op DXBC shapes above (`add`/`mul`/`div`/negated-add-as-sub)
+are untouched. Added alongside them: `spirv_gen::translate_chain_shader`
+/ `decode_chain_shape`, a genuinely more general pattern class ("N
+sequential binary operations, no control flow") rather than a 5th
+hardcoded shape.
+
+**Real finding that shaped the design**: a new shader,
+`vector_add_mul_chain.hlsl` (`t = InputA[i] + InputB[i]; Output[i] = t *
+InputA[i];`, still 3 UAVs so it fits `opencuda-vulkan`'s fixed 3-buffer
+`"vector_add"` argument wiring — `ensure_vector_add_args`/
+`ensure_matmul_args` in `open-cuda`'s `real.rs` are both hardcoded to
+exactly 3 buffers, and this project intentionally does not modify
+`open-cuda`), was compiled with real `fxc.exe` and its real SHEX dumped
+with `examples/dump_shex.rs`. Expected `dcl_temps` to grow to 2 (one
+register per HLSL local). Instead `dcl_temps` stayed at **1**: `fxc`
+reused register `r0`'s `.x`/`.y` components for `t` and the reload of
+`InputA[i]`, and — a second, unpredicted optimization — it didn't even
+re-issue a second `ld_structured` for the repeated `InputA[i]`
+reference; it reused the first load's result via component `.y`
+(classic CSE). A decoder that assumed "one temp register per operation"
+would have missed this shader entirely.
+
+**Design**: `decode_chain_shape` walks the instruction stream building a
+`HashMap<(temp_index, component), RegExpr>` where `RegExpr` is either
+`Load(uav_bind_point)` (from `ld_structured`) or `BinOp(op, lhs, rhs)`
+(from `add`/`mul`, looking up its two source operands' current
+`RegExpr` by their `(temp, component)` key — so it doesn't matter
+whether those operands came from a fresh load or were CSE'd from an
+earlier one). `store_structured`'s source operand resolves to the root
+of the expression tree. `emit_chain_spirv` then recursively (post-order)
+emits `OpAccessChain`/`OpLoad`/`OpFAdd`/`OpFMul` for the tree — handling
+1 op, 2 ops, or (by construction, though only 2 is exercised by a real
+compiled shader so far) N ops identically. `sub` (negated-add
+optimization) and `div` are explicitly rejected inside a chain — their
+operand-order semantics were only confirmed for the single, non-chained
+case, and this project does not claim support it hasn't verified.
+
+`tests/vector_add_mul_chain_real_vulkan.rs` (same pattern as the
+existing 4 real-hardware tests) dispatches the chain-translated SPIR-V
+on the real NVIDIA GT 730 and checks against the CPU reference
+`(a[i]+b[i])*a[i]` for 256 elements. Real output:
+
+```
+device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+OK: DXBC(fxc.exe実コンパイル, 2項演算2回のチェーン)->SPIR-V(自前生成、式木の再帰翻訳)->実Vulkan経路が、CPU参照実装((a[i]+b[i])*a[i])と256要素すべてで数値一致した
+c[0]=65, c[255]=708.875
+test dxbc_vector_add_mul_chain_matches_cpu_reference_on_real_vulkan_hardware ... ok
+```
+
+All 6 real-hardware tests (4 single-op DXBC + 1 chain DXBC + 1 DXIL)
+and 28 unit tests pass; `cargo build --workspace` /
+`cargo clippy --workspace --all-targets` are clean (0 warnings). The
+original 4 single-op shapes and the DXIL vertical slice are unmodified
+and still pass — this was purely additive.
 
 ## D3D11 graphics pipeline (vertex/pixel shaders) — DXBC parsing only, added 2026-07-25
 
@@ -301,20 +377,23 @@ this pipeline stage.
 
 ## What is NOT yet reusable (honest gaps)
 
-- **No general SM5.0 instruction decoder.** Only the 3 opcode shapes
-  above are handled. A different D3D11 compute shader (different
-  resource count/types, other control flow, intrinsics beyond
-  `SV_DispatchThreadID` indexing, a real dedicated `sub`/`div` opcode
-  instead of negated-`add`, more than one bounds check, etc.) will be
-  rejected by `decode_shader_shape`, not silently mistranslated.
+- **No general SM5.0 instruction decoder.** Only the single-op shapes
+  (`decode_shader_shape`, 4 opcodes) and the sequential-chain pattern
+  class (`decode_chain_shape`, add/mul only, no control flow) are
+  handled. A different D3D11 compute shader (different resource
+  count/types, real branches/loops beyond a single top-level bounds
+  check, intrinsics beyond `SV_DispatchThreadID` indexing, `sub`/`div`
+  inside a chain, etc.) will be rejected by one of these decoders, not
+  silently mistranslated.
 - **DXIL (SM6+): the `vector_add.dxil` vertical slice is complete on
   real hardware (see the dedicated section above, updated 2026-07-25),
   but only for this one known shader shape — not a general SM6.0
-  decoder.** Its SPIR-V workgroup size is hardcoded rather than
-  extracted from `METADATA_BLOCK`; any other operation, basic-block
-  count, or bounds-check shape is rejected. D3D12's higher-level layers
-  (command lists, descriptor heaps, root signatures) remain entirely
-  unimplemented, Phase 3+ per `CLAUDE.md`'s roadmap.
+  decoder.** Its SPIR-V workgroup size is now genuinely extracted from
+  `METADATA_BLOCK` (no longer hardcoded, see the update above); any
+  other operation, basic-block count, or bounds-check shape is still
+  rejected. D3D12's higher-level layers (command lists, descriptor
+  heaps, root signatures) remain entirely unimplemented, Phase 3+ per
+  `CLAUDE.md`'s roadmap.
 - **D3D11 graphics pipeline: DXBC container parsing for vertex/pixel
   shaders is confirmed working (see the dedicated section above, added
   2026-07-25), but there is no SPIR-V generation, rasterizer, texture

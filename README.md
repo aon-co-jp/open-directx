@@ -31,10 +31,11 @@ real `dx.op.*` meaning) and translated to real SPIR-V
 real NVIDIA GT 730 and verifies numerically matches the CPU reference
 `a[i]+b[i]`. This is still one known shader shape only, not a general
 SM6.0 decoder — see "Not implemented (honest scope)" below for the
-precise boundary (in particular, the SPIR-V workgroup size is currently
-hardcoded rather than extracted from DXIL metadata). See the
-2026-07-25 "continued 7" HANDOFF entry in `CLAUDE.md` for the full
-account.
+precise boundary. The SPIR-V workgroup size is now genuinely extracted
+from DXIL's `METADATA_BLOCK` (`dx.entryPoints` -> `ShaderProperties` ->
+`NumThreads`), not hardcoded — see the 2026-07-25 "continued 9" HANDOFF
+entry in `CLAUDE.md` for the full account, and "continued 7" for the
+original vertical-slice achievement this closed a known gap in.
 
 ## Current state (2026-07-25, continued: DXIL bitstream-level parsing + D3D11 VS/PS DXBC parsing)
 
@@ -145,6 +146,19 @@ general SM5.0-to-SPIR-V decoder** — see "Not implemented" below.
   writing decoder support for them; kept for future opcode-by-opcode
   generalization work.
 
+**Since this section's title was written**, a 4th single-op shader
+(`vector_div.hlsl`, plain `div`) was added to `translate_shader`
+following the exact same pattern, and — more recently — a genuinely
+different pattern class, `spirv_gen::translate_chain_shader`, was added
+alongside it (not replacing it): it decodes an actual
+register-expression tree of sequential binary operations (add/mul, no
+control flow) instead of a single fixed op, verified against a newly
+compiled shader whose real SHEX turned out to reuse one temp register's
+components via fxc's CSE rather than declaring extra temps. See the
+2026-07-25 "continued 9" HANDOFF entry in `CLAUDE.md` for the full,
+current account (this section is left as originally written for
+historical accuracy about the 2026-07-25 mid-day state).
+
 ## Build & test
 
 ```powershell
@@ -234,16 +248,38 @@ pwsh tools/compile-dxbc-shaders.ps1
   which `tests/vector_add_dxil_real_vulkan.rs` dispatches on this
   machine's real NVIDIA GT 730 via `opencuda-vulkan` and verifies
   matches the CPU reference `a[i]+b[i]` for all 256 elements — the same
-  rigor as the DXBC `vector_add` test. **Known gap**: the SPIR-V
-  workgroup size (`64,1,1`) is hardcoded rather than extracted from
-  DXIL's `METADATA_BLOCK` (`dx.entryPoints`), since that metadata
-  decoding is out of scope so far — this is the one place the DXIL path
-  falls short of the DXBC path's "everything extracted, nothing
-  hardcoded" standard. Any other opcode/operand shape (different
-  operation, multiple basic blocks, bounds checks, different
-  `numthreads`) is still rejected, not mistranslated. D3D12 command
-  list/descriptor heap/root signature support (the layer above shader
-  translation) is untouched.
+  rigor as the DXBC `vector_add` test. **Workgroup size is now actually
+  extracted, not hardcoded**: `extract_numthreads_from_metadata`
+  (`dxil.rs`) walks the real `METADATA_BLOCK` path
+  `dx.entryPoints` -> per-entry-point tuple -> `ShaderProperties` ->
+  `kDxilNumThreadsTag` (=4, confirmed against Microsoft
+  `DirectXShaderCompiler`'s `DxilMetadataHelper.h`/`.cpp` sources) and
+  resolves the `{x,y,z}` node against the module's real value list,
+  yielding `(64,1,1)` from the actual bytes of `vector_add.dxil` — the
+  known hardcode from the previous entry is closed, and a synthetic
+  regression test proves the extraction logic returns a *different*
+  value when given different metadata (not just "returns 64,1,1 no
+  matter what"). Any other opcode/operand shape (different operation,
+  multiple basic blocks, bounds checks) is still rejected, not
+  mistranslated. D3D12 command list/descriptor heap/root signature
+  support (the layer above shader translation) is untouched.
+- **DXBC decoder generalized beyond 4 fixed single-op shapes: now
+  handles chains of sequential binary operations (no control flow) via
+  a real register-expression tree, not a 5th hardcoded shape.**
+  `spirv_gen::translate_chain_shader`/`decode_chain_shape` walk
+  `ld_structured`/`add`/`mul`/`store_structured` and build an actual
+  expression tree keyed by (temp register, component), so it handles 1
+  op, 2 ops, or N ops the same way — verified against a newly compiled
+  real shader (`vector_add_mul_chain.hlsl`, `t = A[i]+B[i]; Out[i] =
+  t*A[i]`) whose real SHEX turned out to reuse a single temp register's
+  `.x`/`.y` components (fxc CSE'd the repeated `A[i]` load away instead
+  of re-issuing `ld_structured`) — a genuine, unpredicted finding the
+  tree-based decoder handles without extra cases. Dispatched and
+  verified on the real NVIDIA GT 730 against the CPU reference
+  `(a[i]+b[i])*a[i]`. `sub`/`div` inside a chain are intentionally still
+  rejected (their operand-order semantics were only verified for the
+  single-op case). The original 4 single-op shapes are untouched and
+  still pass unmodified.
 - **D3D11 graphics pipeline: DXBC container parsing confirmed working
   for VS/PS, but no SPIR-V codegen, no rasterizer, no actual triangle
   drawn on screen.** The full pipeline (rasterizer, texture sampling,
