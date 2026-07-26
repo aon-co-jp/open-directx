@@ -105,6 +105,27 @@ vertical slice below:
   actual rendered pixel is out of scope for this pass. See `CLAUDE.md`
   HANDOFF for the honest milestone boundary.
 
+## Current state (2026-07-26, D3D11 minimal graphics pipeline milestone reached)
+
+New crate `crates/directx-graphics-vulkan` adds `ash` as a **direct**
+dependency of this workspace (not layered on `opencuda-vulkan`, which was
+confirmed by source audit to be compute-dispatch only). It implements a
+real render pass, framebuffer, and `VkGraphicsPipelineCreateInfo`, reusing
+the already-generated, already `spirv-val`-passing SPIR-V from
+`translate_vertex_shader`/`translate_pixel_shader` above (no shader
+translation is re-implemented). `render_uniform_triangle_and_read_back`
+draws one full-viewport "big triangle" with a single uniform vertex color,
+reads the rendered image back through a host-visible staging buffer, and
+the real-hardware test
+(`crates/directx-graphics-vulkan/tests/triangle_real_vulkan.rs`) asserts
+every read-back pixel matches the passthrough vertex color on the real
+NVIDIA GT 730 present on this machine (`cargo test -p
+directx-graphics-vulkan --test triangle_real_vulkan -- --nocapture`: 1
+passed). Scope is intentionally narrow: one fixed shader pair, one draw
+call, no depth buffer/textures/swapchain/multi-triangle interpolation
+check. See `CLAUDE.md` HANDOFF (2026-07-26 continuation) for the full
+honest disclosure.
+
 ## Current state (2026-07-25, Phase 1 vertical slice generalized to 3 known shaders)
 
 `crates/directx-shader-translate` now does the full vertical slice for

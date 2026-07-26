@@ -491,6 +491,20 @@ the next step, not silently skipped.
   sampler, no blend state, no output-merger, and no actual Vulkan
   triangle draw — `opencuda-vulkan` was confirmed by reading its source
   to be Compute-dispatch-only with zero graphics-pipeline code.**
+  **Update 2026-07-26: the actual draw call now exists.** New crate
+  `crates/directx-graphics-vulkan` adds `ash` as a direct dependency of
+  this workspace (not layered on `opencuda-vulkan`) and implements a real
+  render pass + framebuffer + `VkGraphicsPipelineCreateInfo`, reusing the
+  SPIR-V above unmodified. It draws one full-viewport "big triangle" with
+  a uniform vertex color and reads the rendered image back through a
+  host-visible staging buffer; the real-hardware test asserts all
+  read-back pixels match the passthrough vertex color on the real NVIDIA
+  GT 730 present on this machine (`cargo test -p directx-graphics-vulkan
+  --test triangle_real_vulkan -- --nocapture`: 1 passed, see `CLAUDE.md`
+  HANDOFF 2026-07-26 continuation for full transcript). Still no depth
+  buffer, texture sampler, swapchain/on-screen presentation, multiple
+  triangles, or interpolation check across differently-colored vertices —
+  those remain out of scope for this pass.
 
 ## Path-dependency convention used in this ecosystem (for reference)
 

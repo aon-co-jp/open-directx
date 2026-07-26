@@ -607,6 +607,27 @@ pub enum ResolvedDxilCall {
     BufferStore { handle_range_id: i64 },
 }
 
+/// `FUNC_CODE_INST_BINOP`(id=2)から実際に解決した二項演算の意味。
+/// `op`はLLVM bitcodeの`GetEncodedBinaryOpcode`規約(`llvm/Bitcode/Writer/
+/// ValueEnumerator.cpp`、Web検索で確認済み: ADD=0,SUB=1,MUL=2,UDIV=3,
+/// SDIV/FDIV=4)を実際に3つのDXILシェーダー(`vector_mul.dxil`=fields[2]==2,
+/// `vector_sub.dxil`=fields[2]==1, `vector_div.dxil`=fields[2]==4)へ
+/// `examples/dump_dxil.rs`で当てはめて裏取りした値。`vector_add.dxil`も
+/// fields[2]==0であることを確認済み(add/mul/sub/divの4パターンすべて実測)。
+/// `lhs_range_id`/`rhs_range_id`はBinOpの2つのオペランドがそれぞれどの
+/// `BufferLoad`(=`CreateHandle`の`range_id`)由来かを、LLVM相対値参照を
+/// 実際に解決して得たもの——`sub`/`div`は非可換なので、単純に
+/// 「発見順=1番目/2番目」ではなく、実際のオペランド順序をそのまま反映する
+/// 必要がある(`vector_sub.dxil`の実バイト列で`fields=[3,1,1,31]`と
+/// `vector_add.dxil`の`fields=[1,3,0,31]`とでオペランドの相対値順序自体が
+/// 入れ替わっていることを実際に確認した)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedDxilBinOp {
+    pub op: crate::BinaryOp,
+    pub lhs_range_id: i64,
+    pub rhs_range_id: i64,
+}
+
 /// この解決処理が正直に拒否する、未対応の形状。
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum DxilCallResolutionError {
@@ -626,6 +647,10 @@ pub enum DxilCallResolutionError {
     ExtractValueNotFromBufferLoad,
     #[error("想定した命令列形状と一致しない: {0}")]
     UnexpectedShape(String),
+    #[error("BinOpのオペコードが未対応(add=0/sub=1/mul=2/div=4のみ対応、実際={0})")]
+    UnknownBinOpcode(i64),
+    #[error("BinOp命令が1つも解決できなかった(このシェーダー形状は必ず1つ含むはず)")]
+    MissingBinOp,
 }
 
 /// [`DxilModule`]と同じ実バイト列(`vector_add.dxil`)から、7個の`Call`命令
@@ -634,6 +659,15 @@ pub enum DxilCallResolutionError {
 /// 実際にどの`dx.op.*`組み込みかを、`VALUE_SYMTAB_BLOCK`の関数名解決と
 /// LLVM相対値オペランドのデコードによって突き止める。
 pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCall>, DxilCallResolutionError> {
+    resolve_dxil_calls_and_binop(bytes).map(|(calls, _binop)| calls)
+}
+
+/// [`resolve_vector_add_dxil_calls`]と同じ解決に加え、`BinOp`命令自体の意味
+/// (どの演算〈add/sub/mul/div〉かと、2つのオペランドがそれぞれどの`BufferLoad`
+/// 〈range_id〉由来か)も返す。`vector_add_dxil.hlsl`専用だった前バージョンを
+/// mul/sub/div相当のDXILシェーダーへ一般化するために追加した(DXBC側で先行
+/// 実施済みの「1つの狭いデコーダから対応opcodeを増やす」アプローチを踏襲)。
+pub fn resolve_dxil_calls_and_binop(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, ResolvedDxilBinOp), DxilCallResolutionError> {
     let containers = dxbc::scan_dxbc(bytes);
     let container = containers.into_iter().next().ok_or_else(|| DxilCallResolutionError::MissingBlock("DXBC container".to_string()))?;
     let dxil_chunk = container
@@ -664,6 +698,7 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
     // FUNCTION_BLOCK内: DeclareBlocksをスキップし、ネストしたローカル
     // CONSTANTS_BLOCKで値番号付けを継続してから、命令列を順に解決する。
     let mut resolved_calls = Vec::new();
+    let mut resolved_binop: Option<ResolvedDxilBinOp> = None;
     for el in &function_block.elements {
         if let Some(sub) = el.as_block() {
             if sub.id == 11 {
@@ -802,13 +837,30 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
                     *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpにオペランドが無い".to_string()))?;
                 let rhs_relative =
                     *fields.get(1).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpに2つ目のオペランドが無い".to_string()))?;
+                let opcode_field = *fields.get(2).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpにオペコードが無い".to_string()))?;
                 let lhs = resolve_relative(&values, current_value_no, lhs_relative);
                 let rhs = resolve_relative(&values, current_value_no, rhs_relative);
-                if !matches!(lhs, Some(DxilValue::ExtractedBufferValue { .. })) || !matches!(rhs, Some(DxilValue::ExtractedBufferValue { .. })) {
-                    return Err(DxilCallResolutionError::UnexpectedShape(
-                        "BinOpのオペランドがBufferLoad由来の値ではない".to_string(),
-                    ));
-                }
+                let (lhs_range_id, rhs_range_id) = match (lhs, rhs) {
+                    (
+                        Some(DxilValue::ExtractedBufferValue { source_range_id: l }),
+                        Some(DxilValue::ExtractedBufferValue { source_range_id: r }),
+                    ) => (*l, *r),
+                    _ => {
+                        return Err(DxilCallResolutionError::UnexpectedShape(
+                            "BinOpのオペランドがBufferLoad由来の値ではない".to_string(),
+                        ));
+                    }
+                };
+                // LLVM bitcodeの`GetEncodedBinaryOpcode`規約(実際に3つのDXIL
+                // シェーダーで確認済み、上の`ResolvedDxilBinOp`docコメント参照)。
+                let op = match opcode_field as i64 {
+                    0 => crate::BinaryOp::Add,
+                    1 => crate::BinaryOp::Sub,
+                    2 => crate::BinaryOp::Mul,
+                    4 => crate::BinaryOp::Div,
+                    other => return Err(DxilCallResolutionError::UnknownBinOpcode(other)),
+                };
+                resolved_binop = Some(ResolvedDxilBinOp { op, lhs_range_id, rhs_range_id });
                 values.push(DxilValue::BinOpResult);
             }
             10 => { /* Ret: 終端、値を生成しない */ }
@@ -821,7 +873,8 @@ pub fn resolve_vector_add_dxil_calls(bytes: &[u8]) -> Result<Vec<ResolvedDxilCal
     if resolved_calls.len() != 7 {
         return Err(DxilCallResolutionError::UnexpectedShape(format!("Call命令は7個を期待したが実際は{}個", resolved_calls.len())));
     }
-    Ok(resolved_calls)
+    let binop = resolved_binop.ok_or(DxilCallResolutionError::MissingBinOp)?;
+    Ok((resolved_calls, binop))
 }
 
 // ---------------------------------------------------------------------
@@ -1102,7 +1155,6 @@ pub fn extract_numthreads_from_metadata(bytes: &[u8]) -> Result<(u32, u32, u32),
 // 追いついた形。
 
 use crate::spirv_gen::emit_spirv_for_kernel;
-use crate::BinaryOp;
 
 /// [`resolve_vector_add_dxil_calls`]が返す7個の`ResolvedDxilCall`(実DXIL
 /// バイト列から解決済み)から、DXBC側と同じ契約のSPIR-Vを組み立てる。
@@ -1123,13 +1175,22 @@ pub enum DxilSpirvError {
     NumThreads(#[from] DxilNumThreadsError),
 }
 
-/// DXILバイト列(`vector_add.dxil`と同じ契約の1シェーダー専用)を解析し、
-/// SPIR-Vへ翻訳する。DXBC側の[`crate::spirv_gen::translate_vector_add_shader`]
-/// と対になる、D3D12/DXIL版のvector_addバックエンド。
-pub fn translate_dxil_vector_add_to_spirv(
+/// DXILバイト列(`vector_add.dxil`/`vector_mul.dxil`/`vector_sub.dxil`/
+/// `vector_div.dxil`という同一形状・演算違いの4シェーダーに対応)を解析し、
+/// SPIR-Vへ翻訳する。DXBC側の[`crate::spirv_gen::translate_shader`]と対になる、
+/// D3D12/DXIL版の二項演算バックエンド。**2026-07-26の一般化**: 以前は
+/// `vector_add_dxil.hlsl`専用で演算(`BinaryOp::Add`)を決め打ちしていたが、
+/// `resolve_dxil_calls_and_binop`が実際に解決した`BinOp`のオペコード
+/// (add=0/sub=1/mul=2/div=4、`ResolvedDxilBinOp`のdocコメント参照)と
+/// オペランド順序(`lhs_range_id`/`rhs_range_id`)を使うよう変更した——
+/// `sub`/`div`は非可換なので、単純に「発見順」ではなく実際のLLVM相対値
+/// オペランド順序をそのまま`emit_spirv_for_kernel`の`uav_a`/`uav_b`へ渡す
+/// (`uav_a`側が`op`の第1オペランド、`uav_b`側が第2オペランドという
+/// `emit_spirv_for_kernel`の既存契約に合わせた)。
+pub fn translate_dxil_binary_op_to_spirv(
     bytes: &[u8],
 ) -> Result<crate::spirv_gen::TranslatedKernel, DxilSpirvError> {
-    let calls = resolve_vector_add_dxil_calls(bytes)?;
+    let (calls, binop) = resolve_dxil_calls_and_binop(bytes)?;
 
     let mut buffer_loads: Vec<i64> = Vec::new();
     let mut buffer_store: Option<i64> = None;
@@ -1146,20 +1207,17 @@ pub fn translate_dxil_vector_add_to_spirv(
     }
     let uav_c = buffer_store.ok_or(DxilSpirvError::UnexpectedBufferStoreCount(0))?;
 
-    // 実バイト列は非負のレンジID(u#のバインドポイント)であることを
-    // `resolve_vector_add_dxil_calls`のテストで既に確認済み。
-    let uav_a = buffer_loads[0] as u32;
-    let uav_b = buffer_loads[1] as u32;
+    // uav_a/uav_bは、BinOpが実際に参照した順序(lhs/rhs)をそのまま使う
+    // (単なる`buffer_loads`の発見順ではない——sub/divの非可換性のため)。
+    let uav_a = binop.lhs_range_id as u32;
+    let uav_b = binop.rhs_range_id as u32;
     let uav_c = uav_c as u32;
 
     // スレッドグループサイズは、以前の決め打ち`(64,1,1)`ではなく、
     // `METADATA_BLOCK`の`dx.entryPoints`から実際に抽出する
     // (`extract_numthreads_from_metadata`、上記セクション参照)。
-    // このシェーダー専用の既知値として残るのは演算(fadd/`BinaryOp::Add`)と
-    // 境界チェック無し、の2点のみ(`resolve_vector_add_dxil_calls`が検証する
-    // 形状がそもそもこの2つを前提にしている)。
     let local_size = extract_numthreads_from_metadata(bytes)?;
-    let spirv_words = emit_spirv_for_kernel(local_size, uav_a, uav_b, uav_c, BinaryOp::Add, false);
+    let spirv_words = emit_spirv_for_kernel(local_size, uav_a, uav_b, uav_c, binop.op, false);
 
     Ok(crate::spirv_gen::TranslatedKernel {
         spirv_words,
@@ -1167,6 +1225,16 @@ pub fn translate_dxil_vector_add_to_spirv(
         local_size,
         uav_bind_points: (uav_a, uav_b, uav_c),
     })
+}
+
+/// 後方互換のための薄いエイリアス(`vector_add_dxil.hlsl`専用だった旧名)。
+/// 内部実装は上記の一般化された`translate_dxil_binary_op_to_spirv`と同じ
+/// (演算の判定も決め打ちではなく実バイト列から行う——渡すのが本当に
+/// `add`のDXILである限り、旧テストの期待値と一致する)。
+pub fn translate_dxil_vector_add_to_spirv(
+    bytes: &[u8],
+) -> Result<crate::spirv_gen::TranslatedKernel, DxilSpirvError> {
+    translate_dxil_binary_op_to_spirv(bytes)
 }
 
 #[cfg(test)]
@@ -1406,6 +1474,85 @@ mod tests {
         let result = find_numthreads_in_shader_properties(&entries, &props_fields, &values)
             .expect("synthetic shader-properties pair scan must find the NumThreads tag");
         assert_eq!(result, (32, 8, 2), "must extract the synthetic (32,8,2), not the real shader's (64,1,1)");
+    }
+
+    const VECTOR_MUL_DXIL: &[u8] = include_bytes!("../shaders/vector_mul.dxil");
+    const VECTOR_SUB_DXIL: &[u8] = include_bytes!("../shaders/vector_sub.dxil");
+    const VECTOR_DIV_DXIL: &[u8] = include_bytes!("../shaders/vector_div.dxil");
+
+    /// **2026-07-26一般化**: `resolve_dxil_calls_and_binop`が、add以外の3演算
+    /// (`vector_mul.dxil`/`vector_sub.dxil`/`vector_div.dxil`、`dxc.exe -T
+    /// cs_6_0`で実際にコンパイル)についても、実バイト列から正しいBinOp
+    /// オペコード(mul=2/sub=1/div=4)とオペランド順序を解決できることを検証する。
+    /// `examples/dump_dxil.rs`で実際にダンプしたBinOpレコードのfields
+    /// (mul=`[1,3,2,31]`, sub=`[3,1,1,31]`, div=`[3,1,4,31]`、いずれもこの
+    /// コメントとHANDOFFに転記済み)を手計算でトレースした上で書いたテスト。
+    #[test]
+    fn resolves_mul_binop_from_real_dxc_compiled_dxil() {
+        let (calls, binop) = resolve_dxil_calls_and_binop(VECTOR_MUL_DXIL).expect("real dxc-compiled vector_mul.dxil must resolve");
+        assert_eq!(calls.len(), 7);
+        assert_eq!(binop.op, crate::BinaryOp::Mul);
+        // 訂正(検証時に判明): 当初「add.dxilと同じCreateHandle順序なので
+        // lhs=u0,rhs=u1のはず」と手計算だけで予想していたが、実際に
+        // `resolve_dxil_calls_and_binop`をこの実バイト列に対して実行すると
+        // (1, 0)が返る——mulは可換演算のため、dxc/LLVMの最適化パスが
+        // オペランドの相対値参照順序をadd/subとは独立に(値の複雑度等の
+        // 基準で)並べ替えることがある、という実測に基づき期待値を修正した
+        // (手計算トレースだけに頼らず実行結果で裏取りする、という既存方針
+        // 通りの訂正)。数値的にはmulは可換なので(1,0)でも(0,1)でも
+        // 計算結果は同じ——`translate_dxil_binary_op_to_spirv_handles_
+        // mul_sub_div_not_just_add`側もこれを踏まえた検証にしている。
+        assert_eq!((binop.lhs_range_id, binop.rhs_range_id), (1, 0));
+    }
+
+    #[test]
+    fn resolves_sub_binop_with_correct_noncommutative_operand_order_from_real_dxc_compiled_dxil() {
+        let (_calls, binop) = resolve_dxil_calls_and_binop(VECTOR_SUB_DXIL).expect("real dxc-compiled vector_sub.dxil must resolve");
+        assert_eq!(binop.op, crate::BinaryOp::Sub);
+        // subは非可換なので、単純な発見順(0,1)ではなくLLVM相対値参照が
+        // 実際に指す順序をそのまま使う必要がある。実バイト列(fields=[3,1,1,31])を
+        // 手計算でトレースした結果、lhs=u0(a), rhs=u1(b)であることを確認済み
+        // (`a[id.x] - b[id.x]`というHLSLソースの順序と一致する)。
+        assert_eq!((binop.lhs_range_id, binop.rhs_range_id), (0, 1));
+    }
+
+    #[test]
+    fn resolves_div_binop_from_real_dxc_compiled_dxil() {
+        let (_calls, binop) = resolve_dxil_calls_and_binop(VECTOR_DIV_DXIL).expect("real dxc-compiled vector_div.dxil must resolve");
+        assert_eq!(binop.op, crate::BinaryOp::Div);
+        assert_eq!((binop.lhs_range_id, binop.rhs_range_id), (0, 1));
+    }
+
+    /// `translate_dxil_binary_op_to_spirv`が実際にmul/sub/divのDXILからも
+    /// (add専用だった以前のバージョンとは違い)正しくSPIR-Vを生成できることを、
+    /// 型チェックだけでなく生成物の中身(先頭マジック・UAVバインドポイント)まで
+    /// 検証する。
+    #[test]
+    fn translate_dxil_binary_op_to_spirv_handles_mul_sub_div_not_just_add() {
+        // mulは可換なので実バイト列上のオペランド順序が(1,0)になりうる
+        // (上の`resolves_mul_binop_from_real_dxc_compiled_dxil`参照)ため、
+        // uav_a/uav_bの順序そのものではなく「u0とu1をどちらも1回ずつ読み、
+        // u2へ書く」という集合として検証する(sub/divは非可換なので順序も
+        // 厳密に(0,1)を要求し、mulのみ順不同を許容する)。
+        for (bytes, label, op) in [
+            (VECTOR_MUL_DXIL, "mul", crate::BinaryOp::Mul),
+            (VECTOR_SUB_DXIL, "sub", crate::BinaryOp::Sub),
+            (VECTOR_DIV_DXIL, "div", crate::BinaryOp::Div),
+        ] {
+            let kernel = translate_dxil_binary_op_to_spirv(bytes)
+                .unwrap_or_else(|e| panic!("vector_{label}.dxil must translate to SPIR-V: {e:#}"));
+            assert_eq!(kernel.local_size, (64, 1, 1), "{label}: numthreads must be extracted, not hardcoded");
+            let (uav_a, uav_b, uav_c) = kernel.uav_bind_points;
+            assert_eq!(uav_c, 2, "{label}: write UAV bind point must resolve to u2");
+            if op == crate::BinaryOp::Mul {
+                let mut pair = [uav_a, uav_b];
+                pair.sort_unstable();
+                assert_eq!(pair, [0, 1], "{label}: read UAV bind points must be {{u0,u1}} regardless of commutative order");
+            } else {
+                assert_eq!((uav_a, uav_b), (0, 1), "{label}: non-commutative op must preserve real operand order u0,u1");
+            }
+            assert_eq!(kernel.spirv_words[0], 0x0723_0203, "{label}: SPIR-V magic");
+        }
     }
 
     #[test]

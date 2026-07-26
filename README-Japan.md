@@ -68,7 +68,19 @@ LLVM bitstream→型テーブル→命令列→7個の`Call`すべてを実際�
   `BufferStore`=69・`ThreadId`=93)はMicrosoft公式`DXIL.rst`をWeb検索して
   確認し、実際の定数値とも一致した。**それでもDXIL→SPIR-V変換は無い**
   ——これが次の増分の対象(詳細は下記「未実装」節)。
-- **D3D11グラフィックスパイプライン——VS/PS向け実SPIR-V生成に到達・
+- **D3D11グラフィックスパイプライン——2026-07-26、実描画まで到達済み。**
+  新規クレート`crates/directx-graphics-vulkan`が`ash`をopen-directx自身の
+  直接の依存として追加(`opencuda-vulkan`はCompute専用と実ソース監査で
+  確認済みのためラップせず独立実装)。実レンダーパス+フレームバッファ+
+  `VkGraphicsPipelineCreateInfo`を構築し、下記の`translate_vertex_shader`/
+  `translate_pixel_shader`が生成した実SPIR-V(再実装せず再利用)で
+  ビューポート全体を覆う大三角形(単色頂点)を実際に描画、読み戻した
+  全ピクセルがパススルー元の頂点色と一致することを実機
+  (NVIDIA GT 730)で確認した(`cargo test -p directx-graphics-vulkan
+  --test triangle_real_vulkan -- --nocapture`で1件green)。深度バッファ・
+  テクスチャ・スワップチェーン・複数三角形の補間検証は未着手(詳細は
+  `CLAUDE.md`HANDOFF 2026-07-26続き参照)。
+- **(下記は前回到達点の記録)D3D11グラフィックスパイプライン——VS/PS向け実SPIR-V生成に到達・
   検証済み、ラスタライザ/描画は未着手。**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl`(最小のパス
   スルー頂点+ピクセルシェーダーの組、`POSITION`/`COLOR`入力→

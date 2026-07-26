@@ -70,3 +70,11 @@ if (-not $dxc -or -not (Test-Path $dxc)) {
 Write-Host "using dxc: $dxc"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add.dxil")
 Write-Host "OK: compiled vector_add_dxil.hlsl -> vector_add.dxil (DXIL, SM6.0)"
+# 2026-07-26: DXILデコーダをadd専用からmul/sub/div一般化するための追加3本
+# (vector_add_dxil.hlslと同一形状・同一契約、演算のみ異なる)。
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_mul_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_mul.dxil")
+Write-Host "OK: compiled vector_mul_dxil.hlsl -> vector_mul.dxil (DXIL, SM6.0)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_sub_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_sub.dxil")
+Write-Host "OK: compiled vector_sub_dxil.hlsl -> vector_sub.dxil (DXIL, SM6.0)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_div_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_div.dxil")
+Write-Host "OK: compiled vector_div_dxil.hlsl -> vector_div.dxil (DXIL, SM6.0)"

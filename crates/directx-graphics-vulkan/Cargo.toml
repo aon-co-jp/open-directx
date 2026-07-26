@@ -1,0 +1,21 @@
+[package]
+name = "directx-graphics-vulkan"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Minimal real Vulkan graphics pipeline (render pass + framebuffer + VkGraphicsPipelineCreateInfo) for the D3D11 minimal-graphics-pipeline milestone. Uses ash directly (open-cuda's opencuda-vulkan only exposes compute dispatch, no graphics pipeline code, so this crate is not layered on it)."
+
+[dependencies]
+# open-cudaのopencuda-vulkanはCompute専用(vkCreateComputePipelines経路のみ)で
+# レンダーパス/フレームバッファ/グラフィックスパイプラインのコードを一切持たない
+# (2026-07-26付open-directx CLAUDE.md HANDOFF参照、実ソース監査済み)。
+# そのためopen-directx自身の直接の依存としてashを追加する
+# (opencuda-vulkanと同じバージョン・feature構成に揃え、車輪の再発明を
+# 最小限に抑える)。
+ash = { version = "0.37", default-features = false, features = ["loaded"] }
+thiserror = "1"
+
+[dev-dependencies]
+directx-shader-translate = { path = "../directx-shader-translate" }

@@ -440,3 +440,43 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **ラスタライザ・出力マージ・実際のVulkan描画コマンド・フレームバッファ読み戻しは一切実装していない**(タスク指示の到達し得る範囲として明記された「SPIR-V生成+検証まで」を正直な区切りとした)。
      - DXIL(SM6+)・Compute Shader側(DXBC/DXIL双方)は前回エントリから変更なし(既存の対応範囲・実Vulkan検証範囲に変更無し)。
   - 次にすべきこと: (1) `open-directx`自身へ`ash`を直接の依存として追加し、最小限のグラフィックスパイプライン(レンダーパス+フレームバッファ+`VkGraphicsPipelineCreateInfo`+描画コマンド+読み戻し)を実装し、今回生成したSPIR-V2本(VS/PS)を実際にVulkanへディスパッチして三角形を描画、フレームバッファから読み戻したピクセル色がパススルー元の色と一致することを実機(NVIDIA GT 730)で確認する——これが達成できれば「D3D11最小グラフィックスパイプライン」の完全なマイルストーンとなる。(2) DXIL側・DXBC Compute側の一般化継続は前回エントリの記載通り。
+
+- **2026-07-26(続き) D3D11最小グラフィックスパイプラインのマイルストーン達成: `ash`を新規クレートとして直接依存に追加し、実レンダーパス+フレームバッファ+`VkGraphicsPipelineCreateInfo`+実描画コマンド+実読み戻しをNVIDIA GT 730で実証**:
+  1. **新規クレート`crates/directx-graphics-vulkan`**(`ash = "0.37"`を直接の依存として追加。`open-cuda`の`opencuda-vulkan`は`launch_kernel`によるCompute専用ディスパッチのみで`GraphicsPipeline`/`RenderPass`/`Framebuffer`関連のコードが一切無いことを前回エントリで実ソース監査済みのため、それをラップせず、指示通り`open-directx`自身の別クレートとして実装した。`open-cuda`側は一切変更していない)。
+  2. **実装内容**(`src/lib.rs`、`render_uniform_triangle_and_read_back(vs_spirv, ps_spirv, vertex_color, width, height)`): 実際に`vkCreateInstance`→グラフィックスキューファミリを持つ物理デバイスの列挙→`vkCreateDevice`→デバイスローカルな`R8G8B8A8_UNORM`カラーアタッチメント画像(レンダーターゲット兼コピー元)→レンダーパス(1カラーアタッチメント、`finalLayout=TRANSFER_SRC_OPTIMAL`にして明示的なバリアを使わずコピー用レイアウト遷移をレンダーパス自体に行わせる設計)→フレームバッファ→ホスト可視頂点バッファ(POSITION vec3+COLOR vec4、`triangle_vs`のSPIR-V入力レイアウトのLocation 0/1と一致)→`translate_vertex_shader`/`translate_pixel_shader`が生成した実SPIR-Vバイト列からの`vkCreateShaderModule`(コード側でシェーダー翻訳を再実装せず再利用、タスク指示通り)→`VkGraphicsPipelineCreateInfo`(頂点入力・入力アセンブリ・ビューポート/シザー・ラスタライズ・マルチサンプル・カラーブレンドの各ステートを実際に構築)→コマンドバッファ記録(`vkCmdBeginRenderPass`でクリア色黒→`vkCmdBindPipeline`→`vkCmdBindVertexBuffers`→`vkCmdDraw(3,1,0,0)`→`vkCmdEndRenderPass`→`vkCmdCopyImageToBuffer`でホスト可視読み戻しバッファへコピー)→`vkQueueSubmit`+フェンス待機→`vkMapMemory`で実際にRGBA8ピクセル列を読み出す、という一気通貫の実装。
+  3. **検証手法(CPU参照実装相当のチェック)**: 頂点色による補間の曖昧さを避けるため、3頂点すべてに同一の`vertex_color`(`(200,100,50,255)`のRGBA8相当)を与え、かつビューポート全体を覆う「大きい三角形」(NDC座標`(-1,-1),(3,-1),(-1,3)`——三角形1枚でビューポート全体をカバーする定番手法)を描画した。パススルーの頂点/ピクセルシェーダーが正しく動作していれば、読み戻したフレームバッファの全ピクセルが入力色と(UNORM量子化の丸め誤差±1以内で)完全一致するはずであり、これがCPU側の「期待値」に相当する。
+  4. **実際に`cargo test -p directx-graphics-vulkan --test triangle_real_vulkan -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     running 1 test
+     OK: D3D11 minimal graphics pipeline (real ash-driven render pass + framebuffer + VkGraphicsPipelineCreateInfo) drew a full-viewport triangle using triangle_vs.dxbc/triangle_ps.dxbc's real translated SPIR-V, and all 4x4 read-back pixels matched the passthrough vertex color Rgba8 { r: 200, g: 100, b: 50, a: 255 } on the real GPU present on this machine.
+     test d3d11_triangle_draw_call_matches_passthrough_vertex_color_on_real_vulkan_hardware ... ok
+
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+     ```
+     4x4=16ピクセル全て(全チャンネルR/G/B/A)がパススルー元の頂点色と一致することを実際に確認した(GPUがフェイクデータを返していないこと、シェーダーモジュールが実際にロードされ実行されたことの直接証拠)。
+  5. **ワークスペース全体の実際の検証結果**: `cargo test --workspace`で**unittests 33件+実機テスト7本(DXBC Compute 4本+DXBCチェーン1本+DXIL Compute 1本+今回のグラフィックス1本)全green**(既存6本の実機Computeテストに変更・回帰なし)。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも**警告0件**(`manual_find`警告1件を`Iterator::find`ベースの実装へ書き換えて解消済み)。
+  6. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **汎用グラフィックスパイプラインではない**。`triangle_vs.hlsl`/`triangle_ps.hlsl`専用のパススルーSPIR-V2本を、固定の頂点データ(1つの大三角形・単色)で1回描画するだけの単一シナリオ。深度バッファ・テクスチャ・複数レンダーターゲット・スワップチェーン・実ウィンドウ表示は一切無い。
+     - **`open-cuda`側は一切変更していない**(指示通り)。今回のグラフィックスパイプラインは`open-directx`自身が保持する独立したVulkanインスタンス/デバイス経由(Compute側の`opencuda-vulkan`とは別のVulkanコンテキスト)。将来的に同一デバイス/コンテキストを共有する設計にするかどうかは未検討(現時点ではCompute経路とグラフィックス経路が完全に独立している)。
+     - 補間の検証(頂点ごとに異なる色を与えて三角形内部のグラデーションが正しく補間されるか)は今回のテストでは意図的に検証していない(全頂点同色にしてパススルーの正しさのみを曖昧さ無く確認する設計を選んだため)。次の増分候補。
+  - 次にすべきこと: (1) 異なる頂点色での補間検証(グラデーション三角形)によるラスタライザの補間ロジックそのものの検証。(2) DXIL側のmul/sub/div一般化、DXBC Computeチェーンクラスのsub/div対応(前回エントリから継続、今回は未着手)。(3) 深度バッファ・複数三角形・インデックスバッファ等、より本格的なD3D11描画コマンドへの拡張。
+
+- **2026-07-26(続き2) DXIL側のmul/sub/div一般化を達成(前回HANDOFFの次項(2)前半)、実Vulkanで4演算全て検証。作業中断からの再開時に見つけた実バグ2件も修正**:
+  1. **実装**: `dxil.rs`に`resolve_dxil_calls_and_binop`(既存`resolve_vector_add_dxil_calls`を一般化、`BinOp`〈`FUNC_CODE_INST_BINOP`〉のオペコード〈add=0/sub=1/mul=2/div=4、LLVM `GetEncodedBinaryOpcode`規約〉とオペランド順序〈`lhs_range_id`/`rhs_range_id`〉も解決する`ResolvedDxilBinOp`を追加)、`translate_dxil_binary_op_to_spirv`(旧`translate_dxil_vector_add_to_spirv`をadd専用から一般化、後方互換のため後者は前者への薄いエイリアスとして残置)を実装。新規シェーダー3本(`vector_mul_dxil.hlsl`/`vector_sub_dxil.hlsl`/`vector_div_dxil.hlsl`、`vector_add_dxil.hlsl`と同一契約・演算のみ異なる)を`dxc.exe -T cs_6_0`で実コンパイル、`tools/compile-dxbc-shaders.ps1`に追記。
+  2. **セッション中断からの再開で発覚した実バグ2件(このパスで修正)**: 前回セッションが検証途中(`cargo test --workspace`未実行)で中断しており、再開後に実際にテストを回したところ2つの問題が見つかった。
+     - **(a) `lib.rs`のexport漏れ**: `translate_dxil_binary_op_to_spirv`が`dxil`モジュール内に実装されていたが`pub use dxil::{...}`に含まれておらず、新設の実機テスト(`tests/vector_mul_sub_div_dxil_real_vulkan.rs`)がコンパイルエラーになっていた。`lib.rs`のexportリストへ追加して解消。
+     - **(b) mul/addのBinOpオペランド順序に関する誤った手計算前提**: 前回セッションが「add.dxilと同じCreateHandle順序だからmulもlhs=u0,rhs=u1のはず」と手計算のみで書いたテスト期待値(`(0,1)`)が、実際に`resolve_dxil_calls_and_binop`を実行すると`(1,0)`を返し、失敗した(mulだけでなく**addも同様に`(1,0)`**であることを、既存の実機テスト`vector_add_dxil_real_vulkan.rs`の同種のハードコード済みアサーションが落ちたことで確認)。原因はadd/mulが可換演算のため、dxc/LLVMの最適化パスがオペランドの相対値参照順序を(sub/divとは独立に)並べ替えていたこと。**数値的には可換なので実行結果自体は正しい**——問題は「手計算のみに頼った期待値」であって、`resolve_dxil_calls_and_binop`の解決ロジック自体にバグは無かった(実際にVulkanへディスパッチしてCPU参照実装と数値一致することで裏付け済み)。該当する3箇所のテスト・アサーション(`resolves_mul_binop_from_real_dxc_compiled_dxil`・`translate_dxil_binary_op_to_spirv_handles_mul_sub_div_not_just_add`・`vector_add_dxil_real_vulkan.rs`)を、可換演算(add/mul)は読み出し元2本を`{u0,u1}`の集合として検証、非可換演算(sub/div)は引き続き順序`(0,1)`を厳密に検証する形へ修正した。**教訓として明記**: 手計算トレースだけに頼らず必ず実行結果で裏取りする、という既存方針(このリポジトリのHANDOFF随所に既出)が、まさにこの箇所で機能した具体例。
+  3. **実際に`cargo test --workspace --release -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730) (div)
+     OK: DXIL(dxc.exe実コンパイル, div)->SPIR-V(自前生成、resolve_dxil_calls_and_binopで演算/オペランド順序を実解決)->実Vulkan経路が、CPU参照実装と256要素すべてで数値一致した
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730) (mul)
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730) (sub)
+     test dxil_vector_div_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     test dxil_vector_sub_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     test dxil_vector_mul_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware`(既存)も修正後green。ワークスペース全体: unittests 37件+実機テスト8本(DXBC Compute 4本+DXBCチェーン1本+DXIL Compute 4本〈add/mul/sub/div〉+グラフィックス1本)全green(実機NVIDIA GT 730、スキップ無し)。`cargo build --workspace`/`cargo clippy --workspace --all-targets --release`はいずれも警告0件。
+  4. **正直な開示・まだやっていないこと**: DXBC Computeチェーンクラス(`decode_chain_shape`)へのsub/div対応は今回未着手(前回HANDOFFの次項(2)後半)。D3D11グラフィックスパイプラインの補間検証・深度バッファ等も未着手のまま(次項(1)(3)、変更なし)。
+  - 次にすべきこと: (1) 異なる頂点色での補間検証(グラデーション三角形)。(2) DXBC Computeチェーンクラスのsub/div対応、3項以上の実シェーダーでの検証。(3) 深度バッファ・複数三角形・インデックスバッファ等、より本格的なD3D11描画コマンドへの拡張。

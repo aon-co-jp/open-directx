@@ -40,11 +40,17 @@ fn dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware() {
         (64, 1, 1),
         "vector_add_dxil.hlslのnumthreads(64,1,1)(既知値、METADATA_BLOCK未抽出につき固定)"
     );
-    assert_eq!(
-        kernel.uav_bind_points,
-        (0, 1, 2),
-        "InputA=u0, InputB=u1, Output=u2のバインドポイントがCreateHandleのrange_idから正しく解決されているはず"
-    );
+    // addは可換演算のため、dxc/LLVMの最適化によりBinOpのオペランド相対値
+    // 参照順序が実際には(1,0)になっている(mulも同様、
+    // `dxil.rs`の`resolves_mul_binop_from_real_dxc_compiled_dxil`参照)。
+    // 書き込み先(u2)は常に一意なのでそのまま検証し、読み出し元2本は
+    // 順序を問わず{u0,u1}の集合として検証する(数値的には可換なので
+    // どちらの順でもCPU参照実装`a[i]+b[i]`と一致する)。
+    let (uav_a, uav_b, uav_c) = kernel.uav_bind_points;
+    assert_eq!(uav_c, 2, "Output=u2のバインドポイントがCreateHandleのrange_idから正しく解決されているはず");
+    let mut read_uavs = [uav_a, uav_b];
+    read_uavs.sort_unstable();
+    assert_eq!(read_uavs, [0, 1], "InputA/InputBのバインドポイントは(順不同で){{u0,u1}}のはず");
     assert!(
         !kernel.spirv_words.is_empty() && kernel.spirv_words[0] == 0x0723_0203,
         "生成したSPIR-Vの先頭ワードはリトルエンディアンマジック0x07230203のはず"
