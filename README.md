@@ -19,6 +19,24 @@ See [`CLAUDE.md`](CLAUDE.md) for the full design rationale, honest
 scope/roadmap, and session HANDOFF log — this README only summarizes
 current, verified state.
 
+## Current state (2026-07-27, latest: gradient interpolation, GPU vendor diagnostics, chain sub/div)
+
+Three increments landed on top of the D3D11 minimal graphics pipeline and
+DXBC chain-class work below, all verified on this machine's real NVIDIA
+GT 730: (1) `render_gradient_triangle_and_read_back` — the graphics
+pipeline can now assign a distinct color per vertex (not just the
+degenerate uniform-color case), verified via a partition-of-unity
+invariant check on real hardware readback pixels. (2)
+`enumerate_graphics_devices()` — closes a diagnostic parity gap where
+`open-cuda`'s Compute path had vendor-ID detection but the Graphics path
+here had none; standalone, no new dependency on `opencuda-vulkan`. (3)
+`decode_chain_shape` now supports `sub`/`div` (previously explicitly
+rejected as unverifiable) — a new shader (`vector_sub_div_chain.hlsl`)
+was actually compiled with `fxc.exe` and its SHEX dump used to confirm
+the exact operand ordering, then verified end-to-end against a CPU
+reference on real hardware. See `CLAUDE.md` HANDOFF (2026-07-27 entries)
+for the full account.
+
 ## Current state (2026-07-25, latest: DXIL vertical slice complete on real hardware)
 
 The D3D12/DXIL compute-shader vertical slice now reaches full parity
