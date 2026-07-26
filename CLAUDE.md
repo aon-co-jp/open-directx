@@ -481,6 +481,56 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
   4. **正直な開示・まだやっていないこと**: DXBC Computeチェーンクラス(`decode_chain_shape`)へのsub/div対応は今回未着手(前回HANDOFFの次項(2)後半)。D3D11グラフィックスパイプラインの補間検証・深度バッファ等も未着手のまま(次項(1)(3)、変更なし)。
   - 次にすべきこと: (1) 異なる頂点色での補間検証(グラデーション三角形)。(2) DXBC Computeチェーンクラスのsub/div対応、3項以上の実シェーダーでの検証。(3) 深度バッファ・複数三角形・インデックスバッファ等、より本格的なD3D11描画コマンドへの拡張。
 
+- **2026-07-27(続き) DXBCチェーンクラス(`decode_chain_shape`)にsub/div
+  対応を追加——複数エントリにわたって「次にすべきこと」に残っていた
+  項目を実際に検証・解消(以前は「1シェーダーだけでは正しいオペランド
+  順序を検証しきれない」として明示的に拒否していた)**:
+  1. **新規シェーダー`vector_sub_div_chain.hlsl`**(`t = InputA[i] -
+     InputB[i]; Output[i] = t / InputA[i];`、既存の`vector_add_mul_chain.hlsl`
+     と同じUAV3本・InputA多重参照パターン、演算のみsub/divに変更)を
+     実際に`fxc.exe /T cs_5_0`でコンパイルし、`examples/dump_shex`で
+     実SHEX命令列をダンプして正しいオペランド順序を確認した(推測では
+     実装していない)。
+  2. **実際に確認したオペランド順序の規約**: `Add`命令でsrc1オペランド
+     (operands[1])に`negate`フラグが立っている場合、
+     `dest = src2_val - src1_val`(既存の`decode_shader_shape`と同じ
+     「negated-addはsub」規約が、このチェーンクラス内でも成立することを
+     実際に確認)。`Div`はこれと逆で`dest = src1_val / src2_val`
+     (swapしない、モジュールのdocコメントに以前から記載されていた
+     「divはadd/mulとオペランド順序が異なる」という記述が正しかったことを
+     このチェーンクラスでも裏付けた)。
+  3. **`spirv_gen.rs`の`decode_chain_shape`を拡張**: `Opcode::Add | Mul`
+     のみを扱っていたマッチアームを`Add | Mul | Div`に拡張し、上記の
+     規約に従って`RegExpr::BinOp`を構築するようにした。`mul`の
+     negateフラグは今回のシェーダーでは発生しなかったため未検証のまま
+     明示的に拒否する(正直な開示、誤って「対応している」というシグナルを
+     出さない)。
+  4. **新規実機テスト`dxbc_vector_sub_div_chain_matches_cpu_reference_on_
+     real_vulkan_hardware`を追加**(`tests/vector_sub_div_chain_real_vulkan.rs`、
+     既存の`vector_add_mul_chain_real_vulkan.rs`と同じ構成)。
+  5. **実際に`cargo test -p directx-shader-translate --test
+     vector_sub_div_chain_real_vulkan -- --nocapture`で確認した結果
+     (誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, 2項演算2回のチェーン sub+div)->SPIR-V(自前生成、式木の再帰翻訳)->実Vulkan経路が、CPU参照実装((a[i]-b[i])/a[i])と256要素すべてで数値一致した
+     test dxbc_vector_sub_div_chain_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
+     ```
+  6. **ワークスペース全体の検証**: `cargo test --workspace`で既存の
+     実機テスト群(グラフィックス3本+DXBC Compute4本+DXBCチェーン
+     (add/mul)1本+DXIL Compute4本+今回のsub/divチェーン1本)全green、
+     回帰なし。
+  7. **正直な開示・まだ残る制約**: (1) `mul`のnegateフラグが立つケースは
+     未検証のまま(遭遇時は明示的にエラー)。(2) このシェーダー1本
+     (1回のsub+1回のdiv)以外の組み合わせ・オペランド並び(例: 3項以上の
+     チェーンでのsub/divの重複使用)は未検証。(3) 境界チェック
+     (`ult`/`if`/`endif`)は引き続きチェーンクラスの対象外(既存クラス側
+     のみが対応)。
+  - 次にすべきこと: (1) Compute/Graphics両経路でのVulkanデバイス共有の
+    設計検討(前々回エントリから継続)、(2) 3項以上の実チェーンシェーダー
+    でのsub/div組み合わせ検証、(3) `mul`のnegateフラグケースの検証。
+
 - **2026-07-27 グラフィックスパイプライン側にもGPUベンダー診断を追加
   ——SET連携(open-directx/open-cuda/aruaru-llm)調査で判明していた
   「open-cudaのCompute経路には`vendor_from_id`によるベンダー判定がある

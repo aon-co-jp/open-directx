@@ -568,13 +568,17 @@ fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
 // という軸に絞った——これも正直な開示の通り、当初想定より小さいが実物の
 // 一般化である。
 //
-// **正直な開示(スコープ)**: 対応する2項演算は`add`/`mul`のみ(このシェーダーが
-// 実際に使うのがこの2つのため)。`sub`(negated-add最適化)・`div`は、既存の
-// `decode_shader_shape`側でのみ対応済みで、この一般化されたチェーン内での
-// 混在(例: `(a+b)/c`)は未検証のため今回のクラスでは明示的に拒否する
-// (`sub`はoperandの`negate`規約、`div`はoperand順序が`add`/`mul`と異なる
-// ことが既存コードで判明済みで、チェーン内での正しい順序をこの1シェーダー
-// だけでは検証しきれないため——「対応している」という誤ったシグナルを出さない)。
+// **正直な開示(スコープ、2026-07-27更新)**: 対応する2項演算は
+// `add`/`mul`/`sub`(negated-add最適化)/`div`。`vector_sub_div_chain.hlsl`
+// (`t = InputA[i] - InputB[i]; Output[i] = t / InputA[i];`)を実際に
+// `fxc.exe`でコンパイルし`examples/dump_shex`で実SHEXを確認した上で
+// sub/divをこのチェーンクラスへ追加した(当初は「1シェーダーだけでは
+// 正しい順序を検証しきれない」として明示的に拒否していたが、実際に
+// このシェーダーで検証した)。ただし以下は引き続き未検証のスコープ外:
+// - `mul`のnegateフラグが立つケース(このシェーダーでは発生しなかったため
+//   未検証、遭遇したら明示的にエラーを返す)。
+// - このシェーダー1本(1回のsub+1回のdiv)以外の組み合わせ・オペランド
+//   並び(例: 3項以上のチェーンでのsub/divの重複使用)。
 // 境界チェック(`ult`/`if`/`endif`)も今回のクラスでは対象外(既存クラス側の
 // みが対応)。
 
@@ -710,46 +714,69 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                     })?;
                     reg_map.insert(dest_key, RegExpr::Load(uav));
                 }
-                Opcode::Add | Opcode::Mul => {
+                Opcode::Add | Opcode::Mul | Opcode::Div => {
+                    // 2026-07-27追加: sub/divをチェーンクラスへ対応
+                    // (`vector_sub_div_chain.hlsl`を実際にfxc.exeでコンパイル・
+                    // `examples/dump_shex`で実オペランド順序を確認した上での
+                    // 実装、以前は"チェーン内でのnegateフラグは対応スコープ外"
+                    // として明示的に拒否していた)。
+                    //
+                    // 実測した規約(t = A - B; Output = t / A;のSHEXダンプより):
+                    // - `Add`でsrc1(operands[1])に`negate`が立っていれば
+                    //   `dest = src2_val - src1_val`(既存の`decode_shader_shape`
+                    //   と同じ「negated-addはsub」規約、チェーン内でも成立する
+                    //   ことを実際に確認した)。
+                    // - `Mul`はnegateフラグが立つケースは未検証のため引き続き
+                    //   拒否する(実際に検証できたのはこのシェーダーのadd/div
+                    //   のみ、既存のmulの扱いは変更しない)。
+                    // - `Div`は`Add`/`Mul`とはオペランド順序が逆
+                    //   (`dest = src1_val / src2_val`、swapしない)——
+                    //   このモジュール冒頭のdocコメントで以前から「divは
+                    //   オペランド順序がadd/mulと異なる」と記載されていた
+                    //   通りであることを、このチェーンクラスでも実際に確認した。
                     let dest = operands.first().ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mulの書き込み先オペランドが無い".to_string())
+                        SpirvGenError::UnsupportedShader("add/mul/divの書き込み先オペランドが無い".to_string())
                     })?;
                     let dest_key = temp_key(dest, true).ok_or_else(|| {
                         SpirvGenError::UnsupportedShader(
-                            "add/mulの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                            "add/mul/divの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
                         )
                     })?;
                     let src1 = operands.get(1).ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mulの第1ソースオペランドが無い".to_string())
+                        SpirvGenError::UnsupportedShader("add/mul/divの第1ソースオペランドが無い".to_string())
                     })?;
-                    if src1.negate {
-                        // 既存`decode_shader_shape`が扱う「negated-add-as-sub」は、
-                        // このチェーンクラスでは対応スコープ外(上記docコメント参照)。
+                    let src2 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mul/divの第2ソースオペランドが無い".to_string())
+                    })?;
+                    if ins.opcode != Opcode::Add && (src1.negate || src2.negate) {
                         return Err(SpirvGenError::UnsupportedShader(
-                            "チェーン内でのnegateフラグ(sub最適化)は対応スコープ外".to_string(),
+                            "チェーン内でのnegateフラグはAdd(sub最適化)以外では未検証のため対応スコープ外".to_string(),
                         ));
                     }
-                    let src2 = operands.get(2).ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mulの第2ソースオペランドが無い".to_string())
-                    })?;
                     let src1_key = temp_key(src1, false).ok_or_else(|| {
                         SpirvGenError::UnsupportedShader(
-                            "add/mulの第1ソースが一時レジスタのスカラー選択ではない".to_string(),
+                            "add/mul/divの第1ソースが一時レジスタのスカラー選択ではない".to_string(),
                         )
                     })?;
                     let src2_key = temp_key(src2, false).ok_or_else(|| {
                         SpirvGenError::UnsupportedShader(
-                            "add/mulの第2ソースが一時レジスタのスカラー選択ではない".to_string(),
+                            "add/mul/divの第2ソースが一時レジスタのスカラー選択ではない".to_string(),
                         )
                     })?;
-                    let rhs = reg_map.get(&src1_key).cloned().ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mulの第1ソースがまだ定義されていない一時レジスタを参照している".to_string())
+                    let src1_val = reg_map.get(&src1_key).cloned().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mul/divの第1ソースがまだ定義されていない一時レジスタを参照している".to_string())
                     })?;
-                    let lhs = reg_map.get(&src2_key).cloned().ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mulの第2ソースがまだ定義されていない一時レジスタを参照している".to_string())
+                    let src2_val = reg_map.get(&src2_key).cloned().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("add/mul/divの第2ソースがまだ定義されていない一時レジスタを参照している".to_string())
                     })?;
-                    let op = if ins.opcode == Opcode::Add { BinaryOp::Add } else { BinaryOp::Mul };
-                    reg_map.insert(dest_key, RegExpr::BinOp(op, Box::new(lhs), Box::new(rhs)));
+                    let expr = match ins.opcode {
+                        Opcode::Add if src1.negate => RegExpr::BinOp(BinaryOp::Sub, Box::new(src2_val), Box::new(src1_val)),
+                        Opcode::Add => RegExpr::BinOp(BinaryOp::Add, Box::new(src2_val), Box::new(src1_val)),
+                        Opcode::Mul => RegExpr::BinOp(BinaryOp::Mul, Box::new(src2_val), Box::new(src1_val)),
+                        Opcode::Div => RegExpr::BinOp(BinaryOp::Div, Box::new(src1_val), Box::new(src2_val)),
+                        _ => unreachable!("match arm limited to Add|Mul|Div above"),
+                    };
+                    reg_map.insert(dest_key, expr);
                 }
                 Opcode::StoreStructured => {
                     let dest_uav = operands.first().ok_or_else(|| {
