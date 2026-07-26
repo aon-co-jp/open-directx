@@ -10,13 +10,17 @@
 //!
 //! Scope (narrow but real, matching the rest of this repo's honesty policy):
 //! this is a single hardcoded offscreen render of one full-viewport triangle
-//! with a uniform vertex color (passthrough VS + passthrough PS), rendered to
-//! a small device-local color image, read back through a host-visible
-//! staging buffer, and compared byte-for-byte (with a tiny rounding
-//! tolerance) against the CPU-side expectation that the passthrough shaders
-//! must reproduce the input color unchanged. It is not a general-purpose
-//! renderer: no swapchain, no depth buffer, no textures, no per-draw
-//! parameterization beyond what the test below exercises.
+//! (passthrough VS + passthrough PS), rendered to a small device-local color
+//! image, read back through a host-visible staging buffer. Two entry points
+//! share the same pipeline setup: [`render_uniform_triangle_and_read_back`]
+//! assigns every vertex the same color (verifying the passthrough shaders
+//! reproduce the input color unchanged, with no ambiguity from
+//! interpolation), and [`render_gradient_triangle_and_read_back`] (added
+//! 2026-07-26) assigns a distinct color per vertex, so the tests can verify
+//! the rasterizer's actual barycentric color interpolation rather than only
+//! the degenerate all-equal case. It is not a general-purpose renderer: no
+//! swapchain, no depth buffer, no textures, no per-draw parameterization
+//! beyond what the tests below exercise.
 
 use std::ffi::CString;
 
@@ -59,6 +63,32 @@ pub fn render_uniform_triangle_and_read_back(
     vs_spirv: &[u32],
     ps_spirv: &[u32],
     vertex_color: [f32; 4],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Rgba8>> {
+    render_triangle_and_read_back(vs_spirv, ps_spirv, [vertex_color; 3], width, height)
+}
+
+/// Render the same full-viewport "big triangle" as
+/// [`render_uniform_triangle_and_read_back`], but with a distinct color per
+/// vertex (`vertex_colors[0]` for NDC `(-1,-1)`, `[1]` for `(3,-1)`, `[2]` for
+/// `(-1,3)`), exercising the rasterizer's actual barycentric color
+/// interpolation instead of the degenerate all-vertices-equal case. Returns
+/// the same row-major RGBA8 readback as the uniform-color variant.
+pub fn render_gradient_triangle_and_read_back(
+    vs_spirv: &[u32],
+    ps_spirv: &[u32],
+    vertex_colors: [[f32; 4]; 3],
+    width: u32,
+    height: u32,
+) -> Result<Vec<Rgba8>> {
+    render_triangle_and_read_back(vs_spirv, ps_spirv, vertex_colors, width, height)
+}
+
+fn render_triangle_and_read_back(
+    vs_spirv: &[u32],
+    ps_spirv: &[u32],
+    vertex_colors: [[f32; 4]; 3],
     width: u32,
     height: u32,
 ) -> Result<Vec<Rgba8>> {
@@ -216,11 +246,10 @@ pub fn render_uniform_triangle_and_read_back(
         pos: [f32; 3],
         color: [f32; 4],
     }
-    let [cr, cg, cb, ca] = vertex_color;
     let vertices = [
-        Vertex { pos: [-1.0, -1.0, 0.0], color: [cr, cg, cb, ca] },
-        Vertex { pos: [3.0, -1.0, 0.0], color: [cr, cg, cb, ca] },
-        Vertex { pos: [-1.0, 3.0, 0.0], color: [cr, cg, cb, ca] },
+        Vertex { pos: [-1.0, -1.0, 0.0], color: vertex_colors[0] },
+        Vertex { pos: [3.0, -1.0, 0.0], color: vertex_colors[1] },
+        Vertex { pos: [-1.0, 3.0, 0.0], color: vertex_colors[2] },
     ];
     let vbuf_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
     let (vertex_buffer, vertex_buffer_memory) = create_host_visible_buffer(

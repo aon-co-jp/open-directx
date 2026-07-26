@@ -9,7 +9,7 @@
 //! Per repo policy this is a real-hardware test, not a mock: if no Vulkan
 //! device/driver is present it prints and skips rather than faking success.
 
-use directx_graphics_vulkan::render_uniform_triangle_and_read_back;
+use directx_graphics_vulkan::{render_gradient_triangle_and_read_back, render_uniform_triangle_and_read_back};
 use directx_shader_translate::spirv_gen::{translate_pixel_shader, translate_vertex_shader};
 
 // Same real fxc.exe-compiled DXBC bytes already used and verified in
@@ -72,5 +72,91 @@ fn d3d11_triangle_draw_call_matches_passthrough_vertex_color_on_real_vulkan_hard
          real translated SPIR-V, and all {}x{} read-back pixels matched the passthrough vertex color \
          {:?} on the real GPU present on this machine.",
         width, height, expected
+    );
+}
+
+/// 2026-07-26 addition: the uniform-color test above cannot distinguish
+/// "the rasterizer correctly interpolates per-vertex colors" from "the
+/// pipeline just replicates one vertex's color everywhere" — every vertex is
+/// fed the exact same color, so interpolation is degenerate (any weighted
+/// average of three equal colors is that same color). This test assigns
+/// pure red/green/blue to the three distinct vertices and checks real
+/// hardware readback for the defining property of barycentric/affine color
+/// interpolation, without hardcoding the pixel-to-NDC coordinate convention
+/// (viewport y-direction, which vertex maps to which screen corner, etc.),
+/// which would make the test as fragile as the renderer it's checking:
+///
+/// 1. Every covered pixel's (r,g,b) sums to ~255 (the "big triangle" fully
+///    covers the viewport, and R=(255,0,0)+G=(0,255,0)+B=(0,0,255) is a
+///    partition of unity: for any convex combination `u*R + v*G + w*B` with
+///    `u+v+w=1`, the channel sum is always `255`. A buggy pipeline that
+///    clamped/truncated weights, or that used non-affine/incorrect weights,
+///    would not preserve this invariant across every pixel.)
+/// 2. The image is not a single flat color (i.e. genuine per-pixel
+///    variation exists) — ruling out the degenerate "always outputs vertex
+///    0's color" bug that the uniform-color test above cannot catch.
+#[test]
+fn d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulkan_hardware() {
+    let vs = translate_vertex_shader(TRIANGLE_VS_DXBC).expect("triangle_vs.dxbc must translate");
+    let ps = translate_pixel_shader(TRIANGLE_PS_DXBC).expect("triangle_ps.dxbc must translate");
+
+    // Pure red / green / blue per vertex (alpha fixed at 1.0 for all three,
+    // so alpha is not part of the interpolation being exercised here).
+    let vertex_colors = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ];
+
+    let width = 8u32;
+    let height = 8u32;
+
+    let pixels = match render_gradient_triangle_and_read_back(
+        &vs.spirv_words,
+        &ps.spirv_words,
+        vertex_colors,
+        width,
+        height,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "skipping real-hardware D3D11 gradient triangle test: no usable real Vulkan graphics device/driver ({e})"
+            );
+            return;
+        }
+    };
+
+    assert_eq!(pixels.len(), (width * height) as usize);
+
+    let mut saw_a_different_pixel = false;
+    let first = pixels[0];
+    for (i, px) in pixels.iter().enumerate() {
+        let sum = px.r as i32 + px.g as i32 + px.b as i32;
+        assert!(
+            (sum - 255).abs() <= 2,
+            "pixel {i} = {px:?} has r+g+b = {sum}, expected ~255 (partition-of-unity of a convex \
+             combination of pure red/green/blue vertex colors) — the rasterizer's color \
+             interpolation does not look affine"
+        );
+        assert_eq!(px.a, 255, "pixel {i} alpha = {}, expected 255 (constant across all three vertices)", px.a);
+        if px.r != first.r || px.g != first.g || px.b != first.b {
+            saw_a_different_pixel = true;
+        }
+    }
+    assert!(
+        saw_a_different_pixel,
+        "all {} pixels had the identical color {:?} — this would also be consistent with a broken \
+         pipeline that always outputs one vertex's color regardless of position, which the \
+         partition-of-unity check above cannot rule out on its own",
+        pixels.len(),
+        first
+    );
+
+    println!(
+        "OK: D3D11 minimal graphics pipeline correctly interpolates distinct per-vertex colors \
+         (pure red/green/blue) across all {}x{} read-back pixels on the real GPU present on this \
+         machine — every pixel's r+g+b sums to ~255 and the image is not a single flat color.",
+        width, height
     );
 }

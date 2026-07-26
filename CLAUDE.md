@@ -480,3 +480,19 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      `dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware`(既存)も修正後green。ワークスペース全体: unittests 37件+実機テスト8本(DXBC Compute 4本+DXBCチェーン1本+DXIL Compute 4本〈add/mul/sub/div〉+グラフィックス1本)全green(実機NVIDIA GT 730、スキップ無し)。`cargo build --workspace`/`cargo clippy --workspace --all-targets --release`はいずれも警告0件。
   4. **正直な開示・まだやっていないこと**: DXBC Computeチェーンクラス(`decode_chain_shape`)へのsub/div対応は今回未着手(前回HANDOFFの次項(2)後半)。D3D11グラフィックスパイプラインの補間検証・深度バッファ等も未着手のまま(次項(1)(3)、変更なし)。
   - 次にすべきこと: (1) 異なる頂点色での補間検証(グラデーション三角形)。(2) DXBC Computeチェーンクラスのsub/div対応、3項以上の実シェーダーでの検証。(3) 深度バッファ・複数三角形・インデックスバッファ等、より本格的なD3D11描画コマンドへの拡張。
+
+- **2026-07-26(続き3) 異なる頂点色での補間検証(グラデーション三角形)を実装——直前2エントリの「次にすべきこと(1)」を解消(ユーザー指示: runo.tokyo/open-directx/open-cuda/aruaru-llm等7リポジトリの未着手・未完成事項の洗い出し→実装継続、DirectX12/GPU互換性の並行開発の一環)**:
+  1. **`crates/directx-graphics-vulkan/src/lib.rs`を拡張**: 既存の`render_uniform_triangle_and_read_back(vs_spirv, ps_spirv, vertex_color: [f32;4], width, height)`を、内部の非公開関数`render_triangle_and_read_back(vs_spirv, ps_spirv, vertex_colors: [[f32;4];3], width, height)`(3頂点それぞれに個別の色を割り当てられるよう一般化)への薄いラッパーとして書き直し(`[vertex_color; 3]`を渡すだけ、既存の公開APIのシグネチャ・挙動は完全に維持——既存テスト`d3d11_triangle_draw_call_matches_passthrough_vertex_color_on_real_vulkan_hardware`は無変更のままgreen)。新規に公開関数`render_gradient_triangle_and_read_back(vs_spirv, ps_spirv, vertex_colors: [[f32;4];3], width, height)`を追加し、同じ内部関数へ委譲。頂点バッファ構築部分(210行目付近)を`vertex_colors[0/1/2]`をそれぞれ`(-1,-1)`/`(3,-1)`/`(-1,3)`の各頂点へ割り当てる形に変更(HLSL/SPIR-V側は既に`COLOR`セマンティクスをパススルーする構造だったため、シェーダー自体の変更は不要——前回の実機調査で判明していた「シェーダーは補間対応済みだがRust側APIが単色専用だった」というギャップに対する対応)。
+  2. **新規実機テスト`d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulkan_hardware`を追加**(`tests/triangle_real_vulkan.rs`): 3頂点にそれぞれ純色の赤`(1,0,0,1)`・緑`(0,1,0,1)`・青`(0,0,1,1)`を割り当てて8x8ピクセルで実描画。ピクセル位置とNDC座標の対応(ビューポートのY軸方向等)をハードコードして期待色を逆算する方式は、検証コード自体がレンダラと同じ前提のミスを共有しかねないため意図的に避け、代わりに次の2つのアフィン補間の性質を実際の読み戻しピクセルで検証する設計にした: (a) 純色R/G/Bは「単位分割」(`u+v+w=1`のときr+g+b=255の凸結合)をなすため、カバーされる全ピクセルで`r+g+b`が255±2に収まること(バリセントリック補間が正しくアフィンであることの直接証拠)、(b) 全ピクセルが同一色ではない(=真に位置ごとに補間されている、「常に頂点0の色を出すだけ」という縮退バグを(a)だけでは検出できないため追加した別の観点)。
+  3. **実際に`cargo test -p directx-graphics-vulkan --test triangle_real_vulkan -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     running 2 tests
+     OK: D3D11 minimal graphics pipeline correctly interpolates distinct per-vertex colors (pure red/green/blue) across all 8x8 read-back pixels on the real GPU present on this machine — every pixel's r+g+b sums to ~255 and the image is not a single flat color.
+     test d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulkan_hardware ... ok
+     OK: D3D11 minimal graphics pipeline (real ash-driven render pass + framebuffer + VkGraphicsPipelineCreateInfo) drew a full-viewport triangle using triangle_vs.dxbc/triangle_ps.dxbc's real translated SPIR-V, and all 4x4 read-back pixels matched the passthrough vertex color Rgba8 { r: 200, g: 100, b: 50, a: 255 } on the real GPU present on this machine.
+     test d3d11_triangle_draw_call_matches_passthrough_vertex_color_on_real_vulkan_hardware ... ok
+     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+     ```
+  4. **ワークスペース全体の検証**: `cargo test --workspace`で既存の実機テスト7本(DXBC Compute 4本+DXBCチェーン1本+DXIL Compute 4本のうち一部重複カウント訂正、実際には既存8本)+新規1本、全green。既存の単色テストへの回帰なし。
+  5. **正直な開示・まだやっていないこと**: (1) ピクセル位置とNDC座標の厳密な対応(ビューポートのY軸方向、`(row,col)`→NDC変換式)は今回検証していない——上記の設計判断により、その変換式に依存しない不変量(単位分割・非一様性)のみを検証した。ピクセル単位の厳密な期待値照合(例えば中心ピクセルが理論値とどれだけ一致するか)は次の増分候補として残る。(2) 深度バッファ・複数三角形・インデックスバッファ・テクスチャ・スワップチェーン・実ウィンドウ表示は引き続き一切未実装(前回・前々回エントリと同じ既知の制約)。
+  - 次にすべきこと: (1) ピクセル位置↔NDC座標の変換式を明示的に検証するテスト(現在は変換式に依存しない不変量チェックのみ)、(2) DXBC Computeチェーンクラスのsub/div対応・3項以上の実シェーダーでの検証(前々回エントリから継続)、(3) 深度バッファ・複数三角形・インデックスバッファ等、より本格的なD3D11描画コマンドへの拡張。
