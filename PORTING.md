@@ -367,13 +367,100 @@ generator) is confirmed, via a new test
 to fail with `SpirvGenError::UnsupportedShader` rather than silently
 emitting something wrong.
 
-**Honest scope**: no SPIR-V generation for graphics shaders exists, no
-rasterizer, no output-merger, no actual Vulkan triangle draw. This pass
-only establishes that the DXBC container front-end generalizes to
-graphics shaders and records what their SHEX opcode vocabulary actually
-looks like, as the documented prerequisite for eventually extending
-`spirv_gen` (or writing a parallel graphics-focused decoder) to cover
-this pipeline stage.
+**Honest scope (superseded below, kept for history)**: this pass
+established the parsing prerequisite only. The next increment (below)
+built real SPIR-V generation on top of it.
+
+## D3D11 graphics pipeline — real SPIR-V generation for VS/PS, validated, added 2026-07-25 (later pass)
+
+Built directly on the parsing groundwork above. `spirv_gen.rs` gained a
+new, independent section (existing compute-only `decode_shader_shape`/
+`decode_chain_shape` untouched): `decode_vertex_shader_shape`/
+`decode_pixel_shader_shape` strictly match the real, fixed SHEX
+instruction sequences dumped for `triangle_vs.dxbc`/`triangle_ps.dxbc`
+(no free parameters — this pair of shaders is a pure passthrough, so
+unlike the compute decoders there is nothing to extract, only a shape
+to verify):
+
+- VS (9 instructions): `dcl_globalFlags` -> `dcl_input`(v0, mask=7=xyz,
+  POSITION) -> `dcl_input`(v1, mask=15=xyzw, COLOR) ->
+  `dcl_output_siv`(o0, mask=15, SV_POSITION) -> `dcl_output`(o1,
+  mask=15, COLOR) -> `mov o0.xyz, v0.xyzx` -> `mov o0.w, l(1.0)` ->
+  `mov o1.xyzw, v1.xyzw` -> `ret`.
+- PS (5 instructions): `dcl_globalFlags` -> `dcl_input_ps`(linear, v1,
+  mask=15, COLOR) -> `dcl_output`(o0, mask=15) -> `mov o0.xyzw,
+  v1.xyzw` -> `ret`.
+
+`translate_vertex_shader`/`translate_pixel_shader` (new public API)
+check this exact shape and, only if it matches, emit a real graphics
+SPIR-V module via `rspirv::dr::Builder`:
+
+- `OpEntryPoint Vertex`/`Fragment` (not `GLCompute` — the previous
+  compute-only `emit_spirv_impl`/`emit_chain_spirv` are unchanged and
+  still only emit `GLCompute`).
+- `Input`/`Output` storage-class variables with `Location` decorations
+  (not the storage-buffer/push-constant layout used by the compute
+  path).
+- `BuiltIn Position` decoration on the vertex shader's `SV_POSITION`
+  output variable (a `vec4`, constructed in the shader body from the
+  `vec3` POSITION input plus a literal `1.0` for `.w`, matching the
+  real `mov o0.xyz, v0.xyz` / `mov o0.w, l(1.0)` pair instead of
+  hand-waving a single passthrough).
+- `OpExecutionMode ... OriginUpperLeft` on the fragment shader (a
+  Vulkan-mandated execution mode with no DXBC equivalent to extract —
+  added because Vulkan requires it, not derived from the shader bytes).
+
+**Validated two independent ways, both with real output quoted here**:
+
+1. `rspirv`'s own loader re-parses the emitted byte stream without
+   error (`rspirv::binary::parse_bytes` succeeds, `OpEntryPoint`
+   `Vertex`/`Fragment` confirmed present in the re-parsed module) — new
+   tests `translates_real_fxc_compiled_triangle_vs_dxbc_to_valid_vertex_spirv`
+   / `_triangle_ps_dxbc_to_valid_fragment_spirv`.
+2. The real Vulkan SDK's own validator was run against both emitted
+   modules (dumped to files via a new `examples/dump_graphics_spirv.rs`):
+   ```
+   $ /c/VulkanSDK/1.4.350.0/Bin/spirv-val.exe triangle_vs.spv; echo "exit=$?"
+   exit=0
+   $ /c/VulkanSDK/1.4.350.0/Bin/spirv-val.exe triangle_ps.spv; echo "exit=$?"
+   exit=0
+   ```
+   No diagnostics were printed for either file — `spirv-val` prints
+   nothing on success, so the two blank outputs above plus the `exit=0`
+   codes are the real, unedited terminal output.
+
+Regression tests added: `vertex_translator_honestly_rejects_the_pixel_shader_and_vice_versa`
+(cross-feeding VS DXBC to `translate_pixel_shader` and vice versa both
+fail), `graphics_translators_honestly_reject_garbage_bytes`, and
+`compute_translators_still_honestly_reject_graphics_shaders` (confirms
+`translate_shader`/`translate_chain_shader` still reject both graphics
+shaders — the pre-existing "no false positive" guarantee is unbroken).
+`cargo test --workspace --lib` passes all 33 unit tests (27 pre-existing
++ 6 new); `cargo test --workspace --test '*'` re-confirms all 6
+real-hardware Compute Shader tests (4 single-op DXBC + 1 chain DXBC + 1
+DXIL) still pass unchanged. `cargo build --workspace` /
+`cargo clippy --workspace --all-targets` are both clean (0 warnings).
+
+**Honest milestone reached — no further**: real SPIR-V generation for
+both shaders, validated by two independent tools. **No rasterizer, no
+output-merger/framebuffer, no actual Vulkan draw call, no rendered
+pixel readback.** This is not an oversight or a time-boxing shortcut
+taken lightly — `opencuda-vulkan`'s real source
+(`../open-cuda/crates/opencuda-vulkan/src/{lib,real}.rs`) was read and
+confirmed to contain zero `VkGraphicsPipelineCreateInfo`/render-pass/
+framebuffer code; it is a Compute-dispatch-only backend (`ash` is
+already a transitive dev-dependency here only via its `real-vulkan`
+feature, gated to the compute path). Actually drawing the triangle
+would require either (a) extending `opencuda-vulkan` with graphics-
+pipeline support — explicitly out of scope per this project's
+"depend on open-cuda, don't modify it" convention — or (b) adding `ash`
+as a **direct** dependency of `open-directx` itself and hand-rolling a
+minimal `VkGraphicsPipelineCreateInfo` + render pass + framebuffer +
+draw call + readback. Option (b) is a legitimate next increment but was
+not attempted this pass, in keeping with this project's "narrow but
+real, not a stretch claim" discipline — the SPIR-V groundwork above is
+solid and independently validated; the draw call is honestly left as
+the next step, not silently skipped.
 
 ## What is NOT yet reusable (honest gaps)
 
@@ -394,12 +481,16 @@ this pipeline stage.
   rejected. D3D12's higher-level layers (command lists, descriptor
   heaps, root signatures) remain entirely unimplemented, Phase 3+ per
   `CLAUDE.md`'s roadmap.
-- **D3D11 graphics pipeline: DXBC container parsing for vertex/pixel
-  shaders is confirmed working (see the dedicated section above, added
-  2026-07-25), but there is no SPIR-V generation, rasterizer, texture
-  sampler, blend state, output-merger, or actual Vulkan triangle draw.**
-  Compute-only SPIR-V codegen, per the original vertical-slice scope in
-  `CLAUDE.md`.
+- **D3D11 graphics pipeline: real SPIR-V generation for the specific
+  `triangle_vs.hlsl`/`triangle_ps.hlsl` pair is done and validated
+  (`rspirv` re-parse + real `spirv-val.exe`, see the dedicated section
+  above, added 2026-07-25), but this is not a general VS/PS decoder —
+  any other vertex/pixel shader (different semantics, more than one
+  `mov`-chain, texture sampling, multiple render targets, etc.) is
+  rejected, not mistranslated. There is still no rasterizer, no texture
+  sampler, no blend state, no output-merger, and no actual Vulkan
+  triangle draw — `opencuda-vulkan` was confirmed by reading its source
+  to be Compute-dispatch-only with zero graphics-pipeline code.**
 
 ## Path-dependency convention used in this ecosystem (for reference)
 

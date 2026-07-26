@@ -80,23 +80,30 @@ vertical slice below:
   matched the real decoded constants exactly. **Still no DXIL-to-SPIR-V
   translation** — that's the next increment. See "Not implemented"
   below.
-- **D3D11 graphics pipeline — DXBC parsing only, no SPIR-V.**
-  `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl` (minimal
-  passthrough vertex+pixel shader pair, `POSITION`/`COLOR` in,
-  `SV_POSITION`/`SV_TARGET` out) compiled with real `fxc.exe
-  /T vs_5_0`/`/T ps_5_0`. `parse_dxbc` (already existing, container-level
-  only) parses both without modification — confirming the same DXBC
-  container/chunk front-end works for graphics shaders, not just
-  compute. Dumping the real SHEX stream with `examples/dump_shex.rs`
-  confirmed the opcode/operand vocabulary is genuinely different from
-  compute shaders: `dcl_input`/`dcl_input_ps`(with `linear`
-  interpolation)/`dcl_output`/`dcl_output_siv`(`SV_POSITION`)/`mov` — no
-  `dcl_uav_structured`, `ld_structured`/`store_structured`, or
-  `dcl_thread_group` at all. `translate_shader` (compute-only) correctly
-  rejects both with `SpirvGenError::UnsupportedShader` rather than
-  attempting a wrong translation (verified by a new test). No SPIR-V
-  codegen, rasterizer, or actual Vulkan triangle draw exists — that is
-  explicitly out of scope for this pass, see `CLAUDE.md` HANDOFF.
+- **D3D11 graphics pipeline — real SPIR-V generation for VS/PS reached
+  and validated, no rasterizer/draw yet.** `shaders/triangle_vs.hlsl`/
+  `shaders/triangle_ps.hlsl` (minimal passthrough vertex+pixel shader
+  pair, `POSITION`/`COLOR` in, `SV_POSITION`/`SV_TARGET` out) compiled
+  with real `fxc.exe /T vs_5_0`/`/T ps_5_0`. `parse_dxbc` parses both
+  without modification. `spirv_gen::translate_vertex_shader`/
+  `translate_pixel_shader` (new) decode the real, fixed SHEX opcode
+  sequence (`dcl_input`x2/`dcl_output_siv`/`dcl_output`/`mov`x3/`ret` for
+  VS; `dcl_input_ps`(linear)/`dcl_output`/`mov`/`ret` for PS) and emit
+  real graphics SPIR-V: `OpEntryPoint Vertex`/`Fragment` (not
+  `GLCompute`), `Input`/`Output` storage-class variables with `Location`
+  decorations, `BuiltIn Position` on the vertex shader's `SV_POSITION`
+  output, and `OpExecutionMode ... OriginUpperLeft` on the fragment
+  shader. Validated two ways: (1) `rspirv`'s own loader re-parses the
+  emitted bytes without error, (2) the real Vulkan SDK's `spirv-val.exe`
+  (`C:\VulkanSDK\1.4.350.0\Bin\spirv-val.exe`) was run against both
+  emitted modules and returned exit code 0 with no diagnostics for both.
+  `translate_shader`/`translate_chain_shader` (compute-only) still
+  correctly reject both shaders. **No rasterizer, no framebuffer, no
+  actual Vulkan draw call exists** — `opencuda-vulkan` was confirmed (by
+  reading its real source) to have no `VkGraphicsPipelineCreateInfo`/
+  render-pass/framebuffer code at all, compute-dispatch only, so an
+  actual rendered pixel is out of scope for this pass. See `CLAUDE.md`
+  HANDOFF for the honest milestone boundary.
 
 ## Current state (2026-07-25, Phase 1 vertical slice generalized to 3 known shaders)
 

@@ -68,23 +68,31 @@ LLVM bitstream→型テーブル→命令列→7個の`Call`すべてを実際�
   `BufferStore`=69・`ThreadId`=93)はMicrosoft公式`DXIL.rst`をWeb検索して
   確認し、実際の定数値とも一致した。**それでもDXIL→SPIR-V変換は無い**
   ——これが次の増分の対象(詳細は下記「未実装」節)。
-- **D3D11グラフィックスパイプライン——DXBCパースのみ、SPIR-V無し。**
+- **D3D11グラフィックスパイプライン——VS/PS向け実SPIR-V生成に到達・
+  検証済み、ラスタライザ/描画は未着手。**
   `shaders/triangle_vs.hlsl`/`shaders/triangle_ps.hlsl`(最小のパス
   スルー頂点+ピクセルシェーダーの組、`POSITION`/`COLOR`入力→
   `SV_POSITION`/`SV_TARGET`出力)を実`fxc.exe /T vs_5_0`/`/T ps_5_0`で
-  コンパイル。既存の`parse_dxbc`(コンテナレベルのみ、無改修)が両方とも
-  問題なくパースできることを確認——同じDXBCコンテナ/チャンクの
-  フロントエンドがCompute Shaderだけでなくグラフィックスシェーダーにも
-  そのまま使えることの実証。`examples/dump_shex.rs`で実SHEX命令列を
-  ダンプし、オペコード/オペランド語彙が実際にCompute Shaderとは異なる
-  ことを確認した: `dcl_input`/`dcl_input_ps`(`linear`補間付き)/
-  `dcl_output`/`dcl_output_siv`(`SV_POSITION`)/`mov`——
-  `dcl_uav_structured`・`ld_structured`/`store_structured`・
-  `dcl_thread_group`は一切出現しない。`translate_shader`
-  (Compute専用)はVS/PSいずれも`SpirvGenError::UnsupportedShader`で
-  正しく拒否する(誤った翻訳を試みない、新規テストで確認済み)。SPIR-V
-  コード生成・ラスタライザ・実Vulkanでの三角形描画は今回のスコープ外
-  (`CLAUDE.md`のHANDOFF参照)。
+  コンパイル。既存の`parse_dxbc`(無改修)が両方とも問題なくパースできる
+  ことを確認。`spirv_gen::translate_vertex_shader`/`translate_pixel_shader`
+  (新設)が、実SHEX命令列(固定・可変要素無し: VSは
+  `dcl_input`x2/`dcl_output_siv`/`dcl_output`/`mov`x3/`ret`、PSは
+  `dcl_input_ps`(linear)/`dcl_output`/`mov`/`ret`)を厳密に検証した上で、
+  実際のグラフィックスSPIR-Vを組み立てる: `OpEntryPoint Vertex`/
+  `Fragment`(`GLCompute`ではない)、`Input`/`Output`ストレージクラスの
+  変数+`Location`デコレーション、頂点シェーダーの`SV_POSITION`出力への
+  `BuiltIn Position`デコレーション、フラグメントシェーダーの
+  `OpExecutionMode ... OriginUpperLeft`。**2通りで検証済み**: (1)
+  `rspirv`自身のローダーで再パースしエラー無し、(2) 実Vulkan SDK付属の
+  `spirv-val.exe`(`C:\VulkanSDK\1.4.350.0\Bin\spirv-val.exe`)を両モジュール
+  に対して実際に実行し、両方とも診断メッセージ無しの終了コード0を確認した。
+  `translate_shader`/`translate_chain_shader`(Compute専用)は引き続き
+  両シェーダーを正しく拒否する。**ラスタライザ・フレームバッファ・実
+  Vulkan描画は一切無い**——`opencuda-vulkan`の実ソースを実際に読んで
+  確認した通り、`VkGraphicsPipelineCreateInfo`・レンダーパス・
+  フレームバッファ関連のコードは一切存在せずCompute専用のため、実際に
+  描画されたピクセルの検証は今回のスコープ外(正直な到達点の区切りは
+  `CLAUDE.md`のHANDOFF参照)。
 
 ## 現状(2026-07-25、3つの既知シェーダーへ一般化してフェーズ1垂直スライス達成)
 

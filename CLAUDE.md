@@ -415,3 +415,28 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
      - **DXBC側**: チェーンクラスは`add`/`mul`のみ対応、`sub`/`div`のチェーン内混在・3項以上への一般化(3回以上の逐次演算)は今回実測していない(理屈上`decode_chain_shape`のロジックはN回まで対応できる形にはなっているが、実際に3回以上の演算を持つシェーダーをコンパイルして検証してはいない)。境界チェックはチェーンクラスでは非対応のまま。
      - D3D11グラフィックスパイプライン(VS/PS向けSPIR-V生成・ラスタライズ・実描画)は前回エントリから変更なし(未着手のまま)。
   - 次にすべきこと: (1) DXIL側: `resolve_vector_add_dxil_calls`/`translate_dxil_vector_add_to_spirv`をmul/sub/div相当のDXILシェーダーへ一般化(DXBC側で先行実施済みのアプローチを踏襲)。(2) DXBC側: チェーンクラスへ`sub`/`div`のオペランド順序を実際に検証した上で対応追加、3項以上の実シェーダーでの検証。(3) D3D11グラフィックスパイプライン(VS/PS)は引き続き並行で検討可。
+
+- **2026-07-26 D3D11グラフィックスパイプライン: VS/PS向け実SPIR-V生成に到達・2通りの実ツールで検証(ラスタライザ/実描画は未着手、正直な区切り)**:
+  1. **前提の再確認**: 前回(2026-07-25続き4)の到達点通り、`triangle_vs.dxbc`/`triangle_ps.dxbc`は既存の`parse_dxbc`で問題なくパースでき、`translate_shader`(Compute専用)は両方とも`SpirvGenError::UnsupportedShader`で正しく拒否する状態だった。`examples/dump_shex.rs`で改めて実SHEX命令列を番号付きでダンプし直し、VSが実際に9命令(`dcl_globalFlags` -> `dcl_input`(v0, mask=7=xyz, POSITION) -> `dcl_input`(v1, mask=15=xyzw, COLOR) -> `dcl_output_siv`(o0, mask=15, SV_POSITION) -> `dcl_output`(o1, mask=15, COLOR) -> `mov o0.xyz, v0.xyzx` -> `mov o0.w, l(1.0)` -> `mov o1.xyzw, v1.xyzw` -> `ret`)、PSが実際に5命令(`dcl_globalFlags` -> `dcl_input_ps`(linear, v1, mask=15, COLOR) -> `dcl_output`(o0, mask=15) -> `mov o0.xyzw, v1.xyzw` -> `ret`)であることを確認した(HANDOFFの前回記述「mov×3」「mov×1」と一致、より詳細に番号・オペランド形状まで裏取り)。
+  2. **実装**: `crates/directx-shader-translate/src/spirv_gen.rs`へ、既存のCompute Shader向けコード(`decode_shader_shape`/`decode_chain_shape`とその周辺、`emit_spirv_impl`/`emit_chain_spirv`)を一切変更せず、独立した新セクションを追加。
+     - `decode_vertex_shader_shape`/`decode_pixel_shader_shape`: 上記の実命令列を1命令ずつ厳密に突き合わせる(この2シェーダーはパススルーのみで可変要素が無いため、Compute側のように値を抽出するのではなく、形状の一致検証のみを行う)。1つでも一致しなければ`SpirvGenError::UnsupportedShader`で拒否する。
+     - `emit_vertex_spirv`/`emit_pixel_spirv`: 検証を通った場合にのみ返す固定のSPIR-Vモジュールを`rspirv::dr::Builder`で組み立てる。Compute側(`GLCompute`実行モデル、storage buffer+push constant)とは根本的に異なる形: `OpEntryPoint Vertex`/`Fragment`、`Input`/`Output`ストレージクラス変数+`Location`デコレーション、頂点シェーダーの`SV_POSITION`出力への`BuiltIn Position`デコレーション(`vec3`のPOSITION入力から`vec4`を`OpCompositeConstruct`で組み立て、`.w`は実際の`mov o0.w, l(1.0)`命令通り定数1.0)、フラグメントシェーダーへの`OpExecutionMode ... OriginUpperLeft`(Vulkan必須、DXBC側に対応物は無く追加した)。
+     - `translate_vertex_shader`/`translate_pixel_shader`(新設公開API)。
+  3. **2通りの実検証(誇張なし、実出力そのまま)**:
+     - (1) `rspirv`自身のローダーで再パース: 新規テスト`translates_real_fxc_compiled_triangle_vs_dxbc_to_valid_vertex_spirv`/`_triangle_ps_dxbc_to_valid_fragment_spirv`が、`rspirv::binary::parse_bytes`が成功し再パース後のモジュールに`OpEntryPoint Vertex`/`Fragment`が実際に含まれることを検証。
+     - (2) 実Vulkan SDK付属の`spirv-val.exe`による外部検証: 新設`examples/dump_graphics_spirv.rs`で両モジュールをファイルへ書き出し、実際に実行した結果:
+       ```
+       $ /c/VulkanSDK/1.4.350.0/Bin/spirv-val.exe ./triangle_vs.spv
+       exit=0
+       $ /c/VulkanSDK/1.4.350.0/Bin/spirv-val.exe ./triangle_ps.spv
+       exit=0
+       ```
+       (`spirv-val`は成功時に何も出力しないため、上記の空出力+終了コード0がそのまま実結果。)
+  4. **回帰防止テスト追加**: `vertex_translator_honestly_rejects_the_pixel_shader_and_vice_versa`(VS用デコーダにPSのDXBCを渡す、逆も同様——いずれも拒否されることを確認)・`graphics_translators_honestly_reject_garbage_bytes`・`compute_translators_still_honestly_reject_graphics_shaders`(既存の`translate_shader`/`translate_chain_shader`が引き続きVS/PSを拒否することの継続確認)。
+  5. **実際に`cargo test --workspace --lib`で確認した結果(誇張なし、実出力そのまま)**: ワークスペース全体で33件全green(既存27件+新規6件)。`cargo test --workspace --test '*' -- --nocapture`で既存の実機Compute Shaderテスト6本(DXBC単一演算4本+DXBCチェーン1本+DXIL1本)も全green・変更なしを再確認(この増分は追加のみで既存経路への回帰無し)。`cargo build --workspace`/`cargo clippy --workspace --all-targets`はいずれも警告0件。
+  6. **タスク指示のstep 3調査結果(実ソースを実際に読んで確認)**: `../open-cuda/crates/opencuda-vulkan`(`src/lib.rs`/`src/real.rs`)を実際に読んだ結果、`VkGraphicsPipelineCreateInfo`・レンダーパス・フレームバッファに関するコードは一切存在せず、`launch_kernel`によるCompute専用ディスパッチのみであることを確認した(`grep -rl "GraphicsPipeline\|VkGraphicsPipeline\|RenderPass\|Framebuffer"`が0件)。`ash`はこのワークスペースには`opencuda-vulkan`の`real-vulkan`フィーチャ経由でのみ間接的に来ており、Compute経路専用。したがって実際に三角形をVulkanへディスパッチしてピクセルを読み戻すには、(a)`opencuda-vulkan`側にグラフィックスパイプライン対応を追加する(本プロジェクトの「open-cudaに依存するのみで変更しない」方針によりスコープ外)か、(b)`open-directx`自身に`ash`を直接の依存として追加し、最小限のグラフィックスパイプライン(レンダーパス・フレームバッファ・描画コマンド・読み戻し)を自前で組む、のいずれかが必要——これは正直な現状の開示であり、今回のパスでは(b)には着手していない。
+  7. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **汎用VS/PSデコーダではない**。今回対応したのは`triangle_vs.hlsl`/`triangle_ps.hlsl`が実際に生成する固定の命令列(可変要素・抽出対象値が一切無い、パススルーのみ)専用。別の頂点/ピクセルシェーダー(異なるセマンティクス・複数の`mov`連鎖・テクスチャサンプル・複数レンダーターゲット等)を渡せば`SpirvGenError::UnsupportedShader`で拒否される。
+     - **ラスタライザ・出力マージ・実際のVulkan描画コマンド・フレームバッファ読み戻しは一切実装していない**(タスク指示の到達し得る範囲として明記された「SPIR-V生成+検証まで」を正直な区切りとした)。
+     - DXIL(SM6+)・Compute Shader側(DXBC/DXIL双方)は前回エントリから変更なし(既存の対応範囲・実Vulkan検証範囲に変更無し)。
+  - 次にすべきこと: (1) `open-directx`自身へ`ash`を直接の依存として追加し、最小限のグラフィックスパイプライン(レンダーパス+フレームバッファ+`VkGraphicsPipelineCreateInfo`+描画コマンド+読み戻し)を実装し、今回生成したSPIR-V2本(VS/PS)を実際にVulkanへディスパッチして三角形を描画、フレームバッファから読み戻したピクセル色がパススルー元の色と一致することを実機(NVIDIA GT 730)で確認する——これが達成できれば「D3D11最小グラフィックスパイプライン」の完全なマイルストーンとなる。(2) DXIL側・DXBC Compute側の一般化継続は前回エントリの記載通り。

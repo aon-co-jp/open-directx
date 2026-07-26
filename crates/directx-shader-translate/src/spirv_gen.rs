@@ -981,6 +981,419 @@ fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
     module.assemble()
 }
 
+// ---------------------------------------------------------------------
+// ここから先(D3D11グラフィックスパイプライン: VS/PS向けSPIR-V生成)は今回
+// 新規に追加した部分。Compute Shader向けの上記コード(`decode_shader_shape`/
+// `decode_chain_shape`とその周辺)は一切変更していない。
+// ---------------------------------------------------------------------
+//
+// **スコープの正直な開示**: これは汎用SM5.0頂点/ピクセルシェーダーデコーダ
+// ではない。以下の2つの実シェーダー(いずれも`fxc.exe /T vs_5_0`・
+// `/T ps_5_0`で実際にコンパイルし、`examples/dump_shex.rs`で実SHEX命令列を
+// 確認した上でサポートを追加したもの)だけを対象にした翻訳器である:
+//
+// 1. `shaders/triangle_vs.hlsl` — `POSITION`(v0, xyz)・`COLOR`(v1, xyzw)を
+//    入力に取り、`SV_POSITION`(o0, xyzw、ただしwは`mov`で1.0固定)・
+//    `COLOR`(o1, xyzw)をパススルーで出力する頂点シェーダー。実SHEX命令列
+//    (`examples/dump_shex.rs`で実際にダンプして確認、番号は0始まり):
+//    `dcl_globalFlags` -> `dcl_input`(v0, mask=7=xyz) ->
+//    `dcl_input`(v1, mask=15=xyzw) -> `dcl_output_siv`(o0, mask=15, SV_POSITION) ->
+//    `dcl_output`(o1, mask=15) -> `mov o0.xyz, v0.xyzx` -> `mov o0.w, l(1.0)` ->
+//    `mov o1.xyzw, v1.xyzw` -> `ret`。
+// 2. `shaders/triangle_ps.hlsl` — `COLOR`(v1, `linear`補間, xyzw)を入力に
+//    取り、`SV_TARGET`(o0, xyzw)へパススルーで出力するピクセルシェーダー。
+//    実SHEX命令列: `dcl_globalFlags` -> `dcl_input_ps`(linear, v1, mask=15) ->
+//    `dcl_output`(o0, mask=15) -> `mov o0.xyzw, v1.xyzw` -> `ret`。
+//
+// 上記2パターン以外の命令列が1つでも混ざっている場合は
+// `SpirvGenError::UnsupportedShader`を返し、誤った"対応している"という
+// シグナルは出さない(既存のCompute Shader側と同じ方針)。この2シェーダーは
+// 命令列が完全に固定(パラメータ化できる可変要素が実質無い——UAVバインド
+// ポイントのような抽出対象すら存在しない、単純なパススルー)なので、
+// `decode_*_shape`は「この通りの命令列か」を検証するだけの関数であり、
+// 抽出した値を使ってSPIR-Vを組み立てるのではなく、検証が通った場合にのみ
+// 対応する固定のSPIR-Vモジュールを返す。
+//
+// 出力するSPIR-Vは、Compute Shader側(`emit_spirv_impl`)とは根本的に異なる
+// SPIR-V実行モデルを使う: `OpEntryPoint Vertex`/`OpEntryPoint Fragment`
+// (`GLCompute`ではない)、`Input`/`Output`ストレージクラスの変数
+// (storage bufferではない)、頂点シェーダーの`SV_POSITION`出力には
+// `BuiltIn Position`デコレーション、それ以外の入出力には`Location`
+// デコレーションを付与する。フラグメントシェーダーには
+// `OpExecutionMode ... OriginUpperLeft`が必須(Vulkanの規約)。
+//
+// **`opencuda-vulkan`との配線について(正直な開示)**: `opencuda-vulkan`の
+// `VulkanDevice`はCompute専用(`launch_kernel`のみ)で、グラフィックス
+// パイプライン(`VkGraphicsPipelineCreateInfo`・レンダーパス・ラスタライザ・
+// フレームバッファ)を一切持たない。本セクションはSPIR-V生成
+// (`rspirv`の構造検証+`spirv-val`による外部検証)までを対象とし、実際に
+// Vulkanへディスパッチして三角形を描画する処理は含まない(下記HANDOFF
+// エントリに詳細な理由を記載)。
+
+/// 頂点シェーダー(`triangle_vs.hlsl`)の入出力に対応するSPIR-V IDの集合。
+struct VsIds {
+    var_in_pos: u32,
+    var_in_color: u32,
+    var_out_position: u32,
+    var_out_color: u32,
+}
+
+/// 実SHEX命令列を、`triangle_vs.hlsl`が実際に生成する固定の命令列と厳密に
+/// 突き合わせる。1命令でも一致しなければ対応スコープ外として拒否する。
+fn decode_vertex_shader_shape(instructions: &[Instruction]) -> Result<(), SpirvGenError> {
+    let reject = |msg: &str| Err(SpirvGenError::UnsupportedShader(format!("VS: {msg}")));
+
+    let mut it = instructions.iter();
+    let mut next = |what: &str| -> Result<&Instruction, SpirvGenError> {
+        it.next()
+            .ok_or_else(|| SpirvGenError::UnsupportedShader(format!("VS: 命令列が短すぎる({what}が見つからない)")))
+    };
+
+    match &next("dcl_globalFlags")?.kind {
+        InstructionKind::DclGlobalFlags { .. } => {}
+        _ => return reject("先頭はdcl_globalFlagsのはず"),
+    }
+
+    // dcl_input v0 (POSITION, mask=xyz=7)
+    match &next("dcl_input v0")?.kind {
+        InstructionKind::DclInput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("VS: dcl_inputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Input || uav_index(&op0.indices) != Some(0) || op0.components != ComponentSelect::Mask(7) {
+                return reject("dcl_inputの1つ目はv0・mask=7(xyz)のはず");
+            }
+        }
+        _ => return reject("2番目はdcl_inputのはず"),
+    }
+
+    // dcl_input v1 (COLOR, mask=xyzw=15)
+    match &next("dcl_input v1")?.kind {
+        InstructionKind::DclInput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("VS: dcl_inputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Input || uav_index(&op0.indices) != Some(1) || op0.components != ComponentSelect::Mask(15) {
+                return reject("dcl_inputの2つ目はv1・mask=15(xyzw)のはず");
+            }
+        }
+        _ => return reject("3番目はdcl_inputのはず"),
+    }
+
+    // dcl_output_siv o0, SV_POSITION
+    let ins = next("dcl_output_siv o0")?;
+    match &ins.kind {
+        InstructionKind::DclOutput { system_value, operands } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("VS: dcl_output_sivにオペランドが無い".to_string()))?;
+            if ins.opcode != Opcode::DclOutputSiv
+                || *system_value != Some("position")
+                || op0.reg_type != RegisterType::Output
+                || uav_index(&op0.indices) != Some(0)
+            {
+                return reject("4番目はdcl_output_siv o0(SV_POSITION)のはず");
+            }
+        }
+        _ => return reject("4番目はdcl_outputのはず"),
+    }
+
+    // dcl_output o1 (COLOR)
+    match &next("dcl_output o1")?.kind {
+        InstructionKind::DclOutput { system_value, operands } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("VS: dcl_outputにオペランドが無い".to_string()))?;
+            if system_value.is_some() || op0.reg_type != RegisterType::Output || uav_index(&op0.indices) != Some(1) {
+                return reject("5番目はdcl_output o1(COLOR、SVでない)のはず");
+            }
+        }
+        _ => return reject("5番目はdcl_outputのはず"),
+    }
+
+    // mov o0.xyz, v0.xyzx
+    match &next("mov o0.xyz, v0")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) || dst.components != ComponentSelect::Mask(7) {
+                return reject("6番目のmovの書き込み先がo0.xyzではない");
+            }
+            if src.reg_type != RegisterType::Input || uav_index(&src.indices) != Some(0) {
+                return reject("6番目のmovの読み込み元がv0ではない");
+            }
+        }
+        _ => return reject("6番目はmovのはず"),
+    }
+
+    // mov o0.w, l(1.0)
+    match &next("mov o0.w, l(1.0)")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) || dst.components != ComponentSelect::Mask(8) {
+                return reject("7番目のmovの書き込み先がo0.wではない");
+            }
+            if src.reg_type != RegisterType::Immediate32 || src.immediate_values.first() != Some(&1065353216) {
+                return reject("7番目のmovの読み込み元が定数1.0fではない");
+            }
+        }
+        _ => return reject("7番目はmovのはず"),
+    }
+
+    // mov o1.xyzw, v1.xyzw
+    match &next("mov o1.xyzw, v1")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(1) || dst.components != ComponentSelect::Mask(15) {
+                return reject("8番目のmovの書き込み先がo1.xyzwではない");
+            }
+            if src.reg_type != RegisterType::Input || uav_index(&src.indices) != Some(1) {
+                return reject("8番目のmovの読み込み元がv1ではない");
+            }
+        }
+        _ => return reject("8番目はmovのはず"),
+    }
+
+    match &next("ret")?.kind {
+        InstructionKind::Generic { operands } if operands.is_empty() => {}
+        _ => return reject("9番目はretのはず"),
+    }
+
+    if it.next().is_some() {
+        return reject("想定より命令が多い(9命令ちょうどのはず)");
+    }
+
+    Ok(())
+}
+
+/// 実SHEX命令列を、`triangle_ps.hlsl`が実際に生成する固定の命令列と厳密に
+/// 突き合わせる。1命令でも一致しなければ対応スコープ外として拒否する。
+fn decode_pixel_shader_shape(instructions: &[Instruction]) -> Result<(), SpirvGenError> {
+    let reject = |msg: &str| Err(SpirvGenError::UnsupportedShader(format!("PS: {msg}")));
+
+    let mut it = instructions.iter();
+    let mut next = |what: &str| -> Result<&Instruction, SpirvGenError> {
+        it.next()
+            .ok_or_else(|| SpirvGenError::UnsupportedShader(format!("PS: 命令列が短すぎる({what}が見つからない)")))
+    };
+
+    match &next("dcl_globalFlags")?.kind {
+        InstructionKind::DclGlobalFlags { .. } => {}
+        _ => return reject("先頭はdcl_globalFlagsのはず"),
+    }
+
+    // dcl_input_ps (linear) v1, COLOR
+    let ins = next("dcl_input_ps v1")?;
+    match &ins.kind {
+        InstructionKind::DclInput { interpolation, operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("PS: dcl_input_psにオペランドが無い".to_string()))?;
+            if *interpolation != Some("linear")
+                || op0.reg_type != RegisterType::Input
+                || uav_index(&op0.indices) != Some(1)
+                || op0.components != ComponentSelect::Mask(15)
+            {
+                return reject("2番目はdcl_input_ps(linear) v1・mask=15のはず");
+            }
+        }
+        _ => return reject("2番目はdcl_inputのはず"),
+    }
+
+    // dcl_output o0, SV_TARGET (no explicit system_value in this decoder's output)
+    match &next("dcl_output o0")?.kind {
+        InstructionKind::DclOutput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("PS: dcl_outputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Output || uav_index(&op0.indices) != Some(0) || op0.components != ComponentSelect::Mask(15) {
+                return reject("3番目はdcl_output o0・mask=15のはず");
+            }
+        }
+        _ => return reject("3番目はdcl_outputのはず"),
+    }
+
+    // mov o0.xyzw, v1.xyzw
+    match &next("mov o0, v1")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) || dst.components != ComponentSelect::Mask(15) {
+                return reject("4番目のmovの書き込み先がo0.xyzwではない");
+            }
+            if src.reg_type != RegisterType::Input || uav_index(&src.indices) != Some(1) {
+                return reject("4番目のmovの読み込み元がv1ではない");
+            }
+        }
+        _ => return reject("4番目はmovのはず"),
+    }
+
+    match &next("ret")?.kind {
+        InstructionKind::Generic { operands } if operands.is_empty() => {}
+        _ => return reject("5番目はretのはず"),
+    }
+
+    if it.next().is_some() {
+        return reject("想定より命令が多い(5命令ちょうどのはず)");
+    }
+
+    Ok(())
+}
+
+/// VS/PS共通のSPIR-Vモジュール組み立て結果。`local_size`もUAVバインド
+/// ポイントも持たない(グラフィックスシェーダーにその概念が無いため、
+/// Compute向けの`TranslatedKernel`とはフィールドが異なる別の型として定義)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShaderStage {
+    Vertex,
+    Fragment,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphicsTranslatedKernel {
+    pub spirv_words: Vec<u32>,
+    pub entry_point: &'static str,
+    pub stage: ShaderStage,
+}
+
+/// DXBCバイト列(`triangle_vs.hlsl`相当のD3D11頂点シェーダー、SM5.0)を解析し、
+/// 実際のSHEX命令列を検証しながらSPIR-Vへ翻訳する。一致しなければ
+/// `SpirvGenError::UnsupportedShader`を返す。
+pub fn translate_vertex_shader(bytes: &[u8]) -> Result<GraphicsTranslatedKernel, SpirvGenError> {
+    let instructions = shex_instructions(bytes)?;
+    decode_vertex_shader_shape(&instructions)?;
+    Ok(GraphicsTranslatedKernel {
+        spirv_words: emit_vertex_spirv(),
+        entry_point: "main",
+        stage: ShaderStage::Vertex,
+    })
+}
+
+/// DXBCバイト列(`triangle_ps.hlsl`相当のD3D11ピクセルシェーダー、SM5.0)を
+/// 解析し、実際のSHEX命令列を検証しながらSPIR-Vへ翻訳する。一致しなければ
+/// `SpirvGenError::UnsupportedShader`を返す。
+pub fn translate_pixel_shader(bytes: &[u8]) -> Result<GraphicsTranslatedKernel, SpirvGenError> {
+    let instructions = shex_instructions(bytes)?;
+    decode_pixel_shader_shape(&instructions)?;
+    Ok(GraphicsTranslatedKernel {
+        spirv_words: emit_pixel_spirv(),
+        entry_point: "main",
+        stage: ShaderStage::Fragment,
+    })
+}
+
+/// 共通のDXBC->SHEX命令列取り出し処理(`translate_shader`/`translate_chain_shader`
+/// と同じロジックだが、VS/PSはこれら2つとは別のエントリポイント関数から
+/// 呼ばれるため、小さな共有ヘルパーとして切り出した)。
+fn shex_instructions(bytes: &[u8]) -> Result<Vec<Instruction>, SpirvGenError> {
+    let containers = scan_dxbc(bytes);
+    let container = containers.into_iter().next().ok_or_else(|| {
+        SpirvGenError::Translate(TranslateError::Parse("DXBCコンテナが見つからない".to_string()))
+    })?;
+    let mut instructions: Option<Vec<Instruction>> = None;
+    for chunk in &container.chunks {
+        if let ChunkData::Shader(program) = chunk.parse() {
+            instructions = Some(program.instructions);
+        }
+    }
+    instructions.ok_or(SpirvGenError::Translate(TranslateError::MissingChunk("SHEX")))
+}
+
+/// `triangle_vs.hlsl`が検証を通った場合にのみ返す、固定のSPIR-Vモジュール。
+/// `OpEntryPoint Vertex`、入力2本(`Location 0`=POSITION vec3, `Location 1`=
+/// COLOR vec4)、出力2本(`BuiltIn Position` vec4, `Location 0`=COLOR vec4)。
+fn emit_vertex_spirv() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let vec3_ty = b.type_vector(float_ty, 3);
+    let vec4_ty = b.type_vector(float_ty, 4);
+
+    let ids = {
+        let in_pos_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec3_ty);
+        let var_in_pos = b.variable(in_pos_ptr_ty, None, spirv::StorageClass::Input, None);
+        b.decorate(var_in_pos, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+        let in_color_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec4_ty);
+        let var_in_color = b.variable(in_color_ptr_ty, None, spirv::StorageClass::Input, None);
+        b.decorate(var_in_color, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(1)]);
+
+        let out_position_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec4_ty);
+        let var_out_position = b.variable(out_position_ptr_ty, None, spirv::StorageClass::Output, None);
+        b.decorate(var_out_position, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::Position)]);
+
+        let out_color_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec4_ty);
+        let var_out_color = b.variable(out_color_ptr_ty, None, spirv::StorageClass::Output, None);
+        b.decorate(var_out_color, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+        VsIds { var_in_pos, var_in_color, var_out_position, var_out_color }
+    };
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    // o0.xyz = v0.xyz (POSITION passthrough)
+    let pos_in = b.load(vec3_ty, None, ids.var_in_pos, None, vec![]).expect("OpLoad pos");
+    let px = b.composite_extract(float_ty, None, pos_in, vec![0]).expect("extract x");
+    let py = b.composite_extract(float_ty, None, pos_in, vec![1]).expect("extract y");
+    let pz = b.composite_extract(float_ty, None, pos_in, vec![2]).expect("extract z");
+    let one = b.constant_bit32(float_ty, 1.0f32.to_bits());
+    // o0.w = 1.0 (mov o0.w, l(1.0))
+    let pos_out = b.composite_construct(vec4_ty, None, vec![px, py, pz, one]).expect("construct SV_POSITION");
+    b.store(ids.var_out_position, pos_out, None, vec![]).expect("OpStore SV_POSITION");
+
+    // o1 = v1 (COLOR passthrough)
+    let color_in = b.load(vec4_ty, None, ids.var_in_color, None, vec![]).expect("OpLoad color");
+    b.store(ids.var_out_color, color_in, None, vec![]).expect("OpStore COLOR");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(
+        spirv::ExecutionModel::Vertex,
+        main_fn,
+        "main",
+        vec![ids.var_in_pos, ids.var_in_color, ids.var_out_position, ids.var_out_color],
+    );
+
+    let module = b.module();
+    module.assemble()
+}
+
+/// `triangle_ps.hlsl`が検証を通った場合にのみ返す、固定のSPIR-Vモジュール。
+/// `OpEntryPoint Fragment`、入力1本(`Location 0`=COLOR vec4)、出力1本
+/// (`Location 0`=SV_TARGET vec4)。`OpExecutionMode ... OriginUpperLeft`は
+/// Vulkanのフラグメントシェーダーで必須のため付与する。
+fn emit_pixel_spirv() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let vec4_ty = b.type_vector(float_ty, 4);
+
+    let in_color_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec4_ty);
+    let var_in_color = b.variable(in_color_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_in_color, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    let out_color_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec4_ty);
+    let var_out_color = b.variable(out_color_ptr_ty, None, spirv::StorageClass::Output, None);
+    b.decorate(var_out_color, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let color = b.load(vec4_ty, None, var_in_color, None, vec![]).expect("OpLoad color");
+    b.store(var_out_color, color, None, vec![]).expect("OpStore SV_TARGET");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::Fragment, main_fn, "main", vec![var_in_color, var_out_color]);
+    b.execution_mode(main_fn, spirv::ExecutionMode::OriginUpperLeft, []);
+
+    let module = b.module();
+    module.assemble()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,5 +1543,78 @@ mod tests {
             .expect("a single add is a valid (trivial, N=1) instance of the chain pattern class too");
         assert_eq!(kernel.read_uav_bind_points, vec![0, 1]);
         assert_eq!(kernel.write_uav_bind_point, 2);
+    }
+
+    /// `shaders/triangle_vs.dxbc`/`shaders/triangle_ps.dxbc`(実fxc.exe出力、
+    /// `vs_5_0`/`ps_5_0`)。D3D11グラフィックスパイプライン向けSPIR-V生成の
+    /// 実データ。
+    const TRIANGLE_VS_DXBC: &[u8] = include_bytes!("../shaders/triangle_vs.dxbc");
+    const TRIANGLE_PS_DXBC: &[u8] = include_bytes!("../shaders/triangle_ps.dxbc");
+
+    fn assert_valid_spirv(words: &[u32]) -> rspirv::dr::Module {
+        assert_eq!(words[0], 0x0723_0203, "SPIR-Vマジックナンバーが先頭に無い");
+        let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_bytes(&bytes, &mut loader)
+            .expect("emitted SPIR-V must be well-formed and re-parseable by rspirv's own loader");
+        loader.module()
+    }
+
+    #[test]
+    fn translates_real_fxc_compiled_triangle_vs_dxbc_to_valid_vertex_spirv() {
+        let kernel = translate_vertex_shader(TRIANGLE_VS_DXBC)
+            .expect("real fxc-compiled triangle_vs.dxbc (dcl_input x2/dcl_output_siv/dcl_output/mov x3/ret) must translate");
+        assert_eq!(kernel.entry_point, "main");
+        assert_eq!(kernel.stage, ShaderStage::Vertex);
+        let module = assert_valid_spirv(&kernel.spirv_words);
+        assert!(
+            module.entry_points.iter().any(|ep| ep.operands.iter().any(
+                |op| matches!(op, rspirv::dr::Operand::ExecutionModel(rspirv::spirv::ExecutionModel::Vertex))
+            )),
+            "re-parsed module must declare OpEntryPoint Vertex"
+        );
+    }
+
+    #[test]
+    fn translates_real_fxc_compiled_triangle_ps_dxbc_to_valid_fragment_spirv() {
+        let kernel = translate_pixel_shader(TRIANGLE_PS_DXBC)
+            .expect("real fxc-compiled triangle_ps.dxbc (dcl_input_ps/dcl_output/mov/ret) must translate");
+        assert_eq!(kernel.entry_point, "main");
+        assert_eq!(kernel.stage, ShaderStage::Fragment);
+        let module = assert_valid_spirv(&kernel.spirv_words);
+        assert!(
+            module.entry_points.iter().any(|ep| ep.operands.iter().any(
+                |op| matches!(op, rspirv::dr::Operand::ExecutionModel(rspirv::spirv::ExecutionModel::Fragment))
+            )),
+            "re-parsed module must declare OpEntryPoint Fragment"
+        );
+    }
+
+    #[test]
+    fn vertex_translator_honestly_rejects_the_pixel_shader_and_vice_versa() {
+        // VS用の検証ロジックにPSのDXBCを渡す(逆も同様)と、命令列の形状が
+        // 一致しないため正しく拒否されることを確認する(「対応している」
+        // という誤ったシグナルを出さないことの継続的な保証)。
+        assert!(translate_vertex_shader(TRIANGLE_PS_DXBC).is_err());
+        assert!(translate_pixel_shader(TRIANGLE_VS_DXBC).is_err());
+    }
+
+    #[test]
+    fn graphics_translators_honestly_reject_garbage_bytes() {
+        let garbage = [0u8; 16];
+        assert!(translate_vertex_shader(&garbage).is_err());
+        assert!(translate_pixel_shader(&garbage).is_err());
+    }
+
+    /// 既存のCompute Shader専用デコーダ(`translate_shader`/`translate_chain_shader`)
+    /// にVS/PSのDXBCを渡すと、引き続き`SpirvGenError::UnsupportedShader`で
+    /// 正しく拒否されることの回帰確認(今回の追加が既存の「誤ったシグナルを
+    /// 出さない」保証を壊していないことの確認)。
+    #[test]
+    fn compute_translators_still_honestly_reject_graphics_shaders() {
+        assert!(translate_shader(TRIANGLE_VS_DXBC).is_err());
+        assert!(translate_chain_shader(TRIANGLE_VS_DXBC).is_err());
+        assert!(translate_shader(TRIANGLE_PS_DXBC).is_err());
+        assert!(translate_chain_shader(TRIANGLE_PS_DXBC).is_err());
     }
 }
