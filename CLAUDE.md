@@ -609,3 +609,38 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     検討(現状はグラフィックスパイプラインのみ)、(2) PNG変換を
     ワンステップで行いたい場合の軽量画像クレート導入の要否検討(今回は
     依存を増やさない方針を優先しPPM止まりとした)。
+
+- **2026-07-27(続き5) README.mdにプラットフォーム/ベンダー対応表を追加(ユーザー指示「WindowsのDirectXをLinuxやMACやAndoridやiPohneなどへの互換性とnVidiaとAMDとINTELの互換性を高めて」への対応)**:
+  1. **調査結果(コード変更なし、監査結果)**: このリポジトリのコードには
+     `cfg(windows)`等のプラットフォーム限定gateが一切存在せず(DXBCパーサー・
+     SPIR-Vコード生成・`directx-graphics-vulkan`はいずれもプラットフォーム
+     非依存のRust+ash実装)、Windows専用コードで塞がれている箇所は無いと
+     確認した。GPUベンダーID(NVIDIA `0x10DE`・AMD `0x1002`/`0x1022`・
+     Intel `0x8086`)も本リポジトリ・`opencuda-vulkan`・`opencuda-directx`の
+     3箇所で完全に一致しており、不整合・誤りは無い。
+  2. **README.mdに「Platform & vendor support matrix」節を新規追加**:
+     Windows(実機NVIDIA GT 730で検証済み)・Linux(コード上はブロック
+     要因なしだが実機未検証)・Android(open-cudaの`aarch64-linux-android`
+     クロスコンパイル成功済みだが実機未検証)・macOS/iOS(MoltenVK経由、
+     いずれも未着手——iOSはVulkanネイティブ非対応でMoltenVK経由である
+     ことを明記、過大な主張をしない)を一覧化。ベンダー側もNVIDIA
+     (検証済み)・AMD/Intel(コードは正しいが実機未検証)を明記。
+  3. **正直な開示・今回はコード変更をしていない理由**: (1) このマシンには
+     AMD/Intel GPU・Linux/Mac環境・実Android/iOS端末が無く、実機検証を
+     伴わない「対応済み」表記は誇張になるため、ドキュメントでの現状整理に
+     留めた。(2) ベンダーID自体は既に正しいため、修正すべきバグは無かった。
+  - 次にすべきこと: (1) 実際にLinux環境でのビルド確認、(2) 実AMD/Intel
+    GPU入手時の実機vendor_name_from_id検証、(3) 実Android端末での
+    `vkCreateInstance`実行確認、(4) macOS実機でのMoltenVK経由ビルド確認。
+  - **PlayStation/Dolby Visionについて(正直な開示、ユーザーへの再確認が必要)**:
+    ユーザーから追加で「SONYのプレイステーション5/5PRO/6の4K120FPSや
+    Dolby Vision 2 Ultraなどのハードウェアアクセラレータ」への対応も
+    要望されたが、本CLAUDE.mdの2026-07-25付「PlayStation 4/5/6/7対応に
+    ついて」節が既に、PlayStation SDKの非公開・NDA性質による法務リスク
+    (非公式リバースエンジニアリングがDMCA等に抵触しうる)を理由に
+    「将来的な野心としてロードマップに明記するに留め、現時点では設計・
+    実装の対象に含めない」と明確に判断済み。Dolby Visionも同様に
+    ライセンス・特許で保護された認証技術であり、無許諾での実装は
+    同種の法的リスクを伴う。この既存の判断を変更する場合は、法的リスク
+    評価を別途行った上でユーザーに再確認してから着手する方針を維持する
+    (このパスでは実装に着手していない)。

@@ -19,6 +19,39 @@ See [`CLAUDE.md`](CLAUDE.md) for the full design rationale, honest
 scope/roadmap, and session HANDOFF log — this README only summarizes
 current, verified state.
 
+### Platform & vendor support matrix (added 2026-07-27, honest disclosure)
+
+DirectX itself is a Windows/Xbox-only API — "cross-platform" here means
+DXBC/DXIL bytecode is translated to SPIR-V and dispatched via Vulkan,
+which is what actually reaches non-Windows platforms. No `cfg(windows)`
+or other platform-gating exists in this repo's own code today (the DXBC
+parser, SPIR-V codegen, and `directx-graphics-vulkan` are all plain,
+platform-neutral Rust + `ash`), so build/test portability follows
+Vulkan's own reach:
+
+| Platform | Path | Status |
+|---|---|---|
+| Windows | native Vulkan | **Verified on real hardware** (this repo's dev machine, NVIDIA GeForce GT 730) |
+| Linux | native Vulkan | Should build/run unmodified (no Windows-specific code exists to block it) — **not yet tested on a real Linux machine in this environment** |
+| Android | native Vulkan | `open-cuda` has verified `aarch64-linux-android` cross-compilation succeeds (per its CLAUDE.md); real-device execution (`vkCreateInstance` on an actual phone) is still pending |
+| macOS | Vulkan via [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (translates to Metal) | Not yet attempted — MoltenVK is a translation layer, not native Vulkan, so this is a weaker guarantee than Linux/Android |
+| iOS | Vulkan via MoltenVK (translates to Metal) | Not yet attempted. **Same MoltenVK caveat as macOS applies** — Vulkan does not run natively on iOS, only through this translation layer, so parity with the Windows/Vulkan-native path is not guaranteed until actually tried on a device |
+
+GPU vendor coverage (PCI vendor ID matching, consistent across this repo
+and `open-cuda`: NVIDIA `0x10DE`, AMD `0x1002`/`0x1022`, Intel `0x8086`):
+
+| Vendor | Status |
+|---|---|
+| NVIDIA | **Verified on real hardware** (GeForce GT 730) |
+| AMD | Vendor-ID matching code exists and type-checks, but has **never run against real AMD hardware** in this environment — treat as unverified |
+| Intel | Same as AMD: code exists, **never verified on real Intel GPU hardware** |
+
+No fix is needed to make these three vendor IDs *detectable* — the code
+is already correct and identical across `open-directx`/`opencuda-vulkan`/
+`opencuda-directx`. What's missing is real AMD/Intel hardware to actually
+exercise that code path, which this development environment does not
+have.
+
 ## Current state (2026-07-27, latest: gradient interpolation, GPU vendor diagnostics, chain sub/div)
 
 Three increments landed on top of the D3D11 minimal graphics pipeline and
