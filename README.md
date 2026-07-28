@@ -212,6 +212,25 @@ cargo build --workspace
 cargo test --workspace -- --nocapture
 ```
 
+### See it actually draw something (added 2026-07-27)
+
+This repo is a set of libraries with no `fn main` of its own, so the fastest
+way to *see* the graphics pipeline work on your own GPU — rather than reading
+test source — is:
+
+```bash
+cargo run -p directx-graphics-vulkan --example render_triangle
+```
+
+This reuses the same real fxc.exe-compiled DXBC → SPIR-V translated shaders
+as `tests/triangle_real_vulkan.rs`, draws a gradient (red/green/blue)
+triangle on real Vulkan hardware, reads the framebuffer back, and writes it
+to `render_triangle.ppm` (plain PPM, no extra image-crate dependency needed —
+convert it with e.g. `magick render_triangle.ppm render_triangle.png` or open
+it directly in most image viewers). If no usable Vulkan device/driver is
+present, it prints an honest error and exits non-zero rather than faking
+success.
+
 Actually observed output (2026-07-25, this machine, NVIDIA GeForce GT 730):
 
 ```

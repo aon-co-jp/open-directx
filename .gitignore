@@ -1,2 +1,4 @@
 /target
 Cargo.lock
+render_triangle.ppm
+render_triangle.png
