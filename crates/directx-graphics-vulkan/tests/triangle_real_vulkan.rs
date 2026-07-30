@@ -9,7 +9,10 @@
 //! Per repo policy this is a real-hardware test, not a mock: if no Vulkan
 //! device/driver is present it prints and skips rather than faking success.
 
-use directx_graphics_vulkan::{enumerate_graphics_devices, render_gradient_triangle_and_read_back, render_uniform_triangle_and_read_back};
+use directx_graphics_vulkan::{
+    enumerate_graphics_devices, render_gradient_triangle_and_read_back, render_indexed_scene_with_depth_and_read_back,
+    render_uniform_triangle_and_read_back, Vertex,
+};
 use directx_shader_translate::spirv_gen::{translate_pixel_shader, translate_vertex_shader};
 
 // Same real fxc.exe-compiled DXBC bytes already used and verified in
@@ -182,4 +185,66 @@ fn enumerate_graphics_devices_reports_the_real_gpu_on_this_machine() {
         assert!(!d.name.is_empty(), "device name should not be empty");
     }
     println!("OK: enumerate_graphics_devices reported {} graphics-capable device(s): {:?}", devices.len(), devices);
+}
+
+/// The "depth buffer + multiple triangles + index buffer" milestone every
+/// previous HANDOFF entry in this crate listed as the next open item. Draws
+/// two full-viewport, mutually overlapping triangles at different depths --
+/// a *near* red one (z=0.1, drawn first) and a *far* blue one (z=0.9, drawn
+/// second) -- through `render_indexed_scene_with_depth_and_read_back`.
+///
+/// The draw order is deliberately "near first, far second" specifically
+/// because that is the one ordering that only produces the correct result
+/// (staying red) *if* depth testing is genuinely rejecting the far
+/// triangle's fragments. A pipeline with depth testing silently disabled, or
+/// wired up backwards, would let the far (later-drawn) blue triangle
+/// overwrite everything -- the classic "painter's algorithm" bug depth
+/// buffers exist to prevent. This is a stronger real-hardware assertion than
+/// simply checking that *a* color renders: it specifically exercises the
+/// depth comparison logic, not just attachment plumbing.
+#[test]
+fn indexed_scene_with_depth_buffer_keeps_the_nearer_triangle_on_real_vulkan_hardware() {
+    let vs = translate_vertex_shader(TRIANGLE_VS_DXBC).expect("triangle_vs.dxbc must translate");
+    let ps = translate_pixel_shader(TRIANGLE_PS_DXBC).expect("triangle_ps.dxbc must translate");
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+    let vertices = [
+        // Near triangle (z=0.1), full-viewport, drawn first.
+        Vertex { pos: [-1.0, -1.0, 0.1], color: RED },
+        Vertex { pos: [3.0, -1.0, 0.1], color: RED },
+        Vertex { pos: [-1.0, 3.0, 0.1], color: RED },
+        // Far triangle (z=0.9), same full-viewport coverage, drawn second.
+        Vertex { pos: [-1.0, -1.0, 0.9], color: BLUE },
+        Vertex { pos: [3.0, -1.0, 0.9], color: BLUE },
+        Vertex { pos: [-1.0, 3.0, 0.9], color: BLUE },
+    ];
+    let indices: [u32; 6] = [0, 1, 2, 3, 4, 5];
+
+    let pixels = match render_indexed_scene_with_depth_and_read_back(&vs.spirv_words, &ps.spirv_words, &vertices, &indices, 8, 8) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("skipping indexed depth test: no usable real Vulkan graphics device/driver ({e})");
+            return;
+        }
+    };
+
+    assert_eq!(pixels.len(), 8 * 8);
+    let mut red_count = 0;
+    let mut blue_count = 0;
+    for p in &pixels {
+        // Quantized round-trip tolerance, same reasoning as the other
+        // real-hardware color assertions in this file.
+        if p.r > 200 && p.b < 50 {
+            red_count += 1;
+        } else if p.b > 200 && p.r < 50 {
+            blue_count += 1;
+        }
+    }
+    println!("OK: depth-tested indexed scene on real hardware: {red_count} near(red) pixels, {blue_count} far(blue) pixels out of {}", pixels.len());
+    assert_eq!(
+        blue_count, 0,
+        "the farther (z=0.9) triangle must never win the depth test against the nearer (z=0.1) one, regardless of draw order -- found {blue_count} blue pixels"
+    );
+    assert!(red_count > 0, "expected the nearer triangle's red color to actually appear in the read-back framebuffer");
 }
