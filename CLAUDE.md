@@ -708,3 +708,71 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     (2) テクスチャサンプリング・スワップチェーンへの拡張、
     (3) このマシンにGPUが1台しか無いため未検証のAMD/Intel実機・
     Linux/macOS実機での動作確認(前回エントリから継続)。
+
+- **2026-08-04 ピクセル位置↔NDC座標の厳密な変換式を実機で検証するテストを
+  追加——複数エントリにわたって「次にすべきこと」に残っていた項目を解消
+  (ユーザー指示「open-directxの完成度と実用性の全体の向上を進めて」、
+  open-cuda/aruaru-llm連携強化作業の前提としての単体作業)。作業開始前に
+  まず本セクション末尾を確認し、事前に判明していた4項目
+  (DXBC Computeチェーンのsub/div対応、DXIL側の追従、ピクセル↔NDC変換式検証、
+  D3D11グラフィックスの深度/複数三角形/インデックス/テクスチャ/スワップ
+  チェーン)のうち、実装状況を1件ずつコード側で再確認した:**
+  1. **事前確認で判明した「正直な訂正」**: 提示された未着手リストのうち
+     (1)(DXBC Computeチェーンのsub/div対応)と(4)の一部(深度バッファ・
+     複数三角形・インデックスバッファ)は、`crates/directx-shader-translate/
+     src/spirv_gen.rs`の`decode_chain_shape`と
+     `crates/directx-graphics-vulkan/src/lib.rs`の
+     `render_indexed_scene_with_depth_and_read_back`を実際に読んだところ、
+     既にそれぞれ2026-07-27・2026-07-30付のエントリで実装・実機検証済み
+     だった(このCLAUDE.mdの本セクションを最後まで読めば分かる内容で、
+     タスク側の「未着手リスト」の把握が古かった)。誇張を避けるため、
+     今回はこの事実確認の上で、実際に手つかずだった(3)
+     (ピクセル位置↔NDC座標の厳密な変換式の検証)に着手した。
+  2. **`crates/directx-graphics-vulkan/tests/triangle_real_vulkan.rs`に
+     新規実機テスト
+     `d3d11_triangle_pixel_position_maps_to_the_expected_ndc_coordinate_on_real_vulkan_hardware`
+     を追加**: `render_gradient_triangle_and_read_back`が使う「大三角形」
+     (NDC頂点`(-1,-1)`/`(3,-1)`/`(-1,3)`)と、`src/lib.rs`内の実際の
+     `vk::Viewport`構築(`x:0,y:0,width,height,min_depth:0,max_depth:1`、
+     Yフリップ無し)をソースから直接確認した上で、ピクセル中心
+     `(col+0.5, row+0.5)`→NDCの変換式`ndc_x=(col+0.5)/width*2-1`,
+     `ndc_y=(row+0.5)/height*2-1`と、この三角形固有の重心座標の閉形式
+     `l1=(ndc_x+1)/4`, `l2=(ndc_y+1)/4`, `l0=1-l1-l2`を導出。対称性で
+     偶然一致しうる中心・対角ピクセルを避け、あえて非対称な
+     `(col=2, row=5)`(8x8フレームバッファ)を選び、この閉形式から求めた
+     期待色(R8G8B8A8_UNORMの`round(x*255)`量子化込み)と実際の読み戻し
+     ピクセルを比較する、変換式そのものを直接検証するテストとした
+     (既存の不変量ベースのテストとは独立に追加、既存テストは無変更)。
+  3. **実際に`cargo test -p directx-graphics-vulkan --test
+     triangle_real_vulkan -- --nocapture`で確認した結果(誇張なし、
+     実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     OK: pixel (col=2, row=5) on an 8x8 framebuffer maps to NDC (-0.3750,0.3750) as derived, and the real read-back color Rgba8 { r: 127, g: 40, b: 88, a: 255 } matches the closed-form expected color (128,40,88) within tolerance 2 on the real GPU present on this machine.
+     test d3d11_triangle_pixel_position_maps_to_the_expected_ndc_coordinate_on_real_vulkan_hardware ... ok
+     ```
+     計算誤差はr成分で1(UNORM丸めの範囲内、許容差2に収まる)のみで、
+     導出した変換式が実際のVulkanパイプラインの挙動と一致することを
+     実機で確認した。
+  4. **ワークスペース全体の検証**: `cargo test --workspace`で全テスト
+     (unittests+実機テスト、グラフィックス5本(新規1本含む)+DXBC Compute
+     系+DXBCチェーン(add/mul/sub/div)+DXIL Compute系、全て)green、
+     既存テストへの回帰なし。
+  5. **正直な開示・今回やらなかったこと**: (1) DXIL側
+     (`resolve_vector_add_dxil_calls`/`translate_dxil_vector_add_to_spirv`)
+     がDXBC側のチェーンクラス一般化に追従できていない件は今回時間の
+     都合で手を付けていない(`dxil.rs`に`translate_dxil_binary_op_to_spirv`
+     という既存の一般化関数はあるが、DXBC側の`decode_chain_shape`相当の
+     チェーン検出ロジックがDXIL側に存在するかは未確認のまま)。
+     (2) テクスチャサンプリング・スワップチェーン・実ウィンドウ表示は
+     引き続き未着手。(3) AMD/Intel実機・Linux/macOS実機での検証は
+     このマシンにNVIDIA GT 730 1台しか無いため今回も未実施。
+     (4) README/CLAUDE.mdのfeature flag説明の整理、公開APIのexample
+     不足確認は時間の都合で今回は着手していない(`directx-graphics-vulkan`
+     には既に`examples/render_triangle.rs`があるが、他クレートの
+     example充足状況は未調査)。
+  - 次にすべきこと: (1) DXIL側のチェーンクラス一般化への追従
+    (`dxil.rs`の`translate_dxil_binary_op_to_spirv`が既存の一般化
+    ロジックとどこまで重複/乖離しているかの調査から)、(2) テクスチャ
+    サンプリング・スワップチェーンへの拡張、(3) AMD/Intel・Linux/macOS
+    実機検証(前回・前々回エントリから継続)、(4) 各クレートの公開API
+    example充足状況の棚卸し。

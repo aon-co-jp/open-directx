@@ -164,6 +164,95 @@ fn d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulk
     );
 }
 
+/// 2026-08-04 addition: explicit pixel-position <-> NDC-coordinate mapping
+/// check, closing the gap every previous HANDOFF entry in this crate left
+/// open ("today we only check rasterizer invariants that don't depend on the
+/// exact pixel<->NDC transform, not the transform itself").
+///
+/// Derivation (checked against this crate's actual pipeline setup, not
+/// assumed): the "big triangle" vertices used by
+/// `render_gradient_triangle_and_read_back` are NDC `v0=(-1,-1)`,
+/// `v1=(3,-1)`, `v2=(-1,3)` (see `render_triangle_and_read_back` in
+/// `src/lib.rs`), and the viewport is the Vulkan-default
+/// `x:0,y:0,width,height,min_depth:0,max_depth:1` with no `y`-flip (see the
+/// `vk::Viewport` construction in `src/lib.rs`). With that viewport, NDC
+/// `(-1,-1)` maps to the top-left framebuffer corner and NDC `(1,1)` to the
+/// bottom-right, i.e. for a pixel center at column `x`, row `y` (0-indexed,
+/// row 0 = top, matching this crate's row-major host readback order):
+///   ndc_x = (x + 0.5) / width  * 2 - 1
+///   ndc_y = (y + 0.5) / height * 2 - 1
+/// Solving `P = l0*v0 + l1*v1 + l2*v2`, `l0+l1+l2=1` for this specific
+/// triangle gives the closed form `l1 = (ndc_x+1)/4`, `l2 = (ndc_y+1)/4`,
+/// `l0 = 1-l1-l2`, independent of the interpolated attribute itself. This
+/// test computes that closed-form expected color for one specific,
+/// non-center, non-edge pixel (so the check cannot be satisfied by a
+/// trivially-symmetric bug) and compares it against the real read-back
+/// pixel from the real GPU, rather than only checking transform-independent
+/// invariants like the previous test does.
+#[test]
+fn d3d11_triangle_pixel_position_maps_to_the_expected_ndc_coordinate_on_real_vulkan_hardware() {
+    let vs = translate_vertex_shader(TRIANGLE_VS_DXBC).expect("triangle_vs.dxbc must translate");
+    let ps = translate_pixel_shader(TRIANGLE_PS_DXBC).expect("triangle_ps.dxbc must translate");
+
+    let vertex_colors = [
+        [1.0, 0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0],
+    ];
+
+    let width = 8u32;
+    let height = 8u32;
+
+    let pixels = match render_gradient_triangle_and_read_back(
+        &vs.spirv_words,
+        &ps.spirv_words,
+        vertex_colors,
+        width,
+        height,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!(
+                "skipping real-hardware pixel<->NDC mapping test: no usable real Vulkan graphics device/driver ({e})"
+            );
+            return;
+        }
+    };
+    assert_eq!(pixels.len(), (width * height) as usize);
+
+    // Deliberately off-center, off-diagonal pixel: col=2, row=5 out of 8x8.
+    let col = 2u32;
+    let row = 5u32;
+    let ndc_x = (col as f64 + 0.5) / width as f64 * 2.0 - 1.0;
+    let ndc_y = (row as f64 + 0.5) / height as f64 * 2.0 - 1.0;
+    let l1 = (ndc_x + 1.0) / 4.0;
+    let l2 = (ndc_y + 1.0) / 4.0;
+    let l0 = 1.0 - l1 - l2;
+    // color = l0*red + l1*green + l2*blue, quantized to R8G8B8A8_UNORM via
+    // round(x*255), same CPU-reference convention as the other tests in
+    // this file.
+    let expected_r = (l0 * 255.0).round() as i32;
+    let expected_g = (l1 * 255.0).round() as i32;
+    let expected_b = (l2 * 255.0).round() as i32;
+
+    let idx = (row * width + col) as usize;
+    let actual = pixels[idx];
+    let tolerance = 2i32; // UNORM rounding / interpolation rounding slack, same as other tests in this file.
+    assert!(
+        (actual.r as i32 - expected_r).abs() <= tolerance
+            && (actual.g as i32 - expected_g).abs() <= tolerance
+            && (actual.b as i32 - expected_b).abs() <= tolerance,
+        "pixel (col={col}, row={row}) = {actual:?}, expected ~({expected_r},{expected_g},{expected_b}) \
+         from the derived pixel<->NDC transform (ndc=({ndc_x:.4},{ndc_y:.4}), barycentric=({l0:.4},{l1:.4},{l2:.4})) \
+         -- the pixel<->NDC mapping does not match the derivation"
+    );
+    println!(
+        "OK: pixel (col={col}, row={row}) on an {width}x{height} framebuffer maps to NDC ({ndc_x:.4},{ndc_y:.4}) \
+         as derived, and the real read-back color {actual:?} matches the closed-form expected color \
+         ({expected_r},{expected_g},{expected_b}) within tolerance {tolerance} on the real GPU present on this machine."
+    );
+}
+
 /// 2026-07-27 addition: `enumerate_graphics_devices` should report the real
 /// GPU on this machine (an NVIDIA GeForce GT 730) with the correct
 /// best-effort vendor name, closing the diagnostic parity gap noted in
