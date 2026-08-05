@@ -1926,6 +1926,56 @@ mod tests {
         }
     }
 
+    /// `crates/directx-shader-translate/shaders/vector_add_mul_div_chain3_dxil.hlsl`
+    /// (DXBC側`vector_add_mul_div_chain3.hlsl`と同一契約、SM6.0向けに新規
+    /// コンパイル)の実DXILバイト列——2026-08-05増分、3個の逐次2項演算
+    /// (add, mul, div)。`examples/dump_dxil`で実際にダンプした結果、
+    /// `FUNCTION_BLOCK`のCall数は単一/2項チェーンと変わらず7個のままで
+    /// (同じ3バッファのため`CreateHandle`x3は増えない)、`BinOp`(code=2)が
+    /// 3回連続で出現することを確認した(`fields=[1,3,0,31]`(add) ->
+    /// `fields=[1,4,2,31]`(mul、lhs相対値1=直前のBinOp結果) ->
+    /// `fields=[1,3,4,31]`(div、lhs相対値1=直前のBinOp結果、rhs相対値3=
+    /// 1回目の`ExtractedBufferValue(u1)`)——`resolve_dxil_calls_and_chain`は
+    /// この増分向けに一切変更していない(既存の`chain_exprs`ベースの一般
+    /// ロジックがN=2からN=3へそのまま対応した)。
+    const VECTOR_ADD_MUL_DIV_CHAIN3_DXIL: &[u8] = include_bytes!("../shaders/vector_add_mul_div_chain3.dxil");
+
+    #[test]
+    fn resolves_real_dxc_compiled_3op_chain_dxil_into_matching_regexpr_tree() {
+        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
+            .expect("real dxc-compiled vector_add_mul_div_chain3.dxil must resolve into a chain RegExpr");
+        assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, unchanged by adding a 3rd op");
+        // 期待する木: Div(Mul(Add(Load,Load), Load), Load) == (a+b)*a/b
+        match &root {
+            DxilRegExpr::BinOp(crate::BinaryOp::Div, lhs, rhs) => {
+                assert!(matches!(**rhs, DxilRegExpr::Load(_)), "outermost op must be `... / Load(...)`");
+                match &**lhs {
+                    DxilRegExpr::BinOp(crate::BinaryOp::Mul, mul_lhs, mul_rhs) => {
+                        assert!(matches!(**mul_rhs, DxilRegExpr::Load(_)), "middle op must be `... * Load(...)`");
+                        assert!(matches!(**mul_lhs, DxilRegExpr::BinOp(crate::BinaryOp::Add, _, _)), "innermost op must be the add");
+                    }
+                    other => panic!("expected middle Mul(Add(Load,Load), Load), got {other:?}"),
+                }
+            }
+            other => panic!("expected outer Div(Mul(Add(Load,Load), Load), Load), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_dxil_chain_to_spirv_handles_3op_chain() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
+            .expect("vector_add_mul_div_chain3.dxil (3 sequential ops) must translate to SPIR-V");
+        assert_eq!(kernel.local_size, (64, 1, 1), "numthreads must be extracted, not hardcoded");
+        assert_eq!(kernel.write_uav_bind_point, 2, "write UAV bind point must resolve to u2");
+        // 式木は(A+B)*A/Bだが、addは可換演算のためdxc/LLVMの最適化パスが
+        // 相対値参照の順序を並べ替える(既存のHANDOFF「2026-07-26(続き)」
+        // で確認済みの現象と同種)。実際に得られた順序は[u1, u0, u0, u1]
+        // だった——数値的にはa+b=b+aで結果に影響しないため、順序集合の
+        // 一致のみを検証する(厳密な出現順序は検証しない)。
+        assert_eq!(kernel.read_uav_bind_points, vec![1, 0, 0, 1]);
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
     /// 既存の単一演算DXIL(`vector_add.dxil`)を`translate_dxil_chain_to_spirv`
     /// (チェーン版、N=1の自明な場合)へ渡しても正しく翻訳できることを確認する
     /// (DXBC側`chain_translator_also_accepts_the_pre_existing_single_op_

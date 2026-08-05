@@ -1558,6 +1558,34 @@ mod tests {
             .expect("emitted SPIR-V (2-op chain) must be well-formed and re-parseable");
     }
 
+    /// `shaders/vector_add_mul_div_chain3.dxbc`(実fxc.exe出力、UAV3本、
+    /// `t1 = A[i]+B[i]; t2 = t1*A[i]; Out[i] = t2/B[i];`という2項演算
+    /// **3回**のチェーン——2026-08-05増分、`decode_chain_shape`が2回の
+    /// チェーンだけでなく実際に3回のチェーンも(コード変更無しで)正しく
+    /// 扱えることを実バイト列で検証する。`examples/dump_shex`で実際に
+    /// ダンプした結果、命令列は`ld_structured`x2 -> `add`(dest=temp.z) ->
+    /// `mul`(dest=temp.x、temp.xを上書き) -> `div`(dest=temp.x、再度上書き)
+    /// -> `store_structured`(temp.xを参照)という形で、`decode_chain_shape`
+    /// が最初から持っていた「命令を1つずつ走査してreg_mapを更新する」という
+    /// 一般的なロジックがそのまま(N=2専用のコードパスを分岐させることなく)
+    /// N=3にも対応することを裏付けた。
+    const VECTOR_ADD_MUL_DIV_CHAIN3_DXBC: &[u8] = include_bytes!("../shaders/vector_add_mul_div_chain3.dxbc");
+
+    #[test]
+    fn translates_real_fxc_compiled_3op_chain_dxbc_to_valid_spirv() {
+        let kernel = translate_chain_shader(VECTOR_ADD_MUL_DIV_CHAIN3_DXBC)
+            .expect("real fxc-compiled 3-op chain (add, mul, div; 3 UAVs) must translate");
+        // 式木は`(A+B)*A/B`なので、読み込み順は[A(u0), B(u1), A(u0), B(u1)]。
+        assert_eq!(kernel.read_uav_bind_points, vec![0, 1, 0, 1]);
+        assert_eq!(kernel.write_uav_bind_point, 2);
+        assert_eq!(kernel.local_size, (64, 1, 1));
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_bytes(&bytes, &mut loader)
+            .expect("emitted SPIR-V (3-op chain) must be well-formed and re-parseable");
+    }
+
     #[test]
     fn chain_translator_honestly_rejects_garbage_bytes() {
         let garbage = [0u8; 16];

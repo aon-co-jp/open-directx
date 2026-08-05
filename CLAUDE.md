@@ -909,3 +909,117 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     `decode_chain_shape`ですら未対応)、(3) テクスチャサンプリング・
     スワップチェーンへの拡張、(4) AMD/Intel・Linux/macOS実機検証、
     (5) 各クレートの公開APIexample充足状況の棚卸し。
+
+- **2026-08-05(続き2) 直前エントリの次にすべきこと(1)を解消: DXBC/DXIL
+  両チェーンデコーダが3個の逐次2項演算(add+mul+div)を実際に(コード変更
+  無しで)扱えることを実バイト列で確認・実機検証まで到達**:
+  1. **新規シェーダー2本**(既存の2項チェーン群と同じUAV3本・InputA/InputB
+     多重参照パターン、演算を3回〈add→mul→div〉へ拡張): `shaders/
+     vector_add_mul_div_chain3.hlsl`(`t1=InputA[i]+InputB[i]; t2=t1*InputA[i];
+     Output[i]=t2/InputB[i];`、`fxc.exe /T cs_5_0`で実コンパイル)・
+     `shaders/vector_add_mul_div_chain3_dxil.hlsl`(同一契約、`dxc.exe -T
+     cs_6_0`で実コンパイル)。`tools/compile-dxbc-shaders.ps1`に両方追記済み。
+  2. **実バイト列を確認してから着手(推測で実装しない、既存方針の継続)**:
+     - **DXBC側**: `examples/dump_shex`で実SHEX命令列をダンプした結果、
+       `ld_structured`x2 -> `add`(dest=temp.z) -> `mul`(dest=temp.x、
+       `add`の結果とtemp.xに残っていた`InputA`ロード結果を掛けてtemp.xを
+       上書き) -> `div`(dest=temp.x、さらに上書き、`InputB`ロード結果で
+       割る) -> `store_structured`(temp.xを参照) -> `ret`という、既存の
+       2項チェーン(`vector_add_mul_chain.dxbc`)と全く同じ「一時レジスタの
+       コンポーネントを使い回すreg_map更新」パターンがそのまま3回に伸びた
+       だけの形だった。
+     - **DXIL側**: `examples/dump_dxil`で`FUNCTION_BLOCK`をダンプした結果、
+       `Call`(code=34)は既存の単一/2項チェーンと変わらず**7個のまま**
+       (同じ3バッファのため`CreateHandle`は3個から増えない)、`ExtractValue`
+       (code=26)が2個(u0/u1それぞれ1回、CSEで再利用)、**`BinOp`(code=2)が
+       3回連続で出現**(`fields=[1,3,0,31]`(add) -> `fields=[1,4,2,31]`
+       (mul、lhs相対値1=直前のBinOp結果) -> `fields=[1,3,4,31]`(div、
+       lhs相対値1=直前のBinOp結果、rhs相対値3=1回目の`ExtractedBufferValue
+       (u1)`))という構造だった。
+  3. **実装(コード変更は0行、確認のみ)**: DXBC側`decode_chain_shape`
+     (`spirv_gen.rs`)・DXIL側`resolve_dxil_calls_and_chain`(`dxil.rs`)の
+     いずれも、命令列を1つずつ走査して`reg_map`/`chain_exprs`を更新する
+     という設計が最初からN個の逐次2項演算を想定した一般的なロジックに
+     なっており、「2項までしか扱えない」ようなハードコードが存在しな
+     かったため、**新規テストを実際に実行して初めて「3項でも無改修で動く」
+     ことを確認した形**(タスク指示通りコードを書く前にまず実バイト列を
+     確認したが、結果的にプロダクションコード自体への変更は不要だった)。
+     `resolve_dxil_calls_and_chain`内の`resolved_calls.len() != 7`という
+     チェックも、Call数がバッファ本数(3本固定)で決まり演算回数には依存
+     しないため、そのまま通った。
+  4. **正直な発見(既知の現象の再確認)**: DXIL側の3項チェーンテストで、
+     最初`read_uav_bind_points`の期待値を`[0,1,0,1]`(add/mul/divの各
+     オペランドを額面通りの順序で並べたもの)としたところ実際には
+     `[1,0,0,1]`が返り、テストが失敗した——これは2026-07-26付HANDOFF
+     エントリで既に確認済みの「addは可換演算のためdxc/LLVMの最適化パスが
+     相対値参照の順序を並べ替える」現象がこのシェーダーでも再現した
+     もので、数値的には`a+b=b+a`のため実行結果自体には影響しない(実際に
+     実Vulkanで数値一致することで裏付け済み)。テストの期待値を実測順序
+     `[1,0,0,1]`へ修正し、コメントで理由を明記した——**手計算・額面通りの
+     期待だけでテストを書かず、必ず実行結果で裏取りする**という、この
+     プロジェクトで過去にも同じ理由で修正が入った教訓を今回も踏襲した形。
+  5. **単体テスト追加**(`cargo test -p directx-shader-translate --lib`、
+     実際に確認、誇張なし):
+     ```
+     running 44 tests
+     test spirv_gen::tests::translates_real_fxc_compiled_3op_chain_dxbc_to_valid_spirv ... ok
+     test dxil::tests::resolves_real_dxc_compiled_3op_chain_dxil_into_matching_regexpr_tree ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_handles_3op_chain ... ok
+     (既存41件含め) test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     DXBC側テストは`read_uav_bind_points == [0,1,0,1]`(額面通りの順序、
+     DXBCはSHEXレベルでの直接的な走査のためLLVM最適化パスの並べ替えを
+     受けない)・`write_uav_bind_point == 2`・`local_size == (64,1,1)`を
+     実バイト列から検証。DXIL側は式木が`Div(Mul(Add(Load,Load),Load),
+     Load)`という形(`(a+b)*a/b`)であることをパターンマッチで検証。
+  6. **実機テスト2本を新規追加**(`tests/vector_add_mul_div_chain3_real_
+     vulkan.rs`〈DXBC〉・`tests/vector_add_mul_div_chain3_dxil_real_
+     vulkan.rs`〈DXIL〉、既存の2項チェーン実機テストと同じパターン、
+     ゼロ除算を避けるためbは常に正の非ゼロ値)。実際に`cargo test
+     --workspace -- --nocapture`で確認した結果(誇張なし、実出力そのまま、
+     NVIDIA GeForce GT 730):
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, 2項演算3回のチェーン add+mul+div)->SPIR-V(自前生成、式木の再帰翻訳)->実Vulkan経路が、CPU参照実装(((a[i]+b[i])*a[i])/b[i])と256要素すべてで数値一致した
+     c[0]=1.0153847, c[255]=588.3
+     test dxbc_vector_add_mul_div_chain3_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0、2項演算3回のチェーン add+mul+div)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで式木を実解決)->実Vulkan経路が、CPU参照実装(((a[i]+b[i])*a[i])/b[i])と256要素すべてで数値一致した
+     c[0]=1.0153847, c[255]=588.3
+     test dxil_vector_add_mul_div_chain3_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     ```
+     DXBC/DXIL両経路の`c[0]`/`c[255]`が完全に一致している(同一の入力
+     データ生成式・同一の演算チェーンを独立した2つの実装経路で実行し、
+     両方とも同じCPU参照実装に一致することを実機で確認した、既存の
+     2項チェーンエントリと同じ追加的な裏付けパターン)。
+  7. **ワークスペース全体の検証**: `cargo test --workspace -- --nocapture`
+     で全テスト(unittests 44件+実機テスト17本〈グラフィックス5本+DXBC
+     Compute単一演算4本+DXBCチェーン(add/mul, sub/div, **add/mul/div
+     3項**)3本+DXIL Compute単一演算4本+DXILチェーン(add/mul, sub/div,
+     **add/mul/div 3項**)3本〉)すべてgreen、既存経路への回帰なし。
+     `cargo build --workspace`/`cargo clippy --workspace --all-targets`は
+     いずれも警告0件。
+  8. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **汎用N項チェーンデコーダとして正式に一般化・宣言したわけではない**。
+       今回検証できたのは「2項」から「3項」への拡張が既存コードのままで
+       動くことの1点のみ——4項以上、あるいは`sub`/`div`が3回以上混在する
+       組み合わせ(例: `sub`→`div`→`add`のような順序)は実際にコンパイル・
+       検証していない。既存コードが理屈上はN項まで対応できる形だとしても、
+       「実際にテストしていない組み合わせについては保証しない」という
+       このプロジェクトの一貫した方針を維持する。
+     - **境界チェック付きチェーンは今回も未対応のまま**(DXBC側
+       `decode_chain_shape`・DXIL側`resolve_dxil_calls_and_chain`のいずれも、
+       `ult`/`if`/`endif`を伴うチェーン形状は検証していない)。
+     - `mul`のnegateフラグが立つケースは引き続き未検証(2026-07-27付
+       エントリから変更なし)。
+     - テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+       実機検証・各クレートのexample充足状況棚卸しは、いずれも前回
+       エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: (1) 4項以上のチェーン、または`sub`/`div`を含む
+    より複雑な演算順序組み合わせでの実シェーダー検証(汎用N項デコーダと
+    正式に呼べるかどうかの判断はこれらの追加検証を経てから行う)、
+    (2) 境界チェック付きチェーン(DXBC/DXIL両方とも未対応)、
+    (3) テクスチャサンプリング・スワップチェーンへの拡張、
+    (4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
+    example充足状況の棚卸し。

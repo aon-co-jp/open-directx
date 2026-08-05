@@ -42,6 +42,8 @@ Write-Host "OK: compiled vector_sub_bounded.hlsl -> vector_sub_bounded.dxbc (DXB
 Write-Host "OK: compiled vector_div.hlsl -> vector_div.dxbc (DXBC, SM5.0)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_chain.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_chain.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_chain.hlsl -> vector_add_mul_chain.dxbc (DXBC, SM5.0, 2 sequential ops / 3 UAVs, reg-expr chain decoder)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxbc") /nologo
+Write-Host "OK: compiled vector_add_mul_div_chain3.hlsl -> vector_add_mul_div_chain3.dxbc (DXBC, SM5.0, 3 sequential ops / 3 UAVs, reg-expr chain decoder)"
 
 # D3D11グラフィックスパイプライン(タスク2): 頂点/ピクセルシェーダーも
 # fxc.exe(SM<=5.1、DXBC)でコンパイルする。dxc.exeではない(dxc.exeは
@@ -85,3 +87,7 @@ Write-Host "OK: compiled vector_div_dxil.hlsl -> vector_div.dxil (DXIL, SM6.0)"
 Write-Host "OK: compiled vector_add_mul_chain_dxil.hlsl -> vector_add_mul_chain.dxil (DXIL, SM6.0, 2 sequential ops add+mul)"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_sub_div_chain_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_sub_div_chain.dxil")
 Write-Host "OK: compiled vector_sub_div_chain_dxil.hlsl -> vector_sub_div_chain.dxil (DXIL, SM6.0, 2 sequential ops sub+div)"
+# 2026-08-05: 3個の逐次2項演算チェーン(add+mul+div)のDXBC/DXIL版
+# (decode_chain_shape/resolve_dxil_calls_and_chainを3項へ拡張する検証用)。
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_chain3_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxil")
+Write-Host "OK: compiled vector_add_mul_div_chain3_dxil.hlsl -> vector_add_mul_div_chain3.dxil (DXIL, SM6.0, 3 sequential ops add+mul+div)"
