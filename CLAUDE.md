@@ -776,3 +776,35 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     サンプリング・スワップチェーンへの拡張、(3) AMD/Intel・Linux/macOS
     実機検証(前回・前々回エントリから継続)、(4) 各クレートの公開API
     example充足状況の棚卸し。
+
+- **2026-08-05 上記(1)の事前調査のみ実施(コード変更なし、ユーザー
+  指示「open-directx open-cuda aruaru-llmの連携・実用性・完成度を
+  向上」、優先順位1位として着手したが時間の都合で調査止まり)**:
+  1. **確認できたこと**: DXBC側(`spirv_gen.rs::decode_chain_shape`/
+     `ChainShape`)は`RegExpr`という式木で複数演算のチェーン
+     (`vector_add_mul_chain.hlsl`・`vector_sub_div_chain.hlsl`、
+     いずれも実fxc.exe出力の`.dxbc`が既に存在)を扱えるのに対し、
+     **DXIL側(`dxil.rs::ResolvedDxilBinOp`/
+     `translate_dxil_binary_op_to_spirv`)は単一の二項演算
+     (`lhs_range_id`/`rhs_range_id`の1組)しか扱えない**ことをソースを
+     直接読んで確認した——`dxil.rs`に`chain`という語自体が1件も
+     出現しないことも`grep`で確認済み。前回HANDOFFの想定通り、
+     本当にDXIL側だけが取り残されているギャップだった。
+  2. **`vector_add_mul_chain.hlsl`/`vector_sub_div_chain.hlsl`の
+     DXIL(`.dxil`)版は未コンパイルのまま**(このパスでは`dxc.exe`の
+     パス〈`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`〉を特定したところで
+     時間切れとなり、実際のコンパイル・bitcode構造のダンプ・
+     `FUNCTION_BLOCK`内の複数命令レコードの解釈には未着手)。
+  3. **正直な見積もり**: これは単純な配線漏れではなく、DXIL
+     (LLVM bitcode)側で複数命令から成る式木を`FUNCTION_BLOCK`の
+     生レコード列から再構築する新規の解析ロジックが必要——DXBC側の
+     `decode_chain_shape`実装時と同程度の探索的な作業(実際のbitcode
+     出力を都度ダンプしながら1レコードずつ意味を確認する)が見込まれる
+     ため、今回は無理に着手せず正直に次回へ持ち越した。
+  - 次にすべきこと(変更なし、上記(1)は引き続き未着手のまま):
+    (1) `dxc.exe -T cs_6_0`で`vector_add_mul_chain.hlsl`/
+    `vector_sub_div_chain.hlsl`を実際にDXILへコンパイルし、
+    `examples/dump_dxil.rs`で`FUNCTION_BLOCK`のレコード列を実際に
+    ダンプして構造を確認するところから着手する、(2) テクスチャ
+    サンプリング・スワップチェーンへの拡張、(3) AMD/Intel・Linux/macOS
+    実機検証、(4) 各クレートの公開APIexample充足状況の棚卸し。
