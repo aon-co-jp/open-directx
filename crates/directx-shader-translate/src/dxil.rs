@@ -878,6 +878,322 @@ pub fn resolve_dxil_calls_and_binop(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCal
 }
 
 // ---------------------------------------------------------------------
+// ここから先(N個の逐次BinOpから成る「チェーン」の解決)は2026-08-05に新規
+// 追加した部分。DXBC側`spirv_gen.rs`の`decode_chain_shape`/`RegExpr`が
+// 「N個の逐次2項演算」を式木として扱えるのに対し、上の
+// `resolve_dxil_calls_and_binop`は`resolved_binop: Option<ResolvedDxilBinOp>`
+// という単一のBinOpしか保持できず(2つ目のBinOpに遭遇すると単に上書きして
+// しまう)、DXIL側だけが1項演算のチェーンに対応できていないというギャップが
+// あった(2026-08-05付HANDOFFで事前調査済み)。
+//
+// **実際に`vector_add_mul_chain.dxil`/`vector_sub_div_chain.dxil`
+// (`dxc.exe -T cs_6_0`で新規コンパイル)を`examples/dump_dxil.rs`で
+// ダンプして確認した実際のFUNCTION_BLOCK構造**(推測ではなく実バイト列):
+// `DeclareBlocks(1)` -> `CONSTANTS_BLOCK`(オペコード定数群) ->
+// `Call`(CreateHandle)x3 -> `Call`(ThreadId) -> `Call`(BufferLoad) ->
+// `ExtractValue` -> `Call`(BufferLoad) -> `ExtractValue` -> `BinOp`(1回目) ->
+// `BinOp`(2回目) -> `Call`(BufferStore) -> `Ret`。
+// **重要な発見**: `Call`の個数は単一演算シェーダーと全く同じ7個
+// (CreateHandle3+ThreadId1+BufferLoad2+BufferStore1)のまま——HLSL側で
+// `InputA[i]`を2回参照しても、DXBC側で確認済みだったのと同じ共通部分式
+// 除去(CSE)がDXIL/LLVM側でも働き、2回目の`BufferLoad`は発行されず、
+// 1回目の`ExtractValue`結果がそのまま2つ目の`BinOp`のオペランドとして
+// 再利用されていた。実際のフィールド値(`vector_add_mul_chain.dxil`):
+// `BinOp`1回目 `fields=[1,3,0,31]`(lhs相対値=1, rhs相対値=3,
+// opcode=0=add, flags=31) -> `t = ExtractedBufferValue(u1) + ExtractedBufferValue(u0)`
+// (`emit_spirv_for_kernel`と同じ「フィールド順=(lhs,rhs)」の読み方)。
+// `BinOp`2回目 `fields=[1,4,2,31]`(lhs相対値=1 = 直前のBinOp1の結果,
+// rhs相対値=4 = 1回目の`ExtractedBufferValue(u0)`を指す, opcode=2=mul) ->
+// `out = t * ExtractedBufferValue(u0)`——`vector_add_mul_chain.hlsl`の
+// `t = InputA[i] + InputB[i]; Output[i] = t * InputA[i];`と完全に一致する。
+//
+// **正直な開示(このセクションのスコープ)**: 汎用N項チェーンデコーダでは
+// ない。今回実際に確認したのは2回の逐次BinOp(add+mul、sub+div)のみ——
+// 3回以上のチェーンは未検証(DXBC側の`decode_chain_shape`ドキュメントに
+// ある同種の限定と同じ)。各BinOpのオペランドは「直前のBinOp結果」か
+// 「`ExtractedBufferValue`(BufferLoad由来)」のいずれかである前提を検証し、
+// それ以外(例えば2つ前のBinOp結果を直接参照する等)は
+// `DxilCallResolutionError::UnexpectedShape`で正直に拒否する。
+
+/// [`crate::spirv_gen::RegExpr`]の別名(DXIL側から見て、DXBC側の式木型を
+/// そのまま再利用していることを明示するため)。
+type DxilRegExpr = crate::spirv_gen::RegExpr;
+
+/// [`resolve_dxil_calls_and_binop`]の「N個の逐次BinOp」一般化版。
+/// `ResolvedDxilBinOp`(単一のBinOpのみ保持できる)の代わりに、
+/// DXBC側`decode_chain_shape`と同じ`RegExpr`式木を組み立てて返す。
+/// 単一BinOpのシェーダー(`vector_add.dxil`等)を渡しても、`RegExpr::BinOp`
+/// が1段だけの木として正しく解決できる(排他的である必要はない、DXBC側の
+/// `chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader`
+/// と同じ設計)。
+pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, DxilRegExpr), DxilCallResolutionError> {
+    let containers = dxbc::scan_dxbc(bytes);
+    let container = containers.into_iter().next().ok_or_else(|| DxilCallResolutionError::MissingBlock("DXBC container".to_string()))?;
+    let dxil_chunk = container
+        .chunks
+        .iter()
+        .find_map(|c| match c.parse() {
+            ChunkData::Dxil(d) => Some(d),
+            _ => None,
+        })
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("DXIL chunk".to_string()))?;
+    let bc = Bitcode::new(&dxil_chunk.bitcode).map_err(|e| DxilCallResolutionError::MissingBlock(format!("bitcode: {e:?}")))?;
+    let module_block = bc
+        .elements
+        .iter()
+        .find_map(|el| el.as_block())
+        .filter(|b| b.id == 8)
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("MODULE_BLOCK".to_string()))?;
+    let function_block = module_block
+        .elements
+        .iter()
+        .filter_map(|el| el.as_block())
+        .find(|b| b.id == 12)
+        .ok_or_else(|| DxilCallResolutionError::MissingBlock("FUNCTION_BLOCK".to_string()))?;
+    let mut values = build_module_value_list(module_block);
+
+    let mut resolved_calls = Vec::new();
+    // 値の絶対インデックス(`values`の添字)から、それがBinOpの結果なら
+    // 対応する`RegExpr`へ引ける対応表。ExtractValue由来の値はここに無くても
+    // `values`側の`DxilValue::ExtractedBufferValue`から直接`RegExpr::Load`を
+    // 組み立てられるため、BinOp結果だけを記録すれば足りる。
+    let mut chain_exprs: HashMap<usize, DxilRegExpr> = HashMap::new();
+    let mut last_chain_expr: Option<DxilRegExpr> = None;
+
+    for el in &function_block.elements {
+        if let Some(sub) = el.as_block() {
+            if sub.id == 11 {
+                decode_constants_block(sub, &mut values);
+            }
+            continue;
+        }
+        let Some(rec) = el.as_record() else { continue };
+        let fields = rec.fields().to_vec();
+        match rec.id {
+            1 => { /* DeclareBlocks: 大分類側で検証済み、ここでは無視 */ }
+            34 => {
+                // FUNC_CODE_INST_CALL: 既存の`resolve_dxil_calls_and_binop`と
+                // 全く同じ解決ロジック(重複しているが、後述の理由により
+                // このパスでは`resolved_binop`ではなく`chain_exprs`を更新する
+                // 必要があるため、BinOpの分岐だけ独立させた新規関数とした)。
+                let current_value_no = values.len();
+                let paramattrs_and_cc_len = 2;
+                if fields.len() < paramattrs_and_cc_len + 1 {
+                    return Err(DxilCallResolutionError::UnexpectedShape("Call命令のフィールド数が不足".to_string()));
+                }
+                let cc = fields[1];
+                let explicit_type_flag = cc & 0x8000 != 0;
+                let mut idx = paramattrs_and_cc_len;
+                if explicit_type_flag {
+                    idx += 1;
+                }
+                let callee_field = *fields.get(idx).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("Call命令にcallee相対値が無い".to_string()))?;
+                idx += 1;
+                let arg_fields = &fields[idx..];
+
+                let callee = resolve_relative(&values, current_value_no, callee_field);
+                let Some(DxilValue::Function { name: Some(callee_name) }) = callee else {
+                    let name = match callee {
+                        Some(DxilValue::Function { name }) => name.clone(),
+                        _ => None,
+                    };
+                    return Err(DxilCallResolutionError::UnknownCallee(name));
+                };
+                let callee_name = callee_name.clone();
+
+                let resolved_args: Vec<DxilValue> =
+                    arg_fields.iter().map(|&f| resolve_relative(&values, current_value_no, f).cloned().unwrap_or(DxilValue::Other)).collect();
+
+                let expect_int = |v: &DxilValue| -> Option<i64> {
+                    match v {
+                        DxilValue::ConstantInt { value } => Some(*value),
+                        DxilValue::ConstantZero => Some(0),
+                        _ => None,
+                    }
+                };
+
+                match callee_name.as_str() {
+                    "dx.op.createHandle" => {
+                        if resolved_args.len() != 5 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(57) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 57, opcode));
+                        }
+                        let range_id = expect_int(&resolved_args[2])
+                            .ok_or_else(|| DxilCallResolutionError::UnexpectedShape("CreateHandleのrange_idが定数でない".to_string()))?;
+                        resolved_calls.push(ResolvedDxilCall::CreateHandle { range_id });
+                        values.push(DxilValue::CreateHandleResult { range_id });
+                    }
+                    "dx.op.threadId.i32" => {
+                        if resolved_args.len() != 2 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(93) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 93, opcode));
+                        }
+                        resolved_calls.push(ResolvedDxilCall::ThreadId);
+                        values.push(DxilValue::ThreadIdResult);
+                    }
+                    "dx.op.bufferLoad.f32" => {
+                        if resolved_args.len() != 4 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(68) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 68, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("BufferLoadの座標がThreadIdの結果ではない".to_string()));
+                        }
+                        resolved_calls.push(ResolvedDxilCall::BufferLoad { handle_range_id: range_id });
+                        values.push(DxilValue::BufferLoadAggregate { source_range_id: range_id });
+                    }
+                    "dx.op.bufferStore.f32" => {
+                        if resolved_args.len() != 9 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(69) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 69, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("BufferStoreの座標がThreadIdの結果ではない".to_string()));
+                        }
+                        if !matches!(resolved_args[4], DxilValue::BinOpResult) {
+                            return Err(DxilCallResolutionError::StoredValueNotBinOpResult);
+                        }
+                        resolved_calls.push(ResolvedDxilCall::BufferStore { handle_range_id: range_id });
+                    }
+                    other => {
+                        return Err(DxilCallResolutionError::UnknownCallee(Some(other.to_string())));
+                    }
+                }
+            }
+            26 => {
+                // FUNC_CODE_INST_EXTRACTVAL
+                let current_value_no = values.len();
+                let agg_relative = *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("ExtractValueにオペランドが無い".to_string()))?;
+                let index0 = fields.get(1).copied().unwrap_or(u64::MAX);
+                let aggregate = resolve_relative(&values, current_value_no, agg_relative);
+                let source_range_id = match aggregate {
+                    Some(DxilValue::BufferLoadAggregate { source_range_id }) if index0 == 0 => *source_range_id,
+                    _ => return Err(DxilCallResolutionError::ExtractValueNotFromBufferLoad),
+                };
+                values.push(DxilValue::ExtractedBufferValue { source_range_id });
+            }
+            2 => {
+                // FUNC_CODE_INST_BINOP: [lhs_relative, rhs_relative, opcode, flags]。
+                // 単一演算版との違いはここだけ——`resolved_binop`への単純代入
+                // (2個目以降を無条件に上書き)ではなく、各オペランドを
+                // 「ExtractedBufferValue由来のLoad」か「直前までのBinOp結果
+                // (`chain_exprs`に記録済み)」のいずれかとして解決し、
+                // `RegExpr::BinOp`として木を組み立てる。
+                let current_value_no = values.len();
+                let lhs_relative =
+                    *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpにオペランドが無い".to_string()))?;
+                let rhs_relative =
+                    *fields.get(1).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpに2つ目のオペランドが無い".to_string()))?;
+                let opcode_field = *fields.get(2).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("BinOpにオペコードが無い".to_string()))?;
+
+                let resolve_operand = |relative: u64| -> Result<DxilRegExpr, DxilCallResolutionError> {
+                    let relative = relative as usize;
+                    if relative == 0 || relative > current_value_no {
+                        return Err(DxilCallResolutionError::UnexpectedShape("BinOpオペランドの相対値が範囲外".to_string()));
+                    }
+                    let abs_index = current_value_no - relative;
+                    if let Some(expr) = chain_exprs.get(&abs_index) {
+                        return Ok(expr.clone());
+                    }
+                    match values.get(abs_index) {
+                        Some(DxilValue::ExtractedBufferValue { source_range_id }) => Ok(DxilRegExpr::Load(*source_range_id as u32)),
+                        _ => Err(DxilCallResolutionError::UnexpectedShape(
+                            "BinOpのオペランドがBufferLoad由来の値でも直前のBinOp結果でもない".to_string(),
+                        )),
+                    }
+                };
+                let lhs_expr = resolve_operand(lhs_relative)?;
+                let rhs_expr = resolve_operand(rhs_relative)?;
+
+                let op = match opcode_field as i64 {
+                    0 => crate::BinaryOp::Add,
+                    1 => crate::BinaryOp::Sub,
+                    2 => crate::BinaryOp::Mul,
+                    4 => crate::BinaryOp::Div,
+                    other => return Err(DxilCallResolutionError::UnknownBinOpcode(other)),
+                };
+                let expr = DxilRegExpr::BinOp(op, Box::new(lhs_expr), Box::new(rhs_expr));
+                chain_exprs.insert(current_value_no, expr.clone());
+                last_chain_expr = Some(expr);
+                values.push(DxilValue::BinOpResult);
+            }
+            10 => { /* Ret */ }
+            other => {
+                return Err(DxilCallResolutionError::UnexpectedShape(format!("想定外の命令コード{other}")));
+            }
+        }
+    }
+
+    if resolved_calls.len() != 7 {
+        return Err(DxilCallResolutionError::UnexpectedShape(format!("Call命令は7個を期待したが実際は{}個", resolved_calls.len())));
+    }
+    let root = last_chain_expr.ok_or(DxilCallResolutionError::MissingBinOp)?;
+    Ok((resolved_calls, root))
+}
+
+/// [`resolve_dxil_calls_and_chain`]が組み立てた式木から、DXBC側の
+/// `emit_chain_spirv_for_kernel`(`spirv_gen.rs`、`RegExpr`の木さえあれば
+/// DXBC/DXILどちらの由来かを問わない形へ既に切り出し済み)をそのまま再利用
+/// してSPIR-Vを組み立てる。DXBC側`translate_chain_shader`のDXIL版。
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DxilChainSpirvError {
+    #[error("Call命令の解決に失敗した: {0}")]
+    CallResolution(#[from] DxilCallResolutionError),
+    #[error("BufferStoreの呼び出しが想定と異なる個数だった(実際={0}, 期待=1)")]
+    UnexpectedBufferStoreCount(usize),
+    #[error("METADATA_BLOCKからのnumThreads抽出に失敗した: {0}")]
+    NumThreads(#[from] DxilNumThreadsError),
+}
+
+/// [`crate::spirv_gen::ChainTranslatedKernel`]のDXIL版。読み込みUAVが
+/// N本(N>=1)になり得るため、DXBC側と同じ形の型をそのまま使う。
+pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::ChainTranslatedKernel, DxilChainSpirvError> {
+    let (calls, root) = resolve_dxil_calls_and_chain(bytes)?;
+
+    let mut buffer_store: Option<i64> = None;
+    for call in &calls {
+        if let ResolvedDxilCall::BufferStore { handle_range_id } = call {
+            buffer_store = Some(*handle_range_id);
+        }
+    }
+    let write_uav = buffer_store.ok_or(DxilChainSpirvError::UnexpectedBufferStoreCount(0))? as u32;
+
+    let mut read_uav_bind_points = Vec::new();
+    crate::spirv_gen::collect_loads(&root, &mut read_uav_bind_points);
+
+    let local_size = extract_numthreads_from_metadata(bytes)?;
+    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav);
+
+    Ok(crate::spirv_gen::ChainTranslatedKernel {
+        spirv_words,
+        entry_point: "main",
+        local_size,
+        read_uav_bind_points,
+        write_uav_bind_point: write_uav,
+    })
+}
+
+// ---------------------------------------------------------------------
 // ここから先(METADATA_BLOCKからのnumThreads実抽出)は今回新規に追加した部分。
 // 前回のHANDOFFで「DXBCの`dcl_thread_group`に相当する情報は`METADATA_BLOCK`
 // 内の`dx.entryPoints`にエンコードされているが未抽出、`(64,1,1)`を決め打ちで
@@ -1553,6 +1869,75 @@ mod tests {
             }
             assert_eq!(kernel.spirv_words[0], 0x0723_0203, "{label}: SPIR-V magic");
         }
+    }
+
+    /// `crates/directx-shader-translate/shaders/vector_add_mul_chain_dxil.hlsl`
+    /// (DXBC側`vector_add_mul_chain.hlsl`と同一契約、SM6.0向けに`dxc.exe
+    /// -T cs_6_0 -E main`で新規コンパイル)の実DXILバイト列。
+    const VECTOR_ADD_MUL_CHAIN_DXIL: &[u8] = include_bytes!("../shaders/vector_add_mul_chain.dxil");
+    /// 同上、sub/divチェーン版。
+    const VECTOR_SUB_DIV_CHAIN_DXIL: &[u8] = include_bytes!("../shaders/vector_sub_div_chain.dxil");
+
+    /// `resolve_dxil_calls_and_chain`が実際に`vector_add_mul_chain.dxil`から
+    /// `(a+b)*a`という式木を正しく組み立てることを検証する(このHANDOFFの
+    /// コメントに転記した手計算トレース: BinOp1=`fields=[1,3,0,31]`
+    /// (add, u1+u0)、BinOp2=`fields=[1,4,2,31]`(mul, 直前の結果*u0)と一致)。
+    #[test]
+    fn resolves_real_dxc_compiled_add_mul_chain_dxil_into_matching_regexpr_tree() {
+        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_DXIL)
+            .expect("real dxc-compiled vector_add_mul_chain.dxil must resolve into a chain RegExpr");
+        assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, same call count as the single-op shape");
+        match &root {
+            DxilRegExpr::BinOp(crate::BinaryOp::Mul, lhs, rhs) => {
+                assert!(matches!(**rhs, DxilRegExpr::Load(_)), "outer op must be `t * Load(...)`");
+                assert!(matches!(**lhs, DxilRegExpr::BinOp(crate::BinaryOp::Add, _, _)), "inner op must be the add");
+            }
+            other => panic!("expected outer Mul(Add(Load,Load), Load), got {other:?}"),
+        }
+    }
+
+    /// 同上、sub/divチェーン(`(a-b)/a`)版。
+    #[test]
+    fn resolves_real_dxc_compiled_sub_div_chain_dxil_into_matching_regexpr_tree() {
+        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_CHAIN_DXIL)
+            .expect("real dxc-compiled vector_sub_div_chain.dxil must resolve into a chain RegExpr");
+        assert_eq!(calls.len(), 7);
+        match &root {
+            DxilRegExpr::BinOp(crate::BinaryOp::Div, lhs, rhs) => {
+                assert!(matches!(**rhs, DxilRegExpr::Load(_)), "outer op must be `t / Load(...)`");
+                assert!(matches!(**lhs, DxilRegExpr::BinOp(crate::BinaryOp::Sub, _, _)), "inner op must be the sub");
+            }
+            other => panic!("expected outer Div(Sub(Load,Load), Load), got {other:?}"),
+        }
+    }
+
+    /// `translate_dxil_chain_to_spirv`が両チェーンシェーダーから実際に有効な
+    /// SPIR-Vを生成できることを検証する(型チェックだけでなく、先頭マジック・
+    /// 読み込み/書き込みUAVバインドポイント・抽出したnumthreadsまで確認)。
+    #[test]
+    fn translate_dxil_chain_to_spirv_handles_add_mul_and_sub_div_chains() {
+        for (bytes, label) in [(VECTOR_ADD_MUL_CHAIN_DXIL, "add_mul"), (VECTOR_SUB_DIV_CHAIN_DXIL, "sub_div")] {
+            let kernel = translate_dxil_chain_to_spirv(bytes)
+                .unwrap_or_else(|e| panic!("vector_{label}_chain.dxil must translate to SPIR-V: {e:#}"));
+            assert_eq!(kernel.local_size, (64, 1, 1), "{label}: numthreads must be extracted, not hardcoded");
+            assert_eq!(kernel.write_uav_bind_point, 2, "{label}: write UAV bind point must resolve to u2");
+            assert_eq!(kernel.read_uav_bind_points.len(), 3, "{label}: 2 loads referenced 3 times in the expression tree (u0 used twice)");
+            assert_eq!(kernel.spirv_words[0], 0x0723_0203, "{label}: SPIR-V magic");
+        }
+    }
+
+    /// 既存の単一演算DXIL(`vector_add.dxil`)を`translate_dxil_chain_to_spirv`
+    /// (チェーン版、N=1の自明な場合)へ渡しても正しく翻訳できることを確認する
+    /// (DXBC側`chain_translator_also_accepts_the_pre_existing_single_op_
+    /// vector_add_shader`と同じ、排他的である必要はないという設計方針の
+    /// DXIL版での裏付け)。
+    #[test]
+    fn translate_dxil_chain_to_spirv_also_accepts_the_pre_existing_single_op_vector_add_dxil() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_DXIL)
+            .expect("single-op vector_add.dxil must also be accepted by the generalized chain path");
+        assert_eq!(kernel.local_size, (64, 1, 1));
+        assert_eq!(kernel.write_uav_bind_point, 2);
+        assert_eq!(kernel.read_uav_bind_points.len(), 2);
     }
 
     #[test]

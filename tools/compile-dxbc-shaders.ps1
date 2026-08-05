@@ -78,3 +78,10 @@ Write-Host "OK: compiled vector_mul_dxil.hlsl -> vector_mul.dxil (DXIL, SM6.0)"
 Write-Host "OK: compiled vector_sub_dxil.hlsl -> vector_sub.dxil (DXIL, SM6.0)"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_div_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_div.dxil")
 Write-Host "OK: compiled vector_div_dxil.hlsl -> vector_div.dxil (DXIL, SM6.0)"
+# 2026-08-05: DXIL側チェーン(N個の逐次2項演算)対応のための2本
+# (vector_add_mul_chain.hlsl/vector_sub_div_chain.hlslのDXBC/SM5.0版と同一
+# 契約・演算内容、dxc.exe/SM6.0向けに別ファイルへ分離した_dxil.hlsl版)。
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_chain_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_chain.dxil")
+Write-Host "OK: compiled vector_add_mul_chain_dxil.hlsl -> vector_add_mul_chain.dxil (DXIL, SM6.0, 2 sequential ops add+mul)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_sub_div_chain_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_sub_div_chain.dxil")
+Write-Host "OK: compiled vector_sub_div_chain_dxil.hlsl -> vector_sub_div_chain.dxil (DXIL, SM6.0, 2 sequential ops sub+div)"

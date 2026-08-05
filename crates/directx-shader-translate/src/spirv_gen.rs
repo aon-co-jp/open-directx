@@ -585,8 +585,8 @@ fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
 /// 一時レジスタコンポーネントが実際に評価する式。`ld_structured`で読み込んだ
 /// 値そのもの(`Load`)か、既存の2つの式を入力に取る2項演算(`BinOp`)の
 /// いずれか——制御フローを含まない評価式の木。
-#[derive(Debug, Clone)]
-enum RegExpr {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RegExpr {
     /// このUAVバインドポイントから読み込んだ値。
     Load(u32),
     /// 2つの部分式に対する2項演算の結果。
@@ -594,7 +594,7 @@ enum RegExpr {
 }
 
 /// [`RegExpr`]の木を実際に辿り、含まれる`Load`(読み込み元UAV)を出現順に集める。
-fn collect_loads(expr: &RegExpr, out: &mut Vec<u32>) {
+pub(crate) fn collect_loads(expr: &RegExpr, out: &mut Vec<u32>) {
     match expr {
         RegExpr::Load(uav) => out.push(*uav),
         RegExpr::BinOp(_, lhs, rhs) => {
@@ -903,11 +903,21 @@ pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, Spi
     })
 }
 
-/// [`ChainShape`]から実際にSPIR-Vバイナリを組み立てる。`RegExpr`の木を
-/// 実際に(post-order、`Load`は毎回新しく`OpAccessChain`+`OpLoad`を発行、
-/// 共有部分式の再利用は行わない——このシェーダーの式木に共有部分式が
-/// 無いため、正しさに影響は無い)辿って対応するSPIR-V命令列を発行する。
+/// [`ChainShape`]から実際にSPIR-Vバイナリを組み立てる。DXBC側の薄いラッパー
+/// ——実体は[`emit_chain_spirv_for_kernel`](DXIL側`dxil.rs`の
+/// `translate_dxil_chain_to_spirv`とも共有する、DXBC固有の`ChainShape`型に
+/// 依存しない部分を切り出したもの)。
 fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
+    emit_chain_spirv_for_kernel(shape.thread_group, &shape.root, shape.write_uav)
+}
+
+/// [`emit_chain_spirv`]の本体。DXBC固有の[`ChainShape`]型に依存しない
+/// パラメータのみを取る形へ切り出したもの(`emit_spirv_for_kernel`が
+/// `emit_spirv_impl`から切り出されたのと同じパターン)——DXIL側
+/// (`dxil.rs`)がDXBC側の`RegExpr`式木構築ロジックを再利用してSPIR-Vを
+/// 生成する際にも、このSPIR-V組み立て本体をそのまま呼べるようにするため
+/// `pub(crate)`にした(2026-08-05、DXILチェーン対応の一環)。
+pub(crate) fn emit_chain_spirv_for_kernel(thread_group: (u32, u32, u32), root: &RegExpr, write_uav: u32) -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);
@@ -940,8 +950,8 @@ fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
     };
 
     let mut all_uavs = Vec::new();
-    collect_loads(&shape.root, &mut all_uavs);
-    all_uavs.push(shape.write_uav);
+    collect_loads(root, &mut all_uavs);
+    all_uavs.push(write_uav);
     for uav in &all_uavs {
         ensure_buffer_var(&mut b, *uav, &mut buffer_vars);
     }
@@ -987,9 +997,9 @@ fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
         }
     }
 
-    let result = emit_expr(&mut b, &shape.root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+    let result = emit_expr(&mut b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
 
-    let write_var = *buffer_vars.get(&shape.write_uav).expect("write buffer var must exist");
+    let write_var = *buffer_vars.get(&write_uav).expect("write buffer var must exist");
     let ac_out =
         b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
     b.store(ac_out, result, None, vec![]).expect("OpStore out");
@@ -1001,7 +1011,7 @@ fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
     b.execution_mode(
         main_fn,
         spirv::ExecutionMode::LocalSize,
-        [shape.thread_group.0, shape.thread_group.1, shape.thread_group.2],
+        [thread_group.0, thread_group.1, thread_group.2],
     );
 
     let module = b.module();

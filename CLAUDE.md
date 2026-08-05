@@ -808,3 +808,104 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     ダンプして構造を確認するところから着手する、(2) テクスチャ
     サンプリング・スワップチェーンへの拡張、(3) AMD/Intel・Linux/macOS
     実機検証、(4) 各クレートの公開APIexample充足状況の棚卸し。
+
+- **2026-08-05(続き) DXIL側にチェーン(N個の逐次2項演算)対応を実装——
+  前回HANDOFFで正直に「次回へ持ち越し」としていたギャップ(DXBC側のみ
+  `decode_chain_shape`/`RegExpr`でチェーンを扱え、DXIL側は単一BinOpのみ)を
+  解消。実機(NVIDIA GT 730)で数値一致を確認済み**:
+  1. **DXILコンパイル**: `vector_add_mul_chain_dxil.hlsl`/
+     `vector_sub_div_chain_dxil.hlsl`(既存の`vector_add_mul_chain.hlsl`/
+     `vector_sub_div_chain.hlsl`〈DXBC/fxc.exe版〉と同一契約・同一演算内容、
+     `vector_add_dxil.hlsl`等の既存の分離パターンに合わせて別ファイル化)を
+     実際に`dxc.exe -T cs_6_0 -E main`(`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`)
+     でコンパイルし、`vector_add_mul_chain.dxil`/`vector_sub_div_chain.dxil`
+     (実LLVM bitcode)を得た。`tools/compile-dxbc-shaders.ps1`に追記。
+  2. **`examples/dump_dxil.rs`で実際にFUNCTION_BLOCKをダンプして確認した
+     構造**(推測ではない、実バイト列): `Call`の個数は単一演算シェーダーと
+     全く同じ7個(`CreateHandle`x3+`ThreadId`x1+`BufferLoad`x2+
+     `BufferStore`x1)のままだった——**重要な発見**: HLSL側で`InputA[i]`を
+     2回参照しても、DXBC側で確認済みだったのと同じ共通部分式除去(CSE)が
+     LLVM側でも働き、2回目の`BufferLoad`は発行されず1回目の`ExtractValue`
+     結果が2つ目の`BinOp`のオペランドとしてそのまま再利用されていた。
+     `vector_add_mul_chain.dxil`の実フィールド値: `BinOp`1回目
+     `fields=[1,3,0,31]`(lhs相対値=1,rhs相対値=3,opcode=0=add) ->
+     `t = ExtractedBufferValue(u1) + ExtractedBufferValue(u0)`、`BinOp`2回目
+     `fields=[1,4,2,31]`(lhs相対値=1=直前のBinOp1の結果、rhs相対値=4=
+     1回目の`ExtractedBufferValue(u0)`、opcode=2=mul) -> `out = t * u0`——
+     HLSLの`t = InputA[i]+InputB[i]; Output[i] = t*InputA[i];`と完全一致。
+  3. **実装**(`crates/directx-shader-translate/src/dxil.rs`): 既存の
+     `resolve_dxil_calls_and_binop`(単一の`ResolvedDxilBinOp`しか保持でき
+     ない、複数BinOpに遭遇すると単純に上書きしてしまう設計)は変更せず、
+     並行する新規関数`resolve_dxil_calls_and_chain`を追加した(既存の単一
+     演算4シェーダー・既存テスト22件には無変更・無影響)。DXBC側の
+     `RegExpr`(`spirv_gen.rs`)をそのまま再利用——`RegExpr`/
+     `collect_loads`を`pub(crate)`化し、`emit_chain_spirv`本体を
+     `emit_chain_spirv_for_kernel(thread_group, root, write_uav)`という
+     DXBC固有の`ChainShape`型に依存しないパラメータのみを取る形へ切り出し
+     (`emit_spirv_for_kernel`が`emit_spirv_impl`から切り出されたのと同じ
+     パターン)、DXIL側からもそのまま呼べるようにした。`FUNCTION_BLOCK`を
+     走査しながら、各`BinOp`のオペランドを「`ExtractedBufferValue`由来の
+     `RegExpr::Load`」か「直前までのBinOp結果(`chain_exprs: HashMap<絶対
+     値インデックス, RegExpr>`に記録済み)」のいずれかとして解決し、
+     `RegExpr::BinOp`の木を組み立てる(単一演算版のような「2個目以降を
+     無条件に上書き」ではなく、正しく式木として蓄積する点が核心の変更)。
+     `translate_dxil_chain_to_spirv`(新設公開API)がこの式木+
+     `extract_numthreads_from_metadata`(既存、決め打ちではなく実際に
+     `METADATA_BLOCK`から抽出)+`emit_chain_spirv_for_kernel`を繋ぎ、DXBC側
+     `translate_chain_shader`と対になるDXIL版のエントリポイントとなる。
+  4. **正直な開示(このセクションのスコープ)**: 汎用N項チェーンデコーダ
+     ではない。実際に確認したのは2回の逐次BinOp(add+mul、sub+div)のみ
+     ——3回以上のチェーンは未検証(DXBC側`decode_chain_shape`の既存の
+     限定と同じ)。各BinOpのオペランドが「直前のBinOp結果」か
+     「`ExtractedBufferValue`」以外(例えば2つ前のBinOp結果を直接参照する
+     等)の形状は`DxilCallResolutionError::UnexpectedShape`で正直に拒否
+     する。境界チェック付きDXILチェーンは未検証。
+  5. **単体テスト**(実際に`cargo test -p directx-shader-translate --lib`
+     で確認、誇張なし、実出力そのまま):
+     ```
+     running 41 tests
+     test dxil::tests::resolves_real_dxc_compiled_add_mul_chain_dxil_into_matching_regexpr_tree ... ok
+     test dxil::tests::resolves_real_dxc_compiled_sub_div_chain_dxil_into_matching_regexpr_tree ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_handles_add_mul_and_sub_div_chains ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_also_accepts_the_pre_existing_single_op_vector_add_dxil ... ok
+     (既存37件含め) test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     `translate_dxil_chain_to_spirv_also_accepts_the_pre_existing_single_op_
+     vector_add_dxil`は、DXBC側`chain_translator_also_accepts_the_pre_
+     existing_single_op_vector_add_shader`と同じ設計方針(チェーン版は
+     排他的である必要はない、N=1の自明な場合として単一演算シェーダーも
+     受理できる)をDXIL側でも裏付けた。
+  6. **実機テスト2本を新規追加**(`tests/vector_add_mul_chain_dxil_real_
+     vulkan.rs`・`tests/vector_sub_div_chain_dxil_real_vulkan.rs`、既存の
+     DXBCチェーン実機テストと同じパターン)。実際に`cargo test --workspace
+     -- --nocapture`で確認した結果(誇張なし、実出力そのまま、NVIDIA
+     GeForce GT 730):
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0、2項演算2回のチェーン)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで式木を実解決)->実Vulkan経路が、CPU参照実装((a[i]+b[i])*a[i])と256要素すべてで数値一致した
+     c[0]=65, c[255]=708.875
+     test dxil_vector_add_mul_chain_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0、2項演算2回のチェーン sub+div)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで式木を実解決)->実Vulkan経路が、CPU参照実装((a[i]-b[i])/a[i])と256要素すべてで数値一致した
+     c[0]=-0.28000003, c[255]=0.99859154
+     test dxil_vector_sub_div_chain_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     ```
+     DXIL側の`c[0]`/`c[255]`はDXBC側の同名チェーンテスト
+     (`dxbc_vector_add_mul_chain_matches_cpu_reference_on_real_vulkan_
+     hardware`/`dxbc_vector_sub_div_chain_matches_cpu_reference_on_real_
+     vulkan_hardware`)と完全に同じ値になっている——同一の入力データ生成式・
+     同一の演算チェーンをDXBC/DXIL両経路で実行し、両方とも同じCPU参照実装
+     に一致することを実機で確認した(DXBC/DXILの実装が独立に同じ正しい
+     結果へ収束していることの追加的な裏付け)。
+  7. **ワークスペース全体の検証**: `cargo test --workspace -- --nocapture`
+     で全テスト(グラフィックス5本+DXBC Compute単一演算4本+DXBCチェーン
+     (add/mul, sub/div)2本+DXIL Compute単一演算4本+**DXILチェーン
+     (add/mul, sub/div)2本(新規)**、計17本の実機テスト+unittests多数)
+     すべてgreen、既存経路への回帰なし。`cargo build --workspace`/
+     `cargo clippy --workspace --all-targets`はいずれも警告0件。
+  - 次にすべきこと: (1) 3項以上のDXIL/DXBC両チェーンでの実シェーダー
+    検証(前々回エントリから継続)、(2) 境界チェック付きチェーン(DXBC側
+    `decode_chain_shape`ですら未対応)、(3) テクスチャサンプリング・
+    スワップチェーンへの拡張、(4) AMD/Intel・Linux/macOS実機検証、
+    (5) 各クレートの公開APIexample充足状況の棚卸し。
