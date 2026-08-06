@@ -1244,3 +1244,109 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     こと)、(3) テクスチャサンプリング・スワップチェーンへの拡張、
     (4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
     example充足状況の棚卸し。
+
+- **2026-08-06(続き) 直前エントリの次にすべきこと(2)を解消: DXIL側の
+  境界チェック付きチェーン対応を追加(DXBC側は2026-08-06の別エントリで
+  既に対応済み、DXIL側だけ`bounds_check=false`固定のまま残っていた
+  ギャップを埋めた)。ユーザー指示「open-directx、open-cuda、aruaru-llmの
+  連携性と実用性と完成度を高めて」の一環**:
+  1. **事前確認**: `git status`はクリーン、`git log`直近8件を確認し、
+     並行セッションの4項チェーン・境界チェックDXBC対応が両方とも
+     mainへ確定済みであることを確認してから着手した(直前エントリの
+     「次にすべきこと(2)」の指示通り)。
+  2. **新規シェーダー**: `shaders/vector_add_mul_chain_bounded_dxil.hlsl`
+     (`vector_add_mul_chain_bounded.hlsl`と同一契約、cbuffer(b0)の
+     `ElementCount`+`if (i < ElementCount) { t=a[i]+b[i]; c[i]=t*a[i]; }`)を
+     実`dxc.exe -T cs_6_0 -E main`でコンパイル
+     (`tools/compile-dxbc-shaders.ps1`に追記済み)。
+  3. **実バイト列を確認してから着手**(推測で実装しない、既存方針の継続):
+     `examples/dump_dxil`で実際にダンプした結果、境界チェック無しの
+     単一/チェーン系(`Call`7個)に対し、この境界チェック付きシェーダーは
+     `DeclareBlocks(3)`(基本ブロック3個、if/then/merge) -> `Call`
+     (CreateHandle)x4(UAV3本+cbuffer) -> `Call`(ThreadId) -> `Call`
+     (`dx.op.cbufferLoadLegacy.i32`、opcode=59、初出) -> `ExtractValue`
+     (ElementCount) -> `Cmp2`(`FUNC_CODE_INST_CMP2`、code=28、初出、
+     述語36=LLVM`ICMP_ULT`) -> `Br`(`FUNC_CODE_INST_BR`、code=11、初出、
+     3フィールド=条件分岐) -> `Call`(BufferLoad)x2 -> `ExtractValue`x2 ->
+     `BinOp`(add) -> `BinOp`(mul) -> `Call`(BufferStore) -> `Br`
+     (1フィールド=無条件分岐、mergeブロックへ) -> `Ret`という構造だった。
+     `Call`命令の合計は9個(既存の7個+cbuffer用CreateHandle+
+     cbufferLoadLegacy)。
+  4. **実装**(`crates/directx-shader-translate/src/dxil.rs`):
+     - `DxilInstruction`に`Cmp2 { fields }`(code=28)・`Br { fields }`
+       (code=11)を新規追加、`decode_function_instructions`でデコード。
+       既存の単一演算専用デコーダ`decode_vector_add_dxil_shape`側では
+       これらを想定外として正直に拒否するよう網羅性チェックを更新。
+     - `DxilValue`に`ConstantBufferLoadAggregate{cbuffer_range_id}`・
+       `ExtractedConstantBufferValue{cbuffer_range_id}`・`CmpResult`を
+       追加。`resolve_dxil_calls_and_chain`に`"dx.op.cbufferLoadLegacy.i32"`
+       呼び出しの解決(opcode=59検証、引数3個)、`ExtractValue`の
+       `ConstantBufferLoadAggregate`由来ケースへの対応、`Cmp2`
+       (述語ult=36の検証+オペランドが`ThreadIdResult`と
+       `ExtractedConstantBufferValue`の組であることの検証、額面通りの
+       順序を仮定せずどちらの順でも受け付ける)、`Br`(3フィールド=条件分岐
+       は直前に`icmp ult`があることだけ検証、1フィールド=無条件分岐)を
+       追加。
+     - `resolve_dxil_calls_and_chain`の戻り値を`(Vec<ResolvedDxilCall>,
+       DxilRegExpr)`から`(Vec<ResolvedDxilCall>, DxilRegExpr, bool)`
+       (第3要素が`bounds_check`)へ変更。Call数が7個(境界チェック無し)
+       または9個(境界チェック付き、かつcbuffer関連4フラグ全部揃う)の
+       いずれか以外、または個数とフラグの組み合わせが中途半端な場合は
+       `UnexpectedShape`で正直に拒否する(DXBC側`decode_chain_shape`の
+       `has_cbuffer != bounds_check`等と同じ設計方針)。
+     - `translate_dxil_chain_to_spirv`: 以前は`bounds_check=false`固定で
+       `emit_chain_spirv_for_kernel`(DXBC/DXIL共有の本体、2026-08-06の
+       別エントリで既に`bounds_check`パラメータ対応済み)を呼んでいたが、
+       `resolve_dxil_calls_and_chain`が返す実測値をそのまま渡すよう修正
+       (このシグネチャ拡張以外、`emit_chain_spirv_for_kernel`自体は
+       無改修——DXBC側が先に用意した境界チェックSPIR-V生成をDXIL側からも
+       再利用できた)。
+  5. **単体テスト追加**(`cargo test -p directx-shader-translate --lib`、
+     実際に確認、誇張なし):
+     ```
+     test dxil::tests::resolves_real_dxc_compiled_bounded_chain_dxil_and_detects_bounds_check ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_handles_bounded_chain ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_keeps_bounds_check_false_for_unbounded_chain ... ok
+     (既存47件含め) test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     3件目は「境界チェック無しの既存チェーンを渡しても`bounds_check`が
+     常にtrueに固定されていないか」の回帰防止(裏取り)。
+  6. **実機テスト新規追加**(`tests/vector_add_mul_chain_bounded_dxil_real_
+     vulkan.rs`、DXBC側`vector_add_mul_chain_bounded_real_vulkan.rs`と
+     同一パターン、ディスパッチ数320・論理要素数256で境界外64要素が
+     センチネル値のまま書き込まれないことを検証)。実際に
+     `cargo test --workspace -- --nocapture`で確認した結果(誇張なし、
+     実出力そのまま、NVIDIA GeForce GT 730):
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0、境界チェック付き2項演算チェーン)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで境界チェックも実解決)->実Vulkan経路が、CPU参照実装((a[i]+b[i])*a[i])と有効範囲256要素すべてで数値一致し、境界外の64要素はセンチネル値のまま(書き込まれなかった)ことを確認した
+     c[0]=81, c[255]=1132.875, c[319]=-1
+     test dxil_vector_add_mul_chain_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+     ```
+     DXBC側の同シェーダー(`vector_add_mul_chain_bounded_real_vulkan.rs`)
+     の出力`c[0]=81, c[255]=1132.875, c[319]=-1`と完全一致——同一契約の
+     シェーダーをDXBC/DXIL独立2経路で翻訳・実行し、両方とも同じ結果に
+     収束していることの追加的な裏付け(既存のチェーン系エントリと同じ
+     検証パターン)。
+  7. **ワークスペース全体の検証**: `cargo test --workspace -- --nocapture`
+     で全テスト(unittests 50件+実機テスト19本〈グラフィックス5本+DXBC
+     Compute単一演算4本+DXBCチェーン(add/mul, sub/div, 3項, 4項, 境界
+     チェック付き2項)5本+DXIL Compute単一演算4本+DXILチェーン(add/mul,
+     sub/div, 3項, 4項, **境界チェック付き2項、新規**)5本〉)すべてgreen、
+     既存経路への回帰なし。`cargo build --workspace`/`cargo clippy
+     --workspace --all-targets`はいずれも警告0件。
+  8. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **境界チェック付きチェーンは2項のみ検証済み**(DXBC側と同じ限定、
+       3項以上の境界チェック付きチェーンは未検証)。
+     - **`open-cuda`側のカーネル名ハードコード自体は解消していない**
+       (前回エントリから継続、`open-cuda`は変更しない方針)。
+     - `mul`のnegateフラグが立つケース、5項以上・複雑な順序組み合わせは
+       引き続き未検証(前回エントリから継続)。
+     - テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+       実機検証・各クレートのexample充足状況棚卸しは前回エントリから
+       変更なし(未着手のまま)。
+  - 次にすべきこと: (1) 境界チェック付きチェーンの3項以上への拡張
+    (DXBC/DXIL両方とも未検証)、(2) 5項以上・今回未検証の順序組み合わせ
+    (`div`が先頭に来る等)、(3) テクスチャサンプリング・スワップチェーンへの
+    拡張、(4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
+    example充足状況の棚卸し。

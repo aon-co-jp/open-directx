@@ -100,3 +100,8 @@ Write-Host "OK: compiled vector_add_mul_div_chain3_dxil.hlsl -> vector_add_mul_d
 # 4項・かつsub先頭の順序でも無改修で動くかの検証用)。
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxil")
 Write-Host "OK: compiled vector_sub_div_add_mul_chain4_dxil.hlsl -> vector_sub_div_add_mul_chain4.dxil (DXIL, SM6.0, 4 sequential ops sub->div->add->mul)"
+# 2026-08-06: 境界チェック付き2項演算チェーンのDXIL版(DXBC側
+# vector_add_mul_chain_bounded.hlslと同一契約、resolve_dxil_calls_and_chainへ
+# 境界チェック検出ロジックを追加するための検証用)。
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_chain_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_chain_bounded.dxil")
+Write-Host "OK: compiled vector_add_mul_chain_bounded_dxil.hlsl -> vector_add_mul_chain_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 2-op chain)"

@@ -189,6 +189,15 @@ pub enum DxilInstruction {
     /// `FUNC_CODE_INST_EXTRACTVAL`(26): 集約値(構造体)からの要素抽出
     /// (`BufferLoad`が返す構造体から`.x`を取り出す等に使われる)。
     ExtractValue { fields: Vec<u64> },
+    /// `FUNC_CODE_INST_CMP2`(28): 比較命令(境界チェック`i < ElementCount`の
+    /// `icmp ult`がこれに乗る)。`fields`は生の(lhs相対値, rhs相対値,
+    /// 述語コード)をそのまま保持する(2026-08-06、境界チェック付きチェーンの
+    /// DXIL対応で新規追加)。
+    Cmp2 { fields: Vec<u64> },
+    /// `FUNC_CODE_INST_BR`(11): 分岐。条件分岐(`if`)は3フィールド
+    /// (true_bb, false_bb, cond相対値)、無条件分岐(`endif`直前のマージ)は
+    /// 1フィールド(target_bb)で区別する(2026-08-06新規追加)。
+    Br { fields: Vec<u64> },
     /// 上記以外の既知/未知コード。
     Other { code: u64, fields: Vec<u64> },
 }
@@ -264,7 +273,9 @@ pub fn decode_function_instructions(function_block: &Block) -> Vec<DxilInstructi
             1 => DxilInstruction::DeclareBlocks { basic_block_count: fields.first().copied().unwrap_or(0) },
             2 => DxilInstruction::BinOp { fields },
             10 => DxilInstruction::Ret,
+            11 => DxilInstruction::Br { fields },
             26 => DxilInstruction::ExtractValue { fields },
+            28 => DxilInstruction::Cmp2 { fields },
             34 => DxilInstruction::Call { fields },
             other => DxilInstruction::Other { code: other, fields },
         };
@@ -365,9 +376,16 @@ pub fn decode_vector_add_dxil_shape(
             DxilInstruction::Ret => {
                 // Retは最後の1つのみ許容(下のfor後のチェックで保証)。
             }
-            DxilInstruction::Other { .. } | DxilInstruction::DeclareBlocks { .. } => {
+            DxilInstruction::Other { .. }
+            | DxilInstruction::DeclareBlocks { .. }
+            | DxilInstruction::Cmp2 { .. }
+            | DxilInstruction::Br { .. } => {
                 // DeclareBlocksは先頭で既に消費済みのはずなので、ここに
-                // 再度現れるのは想定外の形状。
+                // 再度現れるのは想定外の形状。Cmp2/Br(2026-08-06新規)は
+                // 境界チェック付きシェーダー専用命令であり、この単一演算
+                // 専用の狭いデコーダ(`decode_vector_add_dxil_shape`)は
+                // 境界チェック無しシェーダーしか対象にしないため、ここでも
+                // 想定外として正直に拒否する。
                 return Err(DxilShapeError::UnexpectedInstructionShape);
             }
         }
@@ -491,6 +509,15 @@ enum DxilValue {
     ExtractedBufferValue { source_range_id: i64 },
     /// `BinOp`(このシェーダーでは`fadd`のみ想定)の結果。
     BinOpResult,
+    /// `dx.op.cbufferLoadLegacy.i32`呼び出しの戻り値(集約値、境界チェック
+    /// 付きチェーン専用、2026-08-06新規)。`cbuffer_range_id`は読み出し元
+    /// 定数バッファハンドルの`range_id`。
+    ConstantBufferLoadAggregate { cbuffer_range_id: i64 },
+    /// `ConstantBufferLoadAggregate`から`ExtractValue`で取り出した実際の
+    /// i32値(`ElementCount`本体)。
+    ExtractedConstantBufferValue { cbuffer_range_id: i64 },
+    /// `icmp ult`(`FUNC_CODE_INST_CMP2`)の結果(境界チェック付きチェーン専用)。
+    CmpResult,
     /// 上記以外(意味解決していない値、もしくは型設定専用レコード等)。
     Other,
 }
@@ -926,7 +953,7 @@ type DxilRegExpr = crate::spirv_gen::RegExpr;
 /// が1段だけの木として正しく解決できる(排他的である必要はない、DXBC側の
 /// `chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader`
 /// と同じ設計)。
-pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, DxilRegExpr), DxilCallResolutionError> {
+pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, DxilRegExpr, bool), DxilCallResolutionError> {
     let containers = dxbc::scan_dxbc(bytes);
     let container = containers.into_iter().next().ok_or_else(|| DxilCallResolutionError::MissingBlock("DXBC container".to_string()))?;
     let dxil_chunk = container
@@ -959,6 +986,14 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
     // 組み立てられるため、BinOp結果だけを記録すれば足りる。
     let mut chain_exprs: HashMap<usize, DxilRegExpr> = HashMap::new();
     let mut last_chain_expr: Option<DxilRegExpr> = None;
+    // 境界チェック付きチェーン(2026-08-06新規)検出用フラグ。DXBC側
+    // `decode_chain_shape`の`has_cbuffer`/`saw_ult`/`saw_if`/`saw_endif`と
+    // 同じ役割——4つ全部揃った場合のみ`bounds_check=true`とする(部分的にしか
+    // 揃わない中途半端な形は正直に拒否する)。
+    let mut saw_cbuffer_load = false;
+    let mut saw_ult_cmp = false;
+    let mut saw_conditional_br = false;
+    let mut saw_unconditional_br = false;
 
     for el in &function_block.elements {
         if let Some(sub) = el.as_block() {
@@ -1075,22 +1110,103 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
                         }
                         resolved_calls.push(ResolvedDxilCall::BufferStore { handle_range_id: range_id });
                     }
+                    "dx.op.cbufferLoadLegacy.i32" => {
+                        // 境界チェック付きチェーン専用(2026-08-06新規)。実バイト列
+                        // (`vector_add_mul_chain_bounded.dxil`)では引数3個
+                        // ([opcode, handle, regIndex])だった(`examples/dump_dxil`で
+                        // 実際にダンプして確認、推測ではない)。
+                        if resolved_args.len() != 3 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(59) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 59, opcode));
+                        }
+                        let cbuffer_range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        saw_cbuffer_load = true;
+                        resolved_calls.push(ResolvedDxilCall::CreateHandle { range_id: cbuffer_range_id });
+                        values.push(DxilValue::ConstantBufferLoadAggregate { cbuffer_range_id });
+                    }
                     other => {
                         return Err(DxilCallResolutionError::UnknownCallee(Some(other.to_string())));
                     }
                 }
             }
             26 => {
-                // FUNC_CODE_INST_EXTRACTVAL
+                // FUNC_CODE_INST_EXTRACTVAL: BufferLoadの集約値だけでなく、
+                // 境界チェック付きチェーンでは`ConstantBufferLoadAggregate`
+                // (`ElementCount`)からの抽出も同じ命令コードで来る
+                // (2026-08-06、実バイト列で確認)。
                 let current_value_no = values.len();
                 let agg_relative = *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("ExtractValueにオペランドが無い".to_string()))?;
                 let index0 = fields.get(1).copied().unwrap_or(u64::MAX);
                 let aggregate = resolve_relative(&values, current_value_no, agg_relative);
-                let source_range_id = match aggregate {
-                    Some(DxilValue::BufferLoadAggregate { source_range_id }) if index0 == 0 => *source_range_id,
+                match aggregate {
+                    Some(DxilValue::BufferLoadAggregate { source_range_id }) if index0 == 0 => {
+                        let source_range_id = *source_range_id;
+                        values.push(DxilValue::ExtractedBufferValue { source_range_id });
+                    }
+                    Some(DxilValue::ConstantBufferLoadAggregate { cbuffer_range_id }) if index0 == 0 => {
+                        let cbuffer_range_id = *cbuffer_range_id;
+                        values.push(DxilValue::ExtractedConstantBufferValue { cbuffer_range_id });
+                    }
                     _ => return Err(DxilCallResolutionError::ExtractValueNotFromBufferLoad),
-                };
-                values.push(DxilValue::ExtractedBufferValue { source_range_id });
+                }
+            }
+            28 => {
+                // FUNC_CODE_INST_CMP2: [lhs_relative, rhs_relative, predicate]。
+                // 境界チェック(`i < ElementCount`)は`icmp ult`(述語コード36、
+                // LLVM `CmpInst::ICMP_ULT`)としてエンコードされる(実バイト列で
+                // 確認済み、Web検索でLLVM `CmpInst::Predicate`列挙体の値とも
+                // 一致することを裏取り)。2つのオペランドは順不同で
+                // `ThreadIdResult`と`ExtractedConstantBufferValue`が1つずつ
+                // 揃っていることだけを検証する(額面通りの順序を仮定しない、
+                // このプロジェクトの既存教訓を踏襲)。
+                let current_value_no = values.len();
+                let lhs_relative =
+                    *fields.first().ok_or_else(|| DxilCallResolutionError::UnexpectedShape("Cmp2にオペランドが無い".to_string()))?;
+                let rhs_relative =
+                    *fields.get(1).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("Cmp2に2つ目のオペランドが無い".to_string()))?;
+                let predicate = *fields.get(2).ok_or_else(|| DxilCallResolutionError::UnexpectedShape("Cmp2に述語コードが無い".to_string()))?;
+                if predicate != 36 {
+                    return Err(DxilCallResolutionError::UnexpectedShape(format!(
+                        "境界チェックのCmp2は述語ult(36)のみ対応(実際={predicate})"
+                    )));
+                }
+                let lhs = resolve_relative(&values, current_value_no, lhs_relative);
+                let rhs = resolve_relative(&values, current_value_no, rhs_relative);
+                let has_thread_id = matches!(lhs, Some(DxilValue::ThreadIdResult)) || matches!(rhs, Some(DxilValue::ThreadIdResult));
+                let has_element_count =
+                    matches!(lhs, Some(DxilValue::ExtractedConstantBufferValue { .. })) || matches!(rhs, Some(DxilValue::ExtractedConstantBufferValue { .. }));
+                if !has_thread_id || !has_element_count {
+                    return Err(DxilCallResolutionError::UnexpectedShape(
+                        "境界チェックのCmp2オペランドがThreadId/ElementCountの組ではない".to_string(),
+                    ));
+                }
+                saw_ult_cmp = true;
+                values.push(DxilValue::CmpResult);
+            }
+            11 => {
+                // FUNC_CODE_INST_BR: 3フィールド=条件分岐(if)、1フィールド=
+                // 無条件分岐(endif直前のマージ)。既存方針通り、CFGそのものは
+                // 構築せず「境界チェックの形が揃っているか」の検出にのみ使う。
+                match fields.len() {
+                    3 => {
+                        if !saw_ult_cmp {
+                            return Err(DxilCallResolutionError::UnexpectedShape("条件分岐の前にicmp ultが無い".to_string()));
+                        }
+                        saw_conditional_br = true;
+                    }
+                    1 => {
+                        saw_unconditional_br = true;
+                    }
+                    other => {
+                        return Err(DxilCallResolutionError::UnexpectedShape(format!("Br命令のフィールド数が想定外({other})")));
+                    }
+                }
             }
             2 => {
                 // FUNC_CODE_INST_BINOP: [lhs_relative, rhs_relative, opcode, flags]。
@@ -1144,11 +1260,25 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
         }
     }
 
-    if resolved_calls.len() != 7 {
-        return Err(DxilCallResolutionError::UnexpectedShape(format!("Call命令は7個を期待したが実際は{}個", resolved_calls.len())));
-    }
+    // 境界チェック無し: Call 7個(CreateHandle x3 + ThreadId + BufferLoad x2 +
+    // BufferStore)。境界チェック付き: Call 9個(上記+cbuffer用CreateHandle
+    // 1個+cbufferLoadLegacy 1個、実バイト列`vector_add_mul_chain_bounded.dxil`
+    // で確認済み)。それ以外の個数、または個数と境界チェック関連フラグの
+    // 組み合わせが中途半端な場合は正直に拒否する(DXBC側`decode_chain_shape`
+    // の`has_cbuffer != bounds_check`等と同じ設計)。
+    let bounds_check_flags_all_set = saw_cbuffer_load && saw_ult_cmp && saw_conditional_br && saw_unconditional_br;
+    let bounds_check_flags_none_set = !saw_cbuffer_load && !saw_ult_cmp && !saw_conditional_br && !saw_unconditional_br;
+    let bounds_check = match resolved_calls.len() {
+        7 if bounds_check_flags_none_set => false,
+        9 if bounds_check_flags_all_set => true,
+        n => {
+            return Err(DxilCallResolutionError::UnexpectedShape(format!(
+                "Call命令は7個(境界チェック無し)または9個(境界チェック付き)を期待したが実際は{n}個(境界チェック関連フラグが中途半端な可能性もある)"
+            )));
+        }
+    };
     let root = last_chain_expr.ok_or(DxilCallResolutionError::MissingBinOp)?;
-    Ok((resolved_calls, root))
+    Ok((resolved_calls, root, bounds_check))
 }
 
 /// [`resolve_dxil_calls_and_chain`]が組み立てた式木から、DXBC側の
@@ -1168,7 +1298,7 @@ pub enum DxilChainSpirvError {
 /// [`crate::spirv_gen::ChainTranslatedKernel`]のDXIL版。読み込みUAVが
 /// N本(N>=1)になり得るため、DXBC側と同じ形の型をそのまま使う。
 pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::ChainTranslatedKernel, DxilChainSpirvError> {
-    let (calls, root) = resolve_dxil_calls_and_chain(bytes)?;
+    let (calls, root, bounds_check) = resolve_dxil_calls_and_chain(bytes)?;
 
     let mut buffer_store: Option<i64> = None;
     for call in &calls {
@@ -1182,11 +1312,11 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
     crate::spirv_gen::collect_loads(&root, &mut read_uav_bind_points);
 
     let local_size = extract_numthreads_from_metadata(bytes)?;
-    // DXIL側のチェーン解決(`resolve_dxil_calls_and_chain`)は境界チェック
-    // (ult/if/endif相当)を検出しないため、常に`bounds_check=false`を渡す
-    // (2026-08-06、DXBC側`decode_chain_shape`への境界チェック対応追加に伴う
-    // シグネチャ変更、DXIL側の挙動自体は無変更)。
-    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav, false);
+    // 2026-08-06: DXIL側でも境界チェック(cbuffer+icmp ult+条件分岐+
+    // 無条件分岐)を実際に検出できるようになったため、DXBC側と同様
+    // `resolve_dxil_calls_and_chain`が返す実測値をそのまま渡す
+    // (以前は常に`false`固定だった)。
+    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav, bounds_check);
 
     Ok(crate::spirv_gen::ChainTranslatedKernel {
         spirv_words,
@@ -1194,7 +1324,7 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
         local_size,
         read_uav_bind_points,
         write_uav_bind_point: write_uav,
-        bounds_check: false,
+        bounds_check,
     })
 }
 
@@ -1889,7 +2019,7 @@ mod tests {
     /// (add, u1+u0)、BinOp2=`fields=[1,4,2,31]`(mul, 直前の結果*u0)と一致)。
     #[test]
     fn resolves_real_dxc_compiled_add_mul_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_DXIL)
+        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_DXIL)
             .expect("real dxc-compiled vector_add_mul_chain.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, same call count as the single-op shape");
         match &root {
@@ -1904,7 +2034,7 @@ mod tests {
     /// 同上、sub/divチェーン(`(a-b)/a`)版。
     #[test]
     fn resolves_real_dxc_compiled_sub_div_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_CHAIN_DXIL)
+        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_CHAIN_DXIL)
             .expect("real dxc-compiled vector_sub_div_chain.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7);
         match &root {
@@ -1947,7 +2077,7 @@ mod tests {
 
     #[test]
     fn resolves_real_dxc_compiled_3op_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
+        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
             .expect("real dxc-compiled vector_add_mul_div_chain3.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, unchanged by adding a 3rd op");
         // 期待する木: Div(Mul(Add(Load,Load), Load), Load) == (a+b)*a/b
@@ -2005,7 +2135,7 @@ mod tests {
 
     #[test]
     fn resolves_real_dxc_compiled_4op_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
+        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
             .expect("real dxc-compiled vector_sub_div_add_mul_chain4.dxil must resolve into a chain RegExpr");
         assert_eq!(
             calls.len(),
@@ -2063,6 +2193,56 @@ mod tests {
         assert_eq!(kernel.local_size, (64, 1, 1));
         assert_eq!(kernel.write_uav_bind_point, 2);
         assert_eq!(kernel.read_uav_bind_points.len(), 2);
+    }
+
+    /// `vector_add_mul_chain_bounded_dxil.hlsl`の実dxc.exe出力(SM6.0)。
+    /// DXBC側`vector_add_mul_chain_bounded.dxbc`と同一契約(cbuffer(b0)の
+    /// `ElementCount`+`if (i < ElementCount) { t=a+b; c=t*a; }`)。DXIL側の
+    /// 境界チェック検出(`resolve_dxil_calls_and_chain`への
+    /// cbufferLoadLegacy/Cmp2/Br対応、2026-08-06新規)を検証するための
+    /// 実バイト列。
+    const VECTOR_ADD_MUL_CHAIN_BOUNDED_DXIL: &[u8] = include_bytes!("../shaders/vector_add_mul_chain_bounded.dxil");
+
+    /// `examples/dump_dxil`で実際にダンプして確認したFUNCTION_BLOCK構造
+    /// (推測ではない、`vector_add_mul_chain_bounded.dxil`):
+    /// `DeclareBlocks(3)` -> `CONSTANTS_BLOCK` -> `Call`(CreateHandle)x4
+    /// (u0/u1/u2 + cbuffer b0) -> `Call`(ThreadId) ->
+    /// `Call`(cbufferLoadLegacy) -> `ExtractValue`(ElementCount) ->
+    /// `Cmp2`(icmp ult, 述語36) -> `Br`(条件分岐、3フィールド) ->
+    /// `Call`(BufferLoad)x2 -> `ExtractValue`x2 -> `BinOp`(add) ->
+    /// `BinOp`(mul) -> `Call`(BufferStore) -> `Br`(無条件、1フィールド) ->
+    /// `Ret`。Call命令は合計9個(境界チェック無しの7個+cbuffer用
+    /// CreateHandle+cbufferLoadLegacy)。
+    #[test]
+    fn resolves_real_dxc_compiled_bounded_chain_dxil_and_detects_bounds_check() {
+        let (calls, root, bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_BOUNDED_DXIL)
+            .expect("real dxc-compiled vector_add_mul_chain_bounded.dxil must resolve");
+        assert_eq!(calls.len(), 9, "CreateHandle x4(3 UAV + cbuffer) + ThreadId + cbufferLoadLegacy + BufferLoad x2 + BufferStore");
+        assert!(bounds_check, "cbuffer+icmp ult+条件分岐+無条件分岐が実際に揃っているシェーダーなのでtrueのはず");
+        // 演算内容自体(t=a+b; c=t*a)は既存の境界チェック無しチェーンと同じ
+        // 式木の形になるはず(Mul(Add(Load,Load), Load))。
+        assert!(matches!(&root, DxilRegExpr::BinOp(crate::BinaryOp::Mul, _, _)), "outermost op must be mul, got {root:?}");
+    }
+
+    #[test]
+    fn translate_dxil_chain_to_spirv_handles_bounded_chain() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_MUL_CHAIN_BOUNDED_DXIL)
+            .expect("vector_add_mul_chain_bounded.dxil must translate to SPIR-V");
+        assert_eq!(kernel.local_size, (64, 1, 1), "numthreads must be extracted, not hardcoded");
+        assert_eq!(kernel.write_uav_bind_point, 2, "write UAV bind point must resolve to u2");
+        assert_eq!(kernel.read_uav_bind_points.len(), 3, "add+mul chain must reference 3 loads total (N+1 rule, N=2)");
+        assert!(kernel.bounds_check, "bounds_check flag must propagate through to the emitted kernel");
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    /// 境界チェック無しの既存チェーン(`vector_add_mul_chain.dxil`)を渡した
+    /// 場合は`bounds_check=false`のままであることも確認する(回帰防止、
+    /// 「常にtrueを返すようになっていないか」の裏取り)。
+    #[test]
+    fn translate_dxil_chain_to_spirv_keeps_bounds_check_false_for_unbounded_chain() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_MUL_CHAIN_DXIL)
+            .expect("vector_add_mul_chain.dxil (no bounds check) must still translate to SPIR-V");
+        assert!(!kernel.bounds_check, "vector_add_mul_chain.dxilには境界チェックが無い");
     }
 
     #[test]
