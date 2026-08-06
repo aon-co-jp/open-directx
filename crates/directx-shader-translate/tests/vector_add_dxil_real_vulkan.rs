@@ -14,6 +14,7 @@
 //! `eprintln!`してスキップする(fakeな成功にしない)。
 
 use directx_shader_translate::translate_dxil_vector_add_to_spirv;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -85,7 +86,7 @@ fn dxil_vector_add_matches_cpu_reference_on_real_vulkan_hardware() {
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect();
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(

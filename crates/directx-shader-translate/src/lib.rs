@@ -30,6 +30,27 @@ pub use spirv_gen::{
     translate_shader, translate_vector_add_shader, BinaryOp, SpirvGenError, TranslatedKernel,
 };
 
+/// `open-cuda`の`opencuda-vulkan::VulkanDevice::launch_kernel`が実際に受理する
+/// カーネル名(2026-08-06、連携性改善——12箇所の実機テストに個別コメントとして
+/// 重複していた同じ注記を1箇所へ集約)。
+///
+/// **正直な開示(既知の相互運用上の齟齬、`open-cuda`側は変更しない方針)**:
+/// `launch_kernel`はカーネル名文字列で引数配線(3ストレージバッファ+
+/// push constant 1個のuint)を決める実装であり、実際に認識するのは
+/// `"vector_add"`/`"vector_add_f32"`/`"matmul"`/`"matmul_f32"`/
+/// `"raid6_xor_parity"`/`"raid6_q_parity"`のみ(`../open-cuda/crates/
+/// opencuda-vulkan/src/real.rs`の`launch_kernel`実装で確認済み)。本クレートが
+/// 生成するmul/sub/div/チェーン等の演算バリエーションは、いずれも
+/// `"vector_add"`と全く同じ引数配線(3バッファ+push constant 1個)を要求
+/// するSPIR-Vを生成するため、`CompiledKernel::spirv(...)`のカーネル名には
+/// **実行する演算に関わらず**この定数を渡す(実行される演算はSPIR-Vバイト列
+/// 自体で決まり、この名前文字列では変わらない)。`open-cuda`側のこの
+/// ハードコードされた名前ディスパッチ自体は本プロジェクトの担当範囲外
+/// (`open-cuda`は変更しない方針)のため、この定数はあくまで
+/// open-directx側での重複コメントを1箇所に集約する緩和策であり、
+/// 齟齬そのものの解消ではない。
+pub const OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME: &str = "vector_add";
+
 #[derive(Debug, Error)]
 pub enum TranslateError {
     #[error("DXBCコンテナの解析に失敗した: {0}")]

@@ -1023,3 +1023,224 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     (3) テクスチャサンプリング・スワップチェーンへの拡張、
     (4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
     example充足状況の棚卸し。
+
+- **2026-08-06 直前エントリの次にすべきこと(2)を解消: DXBC Computeチェーン
+  クラス(`decode_chain_shape`)へ境界チェック(`dcl_constantbuffer`/`ult`/
+  `if`/`endif`)対応を追加。あわせて`open-cuda`との連携性改善(カーネル名
+  ハードコード問題の重複コメントを1箇所へ集約)を実施(ユーザー指示
+  「open-directx、open-cuda、aruaru-llmの連携性と実用性と完成度を高めて」)。
+  作業中、同一リポジトリを対象とする別セッション(4個の逐次2項演算
+  `vector_sub_div_add_mul_chain4`シリーズ)が並行して稼働中であることが
+  `git status`のuntracked file・編集中ファイルの内容変化から判明し、
+  以下の作業はそのファイル群(`vector_sub_div_add_mul_chain4*`)には触れず
+  進めた(詳細は5参照)**:
+  1. **事前確認**: `../open-cuda/crates/opencuda-vulkan/src/real.rs`の
+     `launch_kernel`実装を再確認し、カーネル名で引数配線を決める既知の齟齬
+     (`"vector_add"`/`"vector_add_f32"`/`"matmul"`/`"matmul_f32"`/
+     `"raid6_xor_parity"`/`"raid6_q_parity"`のみ認識)に変更が無いことを
+     確認した(`open-cuda`側は今回も変更しない方針を継続)。`aruaru-llm`は
+     過去の調査結果通り直接の技術的依存関係が無いことも再確認(CLAUDE.md/
+     README.mdを読んだ範囲でopencuda-vulkan/opencuda-core/open-directxへの
+     直接依存は見当たらない)。
+  2. **連携性改善(open-cuda側齟齬の緩和、open-directx側でできる範囲)**:
+     `crates/directx-shader-translate/src/lib.rs`に
+     `pub const OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME: &str = "vector_add"`
+     を新設し、上記の齟齬に関する説明を1箇所に集約した。これまで
+     `tests/*.rs`の13ファイルに個別にハードコードされていた
+     `"vector_add"`リテラル+重複した説明コメントを、この定数の参照へ
+     置き換えた(`vector_sub_div_add_mul_chain4*`の2ファイルは前述の並行
+     セッションの作業中ファイルのため意図的に対象外とした)。`open-cuda`
+     側のコードは一切変更していない——齟齬そのものの解消ではなく、
+     open-directx側での重複を減らす緩和策である点を正直に開示する。
+  3. **実用性改善(境界チェック付きチェーン、DXBC側)**: 新規シェーダー
+     `shaders/vector_add_mul_chain_bounded.hlsl`(`if (i < N) { t = A[i]+B[i];
+     Out[i] = t*A[i]; }`、UAV3本)を実際に`fxc.exe /T cs_5_0`でコンパイルし、
+     `examples/dump_shex`で実SHEX命令列をダンプして確認した(推測実装
+     ではない): `dcl_globalFlags` -> `dcl_constantbuffer`(b0) ->
+     `dcl_uav_structured`x3 -> `dcl_input`(vThreadID) -> `dcl_temps`(1) ->
+     `dcl_thread_group` -> `ult` -> `if` -> `ld_structured`x2 -> `add` ->
+     `mul` -> `store_structured` -> `endif` -> `ret`、という構成——既存クラス
+     側`decode_shader_shape`の境界チェック規約(cbuffer b0+ult+if+endifが
+     全部揃うか全く無いか)と全く同じ規約がチェーンクラス側でも成立する
+     ことを実バイト列で確認した。
+  4. **実装**(`crates/directx-shader-translate/src/spirv_gen.rs`):
+     `ChainShape`に`bounds_check: bool`フィールドを追加、`decode_chain_shape`
+     に`DclConstantBuffer`/`Opcode::ULt`/`If`/`EndIf`の処理を既存クラス側と
+     同じ規約で追加(既存のadd/mul/sub/div検出ロジックは無変更)。
+     `ChainTranslatedKernel`に`bounds_check: bool`を追加。
+     `emit_chain_spirv_for_kernel`(DXIL側`dxil.rs`とも共有する本体)に
+     `bounds_check: bool`パラメータを追加し、真の場合は既存クラス側
+     `emit_spirv_impl`と全く同じpush constant`Params{uint n}`+
+     `OpSelectionMerge`/`OpBranchConditional`で`id.x < n`を実際にゲートする
+     ようにした。DXIL側(`dxil.rs`)の呼び出しは境界チェック検出ロジックを
+     持たないため、シグネチャ変更に伴い明示的に`bounds_check=false`を渡す
+     よう更新(DXIL側の挙動自体は無変更、次にすべきことに残す)。
+  5. **並行セッションとの整合性**: 作業中に`cargo build`が一時的に
+     ビルドディレクトリのファイルロック待ちになったことや、他セッションの
+     `dxil::tests::resolves_real_dxc_compiled_4op_chain_dxil_into_matching_
+     regexpr_tree`/`translate_dxil_chain_to_spirv_handles_4op_chain`が
+     一時的に失敗した状態を実際に観測した(このパスでの変更が原因ではない
+     ことを`git diff`で確認済み——該当コードは`dxil.rs`の別関数で自分は
+     触っていない)。最終的な`cargo test --workspace`実行時にはこれらは
+     解消されており(並行セッション側が完了させたと推測される)全green
+     だった。
+  6. **実際に`cargo test --workspace -- --nocapture`で確認した結果
+     (誇張なし、実出力そのまま、NVIDIA GeForce GT 730)**:
+     ```
+     test spirv_gen::tests::translates_real_fxc_compiled_bounded_chain_dxbc_to_valid_spirv_with_bounds_check_flag_set ... ok
+     ...
+     test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+
+     test dxbc_vector_add_mul_chain_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+     test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+     ```
+     新規実機テスト`tests/vector_add_mul_chain_bounded_real_vulkan.rs`は
+     `vector_sub_bounded_real_vulkan.rs`と同じ検証パターン(ディスパッチ数
+     320・論理要素数256、境界外64要素がセンチネル値`-1.0`のまま書き込まれ
+     ないことを確認)で実行し、標準出力は
+     `c[0]=81, c[255]=1132.875, c[319]=-1`——有効範囲全てが
+     `(a[i]+b[i])*a[i]`のCPU参照実装と一致し、境界外はセンチネルのまま
+     だった。ワークスペース全体(グラフィックス5本+DXBC Compute単一演算
+     4本+DXBCチェーン(add/mul, sub/div, 3項, **境界チェック付き2項、
+     新規**)4本+DXIL Compute単一演算4本+DXILチェーン(add/mul, sub/div,
+     3項, 4項〈並行セッション側〉)4本、計17本の実機テスト+unittests 47件)
+     すべてgreen、既存経路への回帰なし。`cargo build --workspace`/
+     `cargo clippy --workspace --all-targets`はいずれも警告0件。
+  7. **正直な開示・まだやっていないこと(誇張しない)**:
+     - **DXIL側の境界チェック対応は未着手**(`resolve_dxil_calls_and_chain`
+       は`ult`/`if`/`endif`相当の検出ロジックを持たない、
+       `emit_chain_spirv_for_kernel`は`bounds_check=false`固定で呼ばれる)。
+     - **`open-cuda`側のカーネル名ハードコード自体は解消していない**
+       (指示通り`open-cuda`は変更しない方針、今回の対応はopen-directx側の
+       重複コメントの集約に留まる緩和策)。
+     - `mul`のnegateフラグが立つケース(2026-07-27付エントリから継続)、
+       4項以上・複雑な順序組み合わせでの境界チェック付きチェーンの検証
+       (今回は2項のみ)は未検証のまま。
+     - テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+       実機検証・各クレートのexample充足状況棚卸しは前回エントリから
+       変更なし(未着手のまま)。
+  - 次にすべきこと: (1) DXIL側の境界チェック対応
+    (`resolve_dxil_calls_and_chain`への`ult`/`if`/`endif`相当の検出ロジック
+    追加、DXBC側`decode_chain_shape`の今回の拡張と対になる)、(2) 境界
+    チェック付きチェーンの3項以上への拡張、(3) テクスチャサンプリング・
+    スワップチェーンへの拡張、(4) AMD/Intel・Linux/macOS実機検証、
+    (5) 各クレートの公開APIexample充足状況の棚卸し。
+
+- **2026-08-06 直前エントリの次にすべきこと(1)を解消: 4個の逐次2項演算、
+  かつ`sub`が先頭に来る新しい順序(`sub->div->add->mul`)での実シェーダー
+  検証をDXBC/DXIL両方で実施(実バイト列確認→テスト実行の順、コード変更は
+  0行)**:
+  1. **新規シェーダー2本**(既存のチェーン群と同じUAV3本・InputA/InputB
+     多重参照パターン、演算を4回・sub先頭の順序へ拡張): `shaders/
+     vector_sub_div_add_mul_chain4.hlsl`(`t1=InputA[i]-InputB[i];
+     t2=t1/InputA[i]; t3=t2+InputB[i]; Output[i]=t3*InputA[i];`、
+     `fxc.exe /T cs_5_0`で実コンパイル)・`shaders/
+     vector_sub_div_add_mul_chain4_dxil.hlsl`(同一契約、`dxc.exe -T
+     cs_6_0`で実コンパイル)。`tools/compile-dxbc-shaders.ps1`に両方追記済み
+     (このスクリプトは同時に別セッションが`vector_add_mul_chain_bounded`
+     向けの行を追記していたため、`git diff --stat`で自分の追記行が
+     壊れていないことを確認した上で進めた)。
+  2. **既存方針の継続(実バイト列を確認してから着手)**:
+     - **DXBC側**: `examples/dump_shex`で実SHEX命令列をダンプした結果、
+       `ld_structured`x2 -> `Add`(第1オペランドに`negate`フラグが立った
+       negated-add=既存の「sub最適化」規約通り、dest=temp.w) ->
+       `Div`(dest=temp.w、さらに上書き) -> `Add`(dest=temp.x) ->
+       `Mul`(dest=temp.x)という、一時レジスタのコンポーネントを使い回す
+       reg_map更新パターンが4回連続で続く形だった。既存の
+       `decode_chain_shape`(`spirv_gen.rs`)は`negate`フラグを`Add`のみで
+       「sub最適化」として解釈する既存分岐で、この4項目チェーンでも
+       追加のコード変更なしに正しく`Sub`へ変換した。
+     - **DXIL側**: `examples/dump_dxil`で`FUNCTION_BLOCK`をダンプした結果、
+       `Call`(code=34)は既存の単一/2項/3項チェーンと変わらず**7個のまま**、
+       `ExtractValue`(code=26)が2個、**`BinOp`(code=2)が4回連続で出現**
+       (`fields=[3,1,1,31]`(sub、第1オペランドが`negate`ではなく
+       別のBinOp種別コード自体がSubを直接表す形——チェーン3項までの
+       add最適化パターンとは異なり、`sub`がチェーンの先頭に来る場合は
+       LLVM側がnegated-addへ変換せず素直にSub命令を出す実装だった)
+       -> `fields=[1,4,4,31]`(div) -> `fields=[3,1,0,31]`(add) ->
+       `fields=[1,6,2,31]`(mul))という構造だった。`resolve_dxil_calls_and_
+       chain`(`dxil.rs`)はこの4項目・かつSub直接コードの形にも変更なしで
+       対応できた。
+  3. **実装(コード変更は0行、確認のみ)**: DXBC側`decode_chain_shape`・
+     DXIL側`resolve_dxil_calls_and_chain`のいずれも、命令列を1つずつ走査
+     して`reg_map`/`chain_exprs`を更新するという既存の一般ロジックのまま、
+     4項・かつ`sub`が先頭に来る新しい順序をそのまま正しく処理できることを
+     実際に単体テスト・実機テストの両方で確認した(タスク指示通りコードを
+     書く前にまず実バイト列を確認したが、結果的にプロダクションコード自体
+     への変更は不要だった、直前の2026-08-05エントリと同じ結論)。
+  4. **正直な発見(既知の現象の再確認+新しい観察)**:
+     - DXIL側の式木を`resolve_dxil_calls_and_chain`で実際に取得して
+       `{:#?}`でダンプしたところ、額面通りの`Add(Div(Sub(a,b),a), b)`
+       ではなく`Add(Load(b), Div(Sub(a,b),a))`(第3演算=addのオペランド
+       順序が入れ替わった形)だった——これは2026-07-26/2026-08-05付
+       HANDOFFエントリで既に確認済みの「addは可換演算のためdxc/LLVMの
+       最適化パスが相対値参照の順序を並べ替える」現象が、subが先頭に来る
+       この4項チェーンでも再現したもの(数値的には`a+b=b+a`のため実行
+       結果に影響しない、実Vulkanで数値一致することで裏付け済み)。
+       手計算・額面通りの期待だけでテストを書かず実行結果で裏取りする
+       という教訓を今回も踏襲し、テストの期待値は実測した木の形
+       (`Mul(Add(Load,Div(Sub(Load,Load),Load)),Load)`)に修正した。
+     - 読み込みUAVバインドポイント一覧(`read_uav_bind_points`)の長さは
+       4項チェーンで**5**(N+1規則、既存の3項チェーンで4=3+1だったのと
+       同じ規則)になる——最初に書いたテストでは額面通り4を期待して
+       実際に失敗し(`left: 5, right: 4`)、実測値に合わせて修正した。
+       これも「実行して初めて分かった」正直な訂正。
+  5. **単体テスト追加**(`cargo test -p directx-shader-translate --lib`、
+     実際に確認、誇張なし):
+     ```
+     running 2 tests
+     test dxil::tests::resolves_real_dxc_compiled_4op_chain_dxil_into_matching_regexpr_tree ... ok
+     test dxil::tests::translate_dxil_chain_to_spirv_handles_4op_chain ... ok
+     test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 45 filtered out
+     ```
+  6. **実機テスト2本を新規追加**(`tests/vector_sub_div_add_mul_chain4_
+     real_vulkan.rs`〈DXBC〉・`tests/vector_sub_div_add_mul_chain4_dxil_
+     real_vulkan.rs`〈DXIL〉、既存のチェーン実機テストと同じパターン、
+     ゼロ除算を避けるためaは常に正の非ゼロ値)。実際に確認した結果
+     (誇張なし、実出力そのまま、NVIDIA GeForce GT 730):
+     ```
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXBC(fxc.exe実コンパイル, 2項演算4回のチェーン sub->div->add->mul)->SPIR-V(自前生成、式木の再帰翻訳)->実Vulkan経路が、CPU参照実装(((a[i]-b[i])/a[i]+b[i])*a[i])と256要素すべてで数値一致した
+     c[0]=1, c[255]=58.375004
+     test dxbc_vector_sub_div_add_mul_chain4_matches_cpu_reference_on_real_vulkan_hardware ... ok
+
+     device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+     OK: DXIL(dxc.exe実コンパイル、SM6.0、2項演算4回のチェーン sub->div->add->mul)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで式木を実解決)->実Vulkan経路が、CPU参照実装(((a[i]-b[i])/a[i]+b[i])*a[i])と256要素すべてで数値一致した
+     c[0]=1, c[255]=58.375004
+     test dxil_vector_sub_div_add_mul_chain4_matches_cpu_reference_on_real_vulkan_hardware ... ok
+     ```
+     DXBC/DXIL両経路の`c[0]`/`c[255]`が完全に一致している(既存のチェーン
+     エントリと同じ、独立2経路の追加的な裏付けパターン)。
+  7. **ワークスペース全体の検証**: 作業中、別セッションが同じワーク
+     ツリーで並行して境界チェック付きチェーン(次にすべきこと(2))に
+     着手しており(`spirv_gen.rs`が一時的にコンパイル不能な中間状態に
+     なっていた場面に遭遇したため、自分の変更が絡んでいないことを
+     `git diff --stat`で確認しつつ、相手の変更が安定するまで
+     `cargo build`が通るようになるのを待ってから検証を実施——相手の
+     作業ファイルへの介入は一切していない)、それが収束した後の状態で
+     `cargo test --workspace -- --nocapture`を実行し、自分が追加した
+     テストを含め全テストgreenであることを確認した(既存経路への回帰
+     なし)。`cargo build --workspace`/`cargo clippy --workspace
+     --all-targets`はいずれも警告0件。ただしこの実行結果には並行作業中の
+     境界チェックチェーン関連テストも含まれている可能性があるため、
+     このエントリでは自分が追加した範囲(4項チェーンのDXBC/DXIL実機・
+     単体テスト計4本)の合格を主張の根拠とする。
+  8. **正直な開示・まだやっていないこと(誇張しない)**:
+     - 検証できたのは「4項・かつsub先頭の順序」の1点のみ。5項以上、
+       あるいは他の順序組み合わせ(例: `mul`が複数回連続する、`div`が
+       先頭に来る等)は実際にコンパイル・検証していない。
+     - 境界チェック付きチェーンは自分では未着手(別セッションが並行して
+       着手している形跡を確認したが、その内容自体はこのエントリの
+       範囲外であり、自分では検証・追記していない)。
+     - `mul`のnegateフラグが立つケースは引き続き未検証(2026-07-27付
+       エントリから変更なし)。
+     - テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+       実機検証・各クレートのexample充足状況棚卸しは、いずれも前回
+       エントリから変更なし(未着手のまま)。
+  - 次にすべきこと: (1) 5項以上、または今回未検証の順序組み合わせ
+    (`div`が先頭に来る等)での追加検証、(2) 境界チェック付きチェーン
+    (別セッションが並行して着手した形跡があるため、次回はまずその
+    セッションの成果が確定しているか`git status`/`git log`で確認する
+    こと)、(3) テクスチャサンプリング・スワップチェーンへの拡張、
+    (4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
+    example充足状況の棚卸し。

@@ -7,6 +7,7 @@
 //! クラスのDXIL版)を使う点が異なる。
 
 use directx_shader_translate::translate_dxil_chain_to_spirv;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -57,7 +58,7 @@ fn dxil_vector_add_mul_chain_matches_cpu_reference_on_real_vulkan_hardware() {
     // (3バッファ+push constant 1個のuint)をそのまま再利用する。実行される
     // 演算はSPIR-Vバイト列側(DXILから生成した実際の`(a+b)*a`チェーン)で決まる。
     let spirv_bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(

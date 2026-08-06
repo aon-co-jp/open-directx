@@ -10,6 +10,7 @@
 //! 変更が実GPU上で数値的に正しいことを検証する。
 
 use directx_shader_translate::spirv_gen::translate_chain_shader;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -68,7 +69,7 @@ fn dxbc_vector_sub_div_chain_matches_cpu_reference_on_real_vulkan_hardware() {
     // バイト列側で決まり、名前文字列では変わらない——既存のmul/div/
     // sub_bounded/add_mul_chainテストと同じ理由)。
     let spirv_bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(

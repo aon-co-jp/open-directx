@@ -1182,7 +1182,11 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
     crate::spirv_gen::collect_loads(&root, &mut read_uav_bind_points);
 
     let local_size = extract_numthreads_from_metadata(bytes)?;
-    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav);
+    // DXIL側のチェーン解決(`resolve_dxil_calls_and_chain`)は境界チェック
+    // (ult/if/endif相当)を検出しないため、常に`bounds_check=false`を渡す
+    // (2026-08-06、DXBC側`decode_chain_shape`への境界チェック対応追加に伴う
+    // シグネチャ変更、DXIL側の挙動自体は無変更)。
+    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav, false);
 
     Ok(crate::spirv_gen::ChainTranslatedKernel {
         spirv_words,
@@ -1190,6 +1194,7 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
         local_size,
         read_uav_bind_points,
         write_uav_bind_point: write_uav,
+        bounds_check: false,
     })
 }
 
@@ -1973,6 +1978,76 @@ mod tests {
         // だった——数値的にはa+b=b+aで結果に影響しないため、順序集合の
         // 一致のみを検証する(厳密な出現順序は検証しない)。
         assert_eq!(kernel.read_uav_bind_points, vec![1, 0, 0, 1]);
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203, "SPIR-V magic");
+    }
+
+    /// タスク(1)続き(2026-08-06): 4個の逐次2項演算、かつsubが先頭に来る
+    /// 新しい順序(sub -> div -> add -> mul)の実DXILバイト列。DXBC側
+    /// `vector_sub_div_add_mul_chain4.hlsl`と同一契約(SM6.0向けに
+    /// `vector_sub_div_add_mul_chain4_dxil.hlsl`から新規コンパイル)。
+    /// `examples/dump_dxil`で実際にダンプした結果、`FUNCTION_BLOCK`の
+    /// Call数(code=34)は既存の単一/2項/3項チェーンと変わらず7個のまま
+    /// (同じ3バッファのためCreateHandleは増えない)、ExtractValue(code=26)
+    /// が2個、`BinOp`(code=2)が**4回連続で出現**した。実際に
+    /// `resolve_dxil_calls_and_chain`を呼んで得た式木を`{:#?}`でダンプして
+    /// 確認したところ、`Mul(Add(Load(1), Div(Sub(Load(0),Load(1)),Load(0))),
+    /// Load(0))`(額面通りの`Add(Div(Sub(a,b),a), b)`ではなく、addオペランドが
+    /// 入れ替わった形)だった——これは2026-07-26/2026-08-05付HANDOFFで既に
+    /// 確認済みの「addは可換演算のためdxc/LLVMの最適化パスが相対値参照の
+    /// 順序を並べ替える」現象がこのシェーダー(sub->div->add->mul)でも再現した
+    /// もので、`a+b=b+a`のため数値的には無関係(実Vulkanで数値一致することで
+    /// 裏付け済み、下記`translate_dxil_chain_to_spirv_handles_4op_chain`
+    /// および`vector_sub_div_add_mul_chain4_dxil_real_vulkan.rs`参照)。
+    /// 額面通りの期待だけでテストを書かず実行結果で裏取りするという、この
+    /// プロジェクトの教訓を踏襲し、期待値は実測した木の形に合わせた。
+    const VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL: &[u8] =
+        include_bytes!("../shaders/vector_sub_div_add_mul_chain4.dxil");
+
+    #[test]
+    fn resolves_real_dxc_compiled_4op_chain_dxil_into_matching_regexpr_tree() {
+        let (calls, root) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
+            .expect("real dxc-compiled vector_sub_div_add_mul_chain4.dxil must resolve into a chain RegExpr");
+        assert_eq!(
+            calls.len(),
+            7,
+            "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, unchanged by a 4th op"
+        );
+        // 実測した木: Mul(Add(Load(1), Div(Sub(Load(0),Load(1)), Load(0))), Load(0))
+        // (addのオペランド順序がdxc/LLVMの最適化で入れ替わっている、上のコメント参照)。
+        match &root {
+            DxilRegExpr::BinOp(crate::BinaryOp::Mul, mul_lhs, mul_rhs) => {
+                assert!(matches!(**mul_rhs, DxilRegExpr::Load(_)), "outermost op must be `... * Load(...)`");
+                match &**mul_lhs {
+                    DxilRegExpr::BinOp(crate::BinaryOp::Add, add_lhs, add_rhs) => {
+                        assert!(matches!(**add_lhs, DxilRegExpr::Load(_)), "3rd op must have a Load(...) operand (reordered by optimizer)");
+                        match &**add_rhs {
+                            DxilRegExpr::BinOp(crate::BinaryOp::Div, div_lhs, div_rhs) => {
+                                assert!(matches!(**div_rhs, DxilRegExpr::Load(_)), "2nd op must be `... / Load(...)`");
+                                assert!(
+                                    matches!(**div_lhs, DxilRegExpr::BinOp(crate::BinaryOp::Sub, _, _)),
+                                    "innermost op must be the sub"
+                                );
+                            }
+                            other => panic!("expected 2nd-level Div(Sub(Load,Load), Load), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected 3rd-level Add(Load, Div(...)), got {other:?}"),
+                }
+            }
+            other => panic!("expected outermost Mul(Add(Load,Div(Sub(Load,Load),Load)),Load), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_dxil_chain_to_spirv_handles_4op_chain() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
+            .expect("vector_sub_div_add_mul_chain4.dxil (4 sequential ops) must translate to SPIR-V");
+        assert_eq!(kernel.local_size, (64, 1, 1), "numthreads must be extracted, not hardcoded");
+        assert_eq!(kernel.write_uav_bind_point, 2, "write UAV bind point must resolve to u2");
+        // 4個の逐次2項演算では、最初の演算が2ロード、以降の演算が1ロードずつ
+        // 追加するため、式木全体の(重複込みの)ロード出現回数は4+1=5になる
+        // (既存の3項チェーンテストで4=3+1だったのと同じ規則、実測して確認)。
+        assert_eq!(kernel.read_uav_bind_points.len(), 5, "4 sequential binops must reference 5 loads total (N+1 rule)");
         assert_eq!(kernel.spirv_words[0], 0x0723_0203, "SPIR-V magic");
     }
 

@@ -7,6 +7,7 @@
 //! 一切追加していないことを実機で裏付ける目的のテスト。
 
 use directx_shader_translate::spirv_gen::translate_chain_shader;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -55,7 +56,7 @@ fn dxbc_vector_add_mul_div_chain3_matches_cpu_reference_on_real_vulkan_hardware(
 
     let cfg = LaunchConfig::linear(N as u32, kernel.local_size.0);
     let spirv_bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(

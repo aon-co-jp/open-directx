@@ -44,6 +44,10 @@ Write-Host "OK: compiled vector_div.hlsl -> vector_div.dxbc (DXBC, SM5.0)"
 Write-Host "OK: compiled vector_add_mul_chain.hlsl -> vector_add_mul_chain.dxbc (DXBC, SM5.0, 2 sequential ops / 3 UAVs, reg-expr chain decoder)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_chain3.hlsl -> vector_add_mul_div_chain3.dxbc (DXBC, SM5.0, 3 sequential ops / 3 UAVs, reg-expr chain decoder)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.hlsl") /Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxbc") /nologo
+Write-Host "OK: compiled vector_sub_div_add_mul_chain4.hlsl -> vector_sub_div_add_mul_chain4.dxbc (DXBC, SM5.0, 4 sequential ops sub->div->add->mul / 3 UAVs, reg-expr chain decoder)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_chain_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_chain_bounded.dxbc") /nologo
+Write-Host "OK: compiled vector_add_mul_chain_bounded.hlsl -> vector_add_mul_chain_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 2-op chain, 2026-08-06)"
 
 # D3D11グラフィックスパイプライン(タスク2): 頂点/ピクセルシェーダーも
 # fxc.exe(SM<=5.1、DXBC)でコンパイルする。dxc.exeではない(dxc.exeは
@@ -91,3 +95,8 @@ Write-Host "OK: compiled vector_sub_div_chain_dxil.hlsl -> vector_sub_div_chain.
 # (decode_chain_shape/resolve_dxil_calls_and_chainを3項へ拡張する検証用)。
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_chain3_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxil")
 Write-Host "OK: compiled vector_add_mul_div_chain3_dxil.hlsl -> vector_add_mul_div_chain3.dxil (DXIL, SM6.0, 3 sequential ops add+mul+div)"
+# 2026-08-06: 4個の逐次2項演算チェーン(sub->div->add->mul、新しい順序組み
+# 合わせ)のDXBC/DXIL版(decode_chain_shape/resolve_dxil_calls_and_chainが
+# 4項・かつsub先頭の順序でも無改修で動くかの検証用)。
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxil")
+Write-Host "OK: compiled vector_sub_div_add_mul_chain4_dxil.hlsl -> vector_sub_div_add_mul_chain4.dxil (DXIL, SM6.0, 4 sequential ops sub->div->add->mul)"

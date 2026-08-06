@@ -610,6 +610,11 @@ struct ChainShape {
     write_uav: u32,
     /// `store_structured`が最終的に参照する式木(制御フロー無し)。
     root: RegExpr,
+    /// `dcl_constantbuffer`(b0) + `ult` + `if`/`endif`による境界チェック
+    /// (`vector_add_mul_chain_bounded.hlsl`実コンパイル結果で確認した形、
+    /// 2026-08-06追加)。既存クラス側(`ShaderShape::bounds_check`)と同じ
+    /// 「全部揃っているか、全く無いか」の規約。
+    bounds_check: bool,
 }
 
 /// 一時レジスタのオペランドから`(temp_index, component_index)`キーを取り出す
@@ -646,10 +651,31 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
     let mut store_uav: Option<u32> = None;
     let mut root: Option<RegExpr> = None;
     let mut saw_ret = false;
+    let mut has_cbuffer = false;
+    let mut saw_ult = false;
+    let mut saw_if = false;
+    let mut saw_endif = false;
 
     for ins in instructions {
         match &ins.kind {
             InstructionKind::DclGlobalFlags { .. } => {}
+            InstructionKind::DclConstantBuffer { operands, .. } => {
+                // 既存クラス側(`decode_shader_shape`)と同じ規約: b0のみ対応。
+                let op0 = operands.first().ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("dcl_constantbufferにオペランドが無い".to_string())
+                })?;
+                if op0.reg_type != RegisterType::ConstantBuffer {
+                    return Err(SpirvGenError::UnsupportedShader(
+                        "dcl_constantbufferの対象レジスタがcbではない".to_string(),
+                    ));
+                }
+                if uav_index(&op0.indices) != Some(0) {
+                    return Err(SpirvGenError::UnsupportedShader(
+                        "対応しているのはb0の定数バッファのみ".to_string(),
+                    ));
+                }
+                has_cbuffer = true;
+            }
             InstructionKind::DclUavStructured { stride, operands, .. } => {
                 if *stride != 4 {
                     return Err(SpirvGenError::UnsupportedShader(format!(
@@ -684,6 +710,30 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                 thread_group = Some((*x, *y, *z));
             }
             InstructionKind::Generic { operands } => match ins.opcode {
+                Opcode::ULt => {
+                    // 既存クラス側(`decode_shader_shape`)と同じ規約:
+                    // `id.x < N`(N=定数バッファ)の比較のみ対応。
+                    let rhs = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("ultの右辺オペランドが無い".to_string())
+                    })?;
+                    if rhs.reg_type != RegisterType::ConstantBuffer {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "対応しているのは定数バッファとの比較のみ".to_string(),
+                        ));
+                    }
+                    saw_ult = true;
+                }
+                Opcode::If => {
+                    if !saw_ult {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "ultの結果を使わないifは対応スコープ外".to_string(),
+                        ));
+                    }
+                    saw_if = true;
+                }
+                Opcode::EndIf => {
+                    saw_endif = true;
+                }
                 Opcode::LdStructured => {
                     let dest = operands.first().ok_or_else(|| {
                         SpirvGenError::UnsupportedShader("ld_structuredの書き込み先オペランドが無い".to_string())
@@ -853,8 +903,16 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
             "2項演算を1回も含まない(単純コピー)シェーダーは対応スコープ外".to_string(),
         ));
     }
+    // 境界チェックは「定数バッファ宣言 + ult + if + endif」が全部揃っている
+    // か、全く無いかのどちらかのみ許容する(既存クラス側と同じ規約)。
+    let bounds_check = has_cbuffer && saw_ult && saw_if && saw_endif;
+    if has_cbuffer != bounds_check || saw_ult != bounds_check || saw_if != bounds_check || saw_endif != bounds_check {
+        return Err(SpirvGenError::UnsupportedShader(
+            "境界チェック構成(dcl_constantbuffer/ult/if/endif)が不完全".to_string(),
+        ));
+    }
 
-    Ok(ChainShape { thread_group, write_uav, root })
+    Ok(ChainShape { thread_group, write_uav, root, bounds_check })
 }
 
 /// [`translate_chain_shader`]が返す翻訳結果。既存の[`TranslatedKernel`]は
@@ -869,6 +927,9 @@ pub struct ChainTranslatedKernel {
     /// (出現順、重複あり得る)。
     pub read_uav_bind_points: Vec<u32>,
     pub write_uav_bind_point: u32,
+    /// `dcl_constantbuffer`(b0)+`ult`+`if`/`endif`による境界チェックが実際に
+    /// このシェーダーに存在したかどうか(2026-08-06追加)。
+    pub bounds_check: bool,
 }
 
 /// DXBCバイト列を解析し、「N個の逐次2項演算(制御フロー無し)」パターンクラス
@@ -900,6 +961,7 @@ pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, Spi
         local_size: shape.thread_group,
         read_uav_bind_points,
         write_uav_bind_point: shape.write_uav,
+        bounds_check: shape.bounds_check,
     })
 }
 
@@ -908,7 +970,7 @@ pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, Spi
 /// `translate_dxil_chain_to_spirv`とも共有する、DXBC固有の`ChainShape`型に
 /// 依存しない部分を切り出したもの)。
 fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
-    emit_chain_spirv_for_kernel(shape.thread_group, &shape.root, shape.write_uav)
+    emit_chain_spirv_for_kernel(shape.thread_group, &shape.root, shape.write_uav, shape.bounds_check)
 }
 
 /// [`emit_chain_spirv`]の本体。DXBC固有の[`ChainShape`]型に依存しない
@@ -916,8 +978,17 @@ fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
 /// `emit_spirv_impl`から切り出されたのと同じパターン)——DXIL側
 /// (`dxil.rs`)がDXBC側の`RegExpr`式木構築ロジックを再利用してSPIR-Vを
 /// 生成する際にも、このSPIR-V組み立て本体をそのまま呼べるようにするため
-/// `pub(crate)`にした(2026-08-05、DXILチェーン対応の一環)。
-pub(crate) fn emit_chain_spirv_for_kernel(thread_group: (u32, u32, u32), root: &RegExpr, write_uav: u32) -> Vec<u32> {
+/// `pub(crate)`にした(2026-08-05、DXILチェーン対応の一環)。`bounds_check`
+/// が真の場合、既存クラス側(`emit_spirv_impl`)と同じpush constant
+/// `Params{ uint n }`+`OpSelectionMerge`/`OpBranchConditional`で
+/// `id.x < n`の比較を実際にゲートする(2026-08-06追加、DXBC側のみ——DXIL側
+/// `dxil.rs`の呼び出しは境界チェック未対応のため常に`false`を渡す)。
+pub(crate) fn emit_chain_spirv_for_kernel(
+    thread_group: (u32, u32, u32),
+    root: &RegExpr,
+    write_uav: u32,
+    bounds_check: bool,
+) -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);
@@ -962,6 +1033,16 @@ pub(crate) fn emit_chain_spirv_for_kernel(thread_group: (u32, u32, u32), root: &
 
     let float_ptr_uniform_ty = b.type_pointer(None, spirv::StorageClass::Uniform, float_ty);
 
+    // push constant: struct Params { uint n; }(既存クラス側`emit_spirv_impl`
+    // と同じレイアウト、`bounds_check`が真の場合のみ実際に使う)。
+    let params_struct_ty = b.type_struct(vec![uint_ty]);
+    b.decorate(params_struct_ty, spirv::Decoration::Block, vec![]);
+    b.member_decorate(params_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let params_ptr_ty = b.type_pointer(None, spirv::StorageClass::PushConstant, params_struct_ty);
+    let var_params = b.variable(params_ptr_ty, None, spirv::StorageClass::PushConstant, None);
+    let uint_ptr_pushconstant_ty = b.type_pointer(None, spirv::StorageClass::PushConstant, uint_ty);
+    let bool_ty = b.type_bool();
+
     let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
     b.begin_block(None).expect("OpLabel");
 
@@ -997,12 +1078,40 @@ pub(crate) fn emit_chain_spirv_for_kernel(thread_group: (u32, u32, u32), root: &
         }
     }
 
-    let result = emit_expr(&mut b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+    // 本体(式木の評価+書き込み)を組み立てるクロージャ。境界チェック無しの
+    // 場合は現在のブロックへ直接、有りの場合は`if`ブロック内へ、それぞれ
+    // 同じ命令列を発行する(既存クラス側`emit_spirv_impl`の`emit_body`と
+    // 同じパターン)。
+    let emit_body = |b: &mut Builder| {
+        let result = emit_expr(b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+        let write_var = *buffer_vars.get(&write_uav).expect("write buffer var must exist");
+        let ac_out =
+            b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
+        b.store(ac_out, result, None, vec![]).expect("OpStore out");
+    };
 
-    let write_var = *buffer_vars.get(&write_uav).expect("write buffer var must exist");
-    let ac_out =
-        b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
-    b.store(ac_out, result, None, vec![]).expect("OpStore out");
+    if bounds_check {
+        let n_ptr = b
+            .access_chain(uint_ptr_pushconstant_ty, None, var_params, vec![const_0])
+            .expect("OpAccessChain params.n");
+        let n_val = b.load(uint_ty, None, n_ptr, None, vec![]).expect("OpLoad n");
+        let cond = b.u_less_than(bool_ty, None, idx, n_val).expect("OpULessThan idx < n");
+
+        let then_label = b.id();
+        let merge_label = b.id();
+        b.selection_merge(merge_label, spirv::SelectionControl::NONE)
+            .expect("OpSelectionMerge");
+        b.branch_conditional(cond, then_label, merge_label, vec![])
+            .expect("OpBranchConditional");
+
+        b.begin_block(Some(then_label)).expect("OpLabel then");
+        emit_body(&mut b);
+        b.branch(merge_label).expect("OpBranch to merge");
+
+        b.begin_block(Some(merge_label)).expect("OpLabel merge");
+    } else {
+        emit_body(&mut b);
+    }
 
     b.ret().expect("OpReturn");
     b.end_function().expect("OpFunctionEnd");
@@ -1538,6 +1647,11 @@ mod tests {
     /// 既存の`translate_shader`(単一演算・UAV3本固定)ではなく、新設した
     /// `translate_chain_shader`(N個の逐次2項演算パターンクラス)を使う。
     const VECTOR_ADD_MUL_CHAIN_DXBC: &[u8] = include_bytes!("../shaders/vector_add_mul_chain.dxbc");
+    /// `shaders/vector_add_mul_chain_bounded.dxbc`(実fxc.exe出力、
+    /// `t = A[i]+B[i]; if (i < N) { Out[i] = t*A[i]; }`——2026-08-06追加、
+    /// 「境界チェック付きチェーン」パターン(既存のどのクラスにも当たら
+    /// なかった組み合わせ)。
+    const VECTOR_ADD_MUL_CHAIN_BOUNDED_DXBC: &[u8] = include_bytes!("../shaders/vector_add_mul_chain_bounded.dxbc");
 
     #[test]
     fn translates_real_fxc_compiled_vector_add_mul_chain_dxbc_to_valid_spirv() {
@@ -1608,6 +1722,25 @@ mod tests {
             .expect("a single add is a valid (trivial, N=1) instance of the chain pattern class too");
         assert_eq!(kernel.read_uav_bind_points, vec![0, 1]);
         assert_eq!(kernel.write_uav_bind_point, 2);
+        assert!(!kernel.bounds_check, "vector_add.dxbcには境界チェックが無い");
+    }
+
+    #[test]
+    /// 2026-08-06追加: 境界チェック(`dcl_constantbuffer`/`ult`/`if`/`endif`)
+    /// 付きのチェーン(既存の`decode_chain_shape`のどのテストにも無かった
+    /// 組み合わせ)を実際にfxc.exeでコンパイルしたバイト列から検証する。
+    fn translates_real_fxc_compiled_bounded_chain_dxbc_to_valid_spirv_with_bounds_check_flag_set() {
+        let kernel = translate_chain_shader(VECTOR_ADD_MUL_CHAIN_BOUNDED_DXBC)
+            .expect("real fxc-compiled bounded 2-op chain (add then mul, cbuffer+ult+if+endif) must translate");
+        assert_eq!(kernel.read_uav_bind_points, vec![0, 1, 0]);
+        assert_eq!(kernel.write_uav_bind_point, 2);
+        assert_eq!(kernel.local_size, (64, 1, 1));
+        assert!(kernel.bounds_check, "cbuffer+ult+if+endifが実際に揃っているシェーダーなのでtrueのはず");
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let mut loader = rspirv::dr::Loader::new();
+        rspirv::binary::parse_bytes(&bytes, &mut loader)
+            .expect("emitted SPIR-V (bounded chain) must be well-formed and re-parseable");
     }
 
     /// `shaders/triangle_vs.dxbc`/`shaders/triangle_ps.dxbc`(実fxc.exe出力、

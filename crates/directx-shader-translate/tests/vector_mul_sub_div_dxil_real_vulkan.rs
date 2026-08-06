@@ -9,6 +9,7 @@
 //! `eprintln!`してスキップする(fakeな成功にしない、既存テストと同じ方針)。
 
 use directx_shader_translate::translate_dxil_binary_op_to_spirv;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -58,7 +59,7 @@ fn run_and_check(dxil_bytes: &[u8], op_name: &str, expected: impl Fn(f32, f32) -
 
     let cfg = LaunchConfig::linear(N as u32, kernel.local_size.0);
     let spirv_bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(

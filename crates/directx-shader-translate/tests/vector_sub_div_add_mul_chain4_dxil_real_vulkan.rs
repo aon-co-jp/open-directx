@@ -1,14 +1,16 @@
-//! `vector_div.hlsl`(実fxc.exe出力、DXBC)の実機検証テスト。
-//! `vector_mul_real_vulkan.rs`と全く同じパターン(実GPUが無ければ
-//! `eprintln!`してスキップ、fakeな成功にしない)。演算がdivである点だけが
-//! `vector_mul`との違い。
+//! `vector_sub_div_add_mul_chain4_dxil.hlsl`(実dxc.exe出力、DXIL/SM6.0、
+//! `t1 = a[i]-b[i]; t2 = t1/a[i]; t3 = t2+b[i]; c[i] = t3*a[i];`という
+//! 2項演算**4回**(sub->div->add->mulという新しい順序)のチェーン)の実機検証
+//! テスト。2026-08-06増分——DXBC側の
+//! `vector_sub_div_add_mul_chain4_real_vulkan.rs`と対になるDXIL版。
+//! `resolve_dxil_calls_and_chain`/`translate_dxil_chain_to_spirv`に4項目の
+//! 演算専用のコードを一切追加していないことを実機で裏付ける目的のテスト。
 
-use directx_shader_translate::spirv_gen::translate_shader;
-use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
+use directx_shader_translate::translate_dxil_chain_to_spirv;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
-const VECTOR_DIV_DXBC: &[u8] = include_bytes!("../shaders/vector_div.dxbc");
+const VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL: &[u8] = include_bytes!("../shaders/vector_sub_div_add_mul_chain4.dxil");
 
 fn cast_f32_to_u8(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
@@ -19,12 +21,13 @@ fn cast_f32_to_u8_mut(v: &mut [f32]) -> &mut [u8] {
 }
 
 #[test]
-fn dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware() {
-    let kernel = translate_shader(VECTOR_DIV_DXBC)
-        .expect("real fxc-compiled vector_div.dxbc must translate to SPIR-V");
+fn dxil_vector_sub_div_add_mul_chain4_matches_cpu_reference_on_real_vulkan_hardware() {
+    let kernel = translate_dxil_chain_to_spirv(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
+        .expect("real dxc-compiled DXIL 4-op chain (sub, div, add, mul) must translate to SPIR-V");
 
-    assert_eq!(kernel.local_size, (64, 1, 1));
-    assert_eq!(kernel.uav_bind_points, (0, 1, 2));
+    assert_eq!(kernel.local_size, (64, 1, 1), "numthreads must be extracted from METADATA_BLOCK, not hardcoded");
+    assert_eq!(kernel.write_uav_bind_point, 2);
+    assert_eq!(kernel.read_uav_bind_points.len(), 5, "4 sequential binops must reference 5 loads total (N+1 rule, first op contributes 2 loads, each further op adds 1)");
     assert!(!kernel.spirv_words.is_empty() && kernel.spirv_words[0] == 0x0723_0203);
 
     let device: std::sync::Arc<dyn GpuDevice> = match VulkanDevice::new(0) {
@@ -37,9 +40,9 @@ fn dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware() {
     println!("device: {}", device.info().name);
 
     const N: usize = 256;
-    // ゼロ除算を避けるため、両方とも常に正の非ゼロ値になるよう構成する。
+    // ゼロ除算を避けるため、aは常に正の非ゼロ値にする(t2=t1/aのため)。
     let a: Vec<f32> = (0..N).map(|i| (i as f32) * 0.1 + 1.0).collect();
-    let b: Vec<f32> = (0..N).map(|i| (i as f32) * 0.05 + 2.0).collect();
+    let b: Vec<f32> = (0..N).map(|i| (N - i) as f32 * 0.25 + 1.0).collect();
     let bytes = N * std::mem::size_of::<f32>();
 
     let da = alloc_buffer(&device, bytes).expect("alloc a");
@@ -50,12 +53,8 @@ fn dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware() {
     db.copy_from_host(cast_f32_to_u8(&b)).expect("h2d b");
 
     let cfg = LaunchConfig::linear(N as u32, kernel.local_size.0);
-    // 注: opencuda-vulkan::VulkanDevice::launch_kernel はカーネル名で引数配線
-    // を選ぶディスパッチャであり、"vector_add"以外の名前は未対応(既存の
-    // vector_mul/vector_sub_boundedテストと同じ理由でこの名前を再利用する。
-    // 実行される演算はSPIR-Vバイト列側で決まる)。
     let spirv_bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(
@@ -68,16 +67,16 @@ fn dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware() {
                 KernelArg::Usize(N),
             ],
         )
-        .expect("launch_kernel (DXBC-derived SPIR-V, real Vulkan hardware)");
+        .expect("launch_kernel (DXIL-derived SPIR-V 4-op chain, real Vulkan hardware)");
     device.synchronize().expect("synchronize");
 
     let mut c = vec![0.0f32; N];
     dc.copy_to_host(cast_f32_to_u8_mut(&mut c)).expect("d2h c");
 
     for i in 0..N {
-        let expected = a[i] / b[i];
+        let expected = ((a[i] - b[i]) / a[i] + b[i]) * a[i];
         assert!(
-            (c[i] - expected).abs() < 1e-2,
+            (c[i] - expected).abs() < 1e-1,
             "mismatch at {i}: GPU produced {}, CPU reference expected {expected} (a={}, b={})",
             c[i],
             a[i],
@@ -86,7 +85,7 @@ fn dxbc_vector_div_matches_cpu_reference_on_real_vulkan_hardware() {
     }
 
     println!(
-        "OK: DXBC(fxc.exe実コンパイル, div)->SPIR-V(自前生成)->実Vulkan経路が、CPU参照実装(a[i]/b[i])と{N}要素すべてで数値一致した"
+        "OK: DXIL(dxc.exe実コンパイル、SM6.0、2項演算4回のチェーン sub->div->add->mul)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで式木を実解決)->実Vulkan経路が、CPU参照実装(((a[i]-b[i])/a[i]+b[i])*a[i])と{N}要素すべてで数値一致した"
     );
     println!("c[0]={}, c[{}]={}", c[0], N - 1, c[N - 1]);
 }

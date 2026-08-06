@@ -7,6 +7,7 @@
 //! 一切書き込まれず、初期化時のセンチネル値のまま残ることを確認する。
 
 use directx_shader_translate::spirv_gen::translate_shader;
+use directx_shader_translate::OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME;
 use opencuda_core::{alloc_buffer, CompiledKernel, GpuDevice, KernelArg, LaunchConfig};
 use opencuda_vulkan::VulkanDevice;
 
@@ -68,7 +69,7 @@ fn dxbc_vector_sub_bounded_matches_cpu_reference_and_respects_bounds_on_real_vul
     // (`if (id.x < ElementCount)`)にそのまま使われる値でもある
     // (この配線がSPIR-V側のpush constant `Params.n`と一致するように
     // emit_spirvを実装済み)。
-    let compiled = CompiledKernel::spirv("vector_add", kernel.entry_point, spirv_bytes);
+    let compiled = CompiledKernel::spirv(OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME, kernel.entry_point, spirv_bytes);
 
     device
         .launch_kernel(
