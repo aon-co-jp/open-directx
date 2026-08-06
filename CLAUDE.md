@@ -1350,3 +1350,93 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     (`div`が先頭に来る等)、(3) テクスチャサンプリング・スワップチェーンへの
     拡張、(4) AMD/Intel・Linux/macOS実機検証、(5) 各クレートの公開API
     example充足状況の棚卸し。
+
+- **2026-08-06(続き2) 直前エントリの次にすべきこと(1)を解消: 境界チェック
+  付きチェーンを3項へ拡張して実検証(DXBC/DXIL両方、コード変更は0行——
+  既存の`decode_chain_shape`/`resolve_dxil_calls_and_chain`一般化ロジックが
+  そのまま通用することを確認)。ユーザー指示「open-directx、open-cuda、
+  aruaru-llmの連携性と実用性と完成度を高めて」の一環**:
+  1. **事前確認**: `git status`クリーン、直前のDXIL側境界チェック対応
+    (13aede6)がmainへ確定済みであることを確認してから着手。
+  2. **新規シェーダー2本**: `shaders/vector_add_mul_div_chain3_bounded.hlsl`
+    (`if (i < ElementCount) { t1=A[i]+B[i]; t2=t1*A[i]; Out[i]=t2/B[i]; }`、
+    UAV3本+cbuffer(b0)、`fxc.exe /T cs_5_0`で実コンパイル)・
+    `shaders/vector_add_mul_div_chain3_bounded_dxil.hlsl`(同一契約、
+    `dxc.exe -T cs_6_0`で実コンパイル)。`tools/compile-dxbc-shaders.ps1`に
+    両方追記済み。
+  3. **実バイト列を確認してから着手(既存方針の継続)**:
+    - DXBC側: `examples/dump_shex`で実SHEX命令列をダンプ(18命令、
+      `dcl_globalFlags`→`dcl_constantbuffer`(b0)→`dcl_uav_structured`x3→
+      `dcl_input`(vThreadID)→`dcl_temps`(1)→`dcl_thread_group`→`ult`→
+      `if`→`ld_structured`x2→`add`→`mul`→`div`→`store_structured`→
+      `endif`→`ret`)——既存の境界チェック付き2項チェーン(`ult`/`if`/
+      `endif`)と境界チェック無し3項チェーン(3回の逐次2項演算)の規約が
+      そのまま組み合わさった形であることを確認した。
+    - DXIL側: `examples/dump_dxil`で`FUNCTION_BLOCK`をダンプ(基本ブロック3
+      個、`Call`合計9個(CreateHandle x4〈UAV3+cbuffer〉+ThreadId+
+      cbufferLoadLegacy+BufferLoad x2+BufferStore)・`ExtractValue`2個・
+      `Cmp2`(icmp ult)1個・`Br`2個(条件分岐+無条件分岐)・`BinOp`3個
+      (add/mul/div)・`Ret`)——既存の境界チェック付き2項チェーン(Call計9個)
+      と境界チェック無し3項チェーン(BinOp3個)の規約がそのまま組み合わさった
+      形であることを確認した。
+  4. **実装**: DXBC側`decode_chain_shape`・DXIL側`resolve_dxil_calls_and_
+    chain`のいずれも、命令列を1つずつ走査してreg_map/式木を更新する既存の
+    一般ロジックのまま、境界チェック+3項という組み合わせをそのまま正しく
+    処理できることを実際に単体テスト・実機テストの両方で確認した
+    (プロダクションコードへの変更は0行、直前2026-08-06エントリ〈4項
+    チェーン〉と同じ結論)。
+  5. **単体テストは既存の28件+境界チェック関連22件(計50件)から変化なし**
+    (今回の増分は`translate_chain_shader`/`translate_dxil_chain_to_spirv`の
+    既存呼び出しパスをそのまま通すのみのため、新規の単体テストは追加せず
+    実機テストのみ追加——実機テスト自体が`kernel.read_uav_bind_points.len()
+    == 4`・`kernel.bounds_check == true`等のアサーションを含むため、単体
+    レベルの回帰防止としても機能する)。
+  6. **実機テスト2本を新規追加**(`tests/vector_add_mul_div_chain3_bounded_
+    real_vulkan.rs`〈DXBC〉・`tests/vector_add_mul_div_chain3_bounded_dxil_
+    real_vulkan.rs`〈DXIL〉、既存の境界チェック付きチェーン実機テストと同じ
+    パターン、ディスパッチ数320・論理要素数256、境界外64要素がセンチネル値
+    のまま書き込まれないことを検証)。実際に確認した結果(誇張なし、実出力
+    そのまま、NVIDIA GeForce GT 730):
+    ```
+    OK: DXBC(fxc.exe実コンパイル, 境界チェック付き3項演算チェーン add->mul->div)->SPIR-V(自前生成、式木の再帰翻訳+OpSelectionMerge/OpBranchConditional)->実Vulkan経路が、CPU参照実装(((a[i]+b[i])*a[i])/b[i])と有効範囲256要素すべてで数値一致し、境界外の64要素はセンチネル値のまま(書き込まれなかった)ことを確認した
+    c[0]=1.0123457, c[255]=67.210144, c[319]=-1
+    test dxbc_vector_add_mul_div_chain3_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+
+    OK: DXIL(dxc.exe実コンパイル、SM6.0、境界チェック付き3項演算チェーン add->mul->div)->SPIR-V(自前生成、resolve_dxil_calls_and_chainで境界チェックも実解決)->実Vulkan経路が、CPU参照実装(((a[i]+b[i])*a[i])/b[i])と有効範囲256要素すべてで数値一致し、境界外の64要素はセンチネル値のまま(書き込まれなかった)ことを確認した
+    c[0]=1.0123457, c[255]=67.210144, c[319]=-1
+    test dxil_vector_add_mul_div_chain3_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+    ```
+    DXBC/DXIL両経路の`c[0]`/`c[255]`/`c[319]`が完全に一致している
+    (既存のチェーン系エントリと同じ、独立2経路の追加的な裏付けパターン)。
+    `read_uav_bind_points.len() == 4`(境界チェック無し3項チェーンと同じ
+    N+1規則)も実測で確認した。
+  7. **ワークスペース全体の検証**: `cargo test --workspace`で全テスト
+    (unittests 50件、変化なし+実機テスト21本〈既存19本+今回2本〉)すべて
+    green、既存経路への回帰なし。`cargo build --workspace`/`cargo clippy
+    --workspace --all-targets`はいずれも警告0件。
+  8. **正直な開示・まだやっていないこと(誇張しない)**:
+    - **検証できたのは「境界チェック付き3項」の1点のみ**。4項以上の境界
+      チェック付きチェーンは未検証。
+    - `mul`のnegateフラグが立つケース、5項以上・今回未検証の順序組み合わせ
+      (境界チェック無し版)は引き続き未検証(前回エントリから継続)。
+    - **open-cuda・aruaru-llmとの連携**: 今回のセッションで両方のCLAUDE.md
+      を再確認したが、2026-07-25付エントリの結論(open-cudaの
+      `opencuda-vulkan`をVulkan実行バックエンドとして既に再利用済み〈実配線
+      済み、cross-repoパス依存〉、aruaru-llmとの直接の技術的依存は無し)から
+      変化は無かった。`opencuda-vulkan::VulkanDevice::launch_kernel`の
+      カーネル名ハードコード(`"vector_add"`/`"matmul"`のみ認識、
+      `OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME`定数で重複コメントは集約済み
+      〈2026-08-06別エントリ〉)が実用性上のボトルネックとして残っている点も
+      変化なし——open-cuda側の変更は今回のタスク範囲では不要と判断した
+      (境界チェック付き3項チェーンの検証は既存の配線をそのまま再利用
+      できたため)。
+    - テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+      実機検証・各クレートのexample充足状況棚卸しは前回エントリから
+      変更なし(未着手のまま)。
+  - 次にすべきこと: (1) 4項以上の境界チェック付きチェーン、(2) 5項以上・
+    今回未検証の順序組み合わせ(境界チェック無し版、`div`が先頭に来る等)、
+    (3) テクスチャサンプリング・スワップチェーンへの拡張、(4) AMD/Intel・
+    Linux/macOS実機検証、(5) 各クレートの公開APIexample充足状況の棚卸し、
+    (6) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+    ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
+    着手すること)。
