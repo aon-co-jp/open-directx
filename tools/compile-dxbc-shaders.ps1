@@ -50,6 +50,8 @@ Write-Host "OK: compiled vector_sub_div_add_mul_chain4.hlsl -> vector_sub_div_ad
 Write-Host "OK: compiled vector_add_mul_chain_bounded.hlsl -> vector_add_mul_chain_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 2-op chain, 2026-08-06)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3_bounded.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_chain3_bounded.hlsl -> vector_add_mul_div_chain3_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 3-op chain, 2026-08-06)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.dxbc") /nologo
+Write-Host "OK: compiled vector_add_mul_div_sub_chain4_bounded.hlsl -> vector_add_mul_div_sub_chain4_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 4-op chain, 2026-08-06)"
 
 # D3D11グラフィックスパイプライン(タスク2): 頂点/ピクセルシェーダーも
 # fxc.exe(SM<=5.1、DXBC)でコンパイルする。dxc.exeではない(dxc.exeは
@@ -112,3 +114,5 @@ Write-Host "OK: compiled vector_add_mul_chain_bounded_dxil.hlsl -> vector_add_mu
 # 3項以上へ対応できるかの検証用)。
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_chain3_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_chain3_bounded.dxil")
 Write-Host "OK: compiled vector_add_mul_div_chain3_bounded_dxil.hlsl -> vector_add_mul_div_chain3_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 3-op chain)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.dxil")
+Write-Host "OK: compiled vector_add_mul_div_sub_chain4_bounded_dxil.hlsl -> vector_add_mul_div_sub_chain4_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 4-op chain)"

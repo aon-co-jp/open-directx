@@ -1440,3 +1440,62 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     (6) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
     ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
     着手すること)。
+
+- **2026-08-06(続き3) 直前エントリの次にすべきこと(1)を解消: 境界チェック
+  付きチェーンを4項へ拡張して実検証(DXBC/DXIL両方、コード変更は0行——
+  既存の`decode_chain_shape`/`resolve_dxil_calls_and_chain`一般化ロジックが
+  そのまま通用することを再確認)**:
+  1. **事前確認**: `git status`クリーン、直前の境界チェック付き3項チェーン
+    対応(cbd0947)がmainへ確定済みであることを確認してから着手。
+  2. **新規シェーダー2本**: `shaders/vector_add_mul_div_sub_chain4_bounded.hlsl`
+    (`if (i < ElementCount) { t1=A[i]+B[i]; t2=t1*A[i]; t3=t2/B[i];
+    Out[i]=t3-A[i]; }`、UAV3本+cbuffer(b0)、境界チェック付き3項〈add/mul/
+    div〉へsubをもう1回追加、`fxc.exe /T cs_5_0`で実コンパイル)・
+    `shaders/vector_add_mul_div_sub_chain4_bounded_dxil.hlsl`(同一契約、
+    `dxc.exe -T cs_6_0`で実コンパイル)。`tools/compile-dxbc-shaders.ps1`に
+    両方追記済み。
+  3. **実バイト列を確認してから着手(既存方針の継続)**: DXBC側
+    `examples/dump_shex`で実SHEX命令列をダンプ(20命令、境界チェック付き
+    3項チェーンの構成〈`dcl_constantbuffer`→`ult`→`if`→...→`endif`〉に
+    4回目の演算(`sub`、実際には第1オペランドに`negate`フラグが立った
+    `add`——既存のnegated-add規約通り)が追加されただけの形だった。DXIL側
+    `examples/dump_dxil`で`FUNCTION_BLOCK`をダンプし、`Call`合計9個
+    (境界チェック付き3項チェーンと同じ、UAV3本+cbuffer由来で演算回数には
+    依存しない)・`BinOp`4個(add/mul/div/sub)という構造を確認した。
+  4. **実装**: DXBC側`decode_chain_shape`・DXIL側`resolve_dxil_calls_and_
+    chain`のいずれも無改修で境界チェック+4項の組み合わせを正しく処理
+    できることを単体テスト(既存パス経由、新規追加なし)・実機テストの
+    両方で確認した(プロダクションコードへの変更は0行、直前2エントリと
+    同じ結論)。
+  5. **実機テスト2本を新規追加**(`tests/vector_add_mul_div_sub_chain4_
+    bounded_real_vulkan.rs`〈DXBC〉・`tests/vector_add_mul_div_sub_chain4_
+    bounded_dxil_real_vulkan.rs`〈DXIL〉、既存の境界チェック付きチェーン
+    実機テストと同じパターン、ディスパッチ数320・論理要素数256)。実際に
+    確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)、
+    DXBC/DXIL両経路とも完全に同じ値:
+    ```
+    c[0]=0.012345672, c[255]=40.710144, c[319]=-1
+    test dxbc_vector_add_mul_div_sub_chain4_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+    test dxil_vector_add_mul_div_sub_chain4_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+    ```
+    有効範囲256要素すべてでCPU参照実装`((a[i]+b[i])*a[i])/b[i]-a[i]`と
+    一致し、境界外64要素はセンチネル値のまま(書き込まれなかった)ことを
+    確認した。
+  6. **ワークスペース全体の検証**: `cargo test --workspace`で全テスト
+    (unittests 50件、変化なし+実機テスト計23本〈既存21本+今回2本〉)すべて
+    green、既存経路への回帰なし。`cargo build --workspace`/`cargo clippy
+    --workspace --all-targets`はいずれも警告0件。
+  7. **正直な開示・まだやっていないこと**: 検証できたのは「境界チェック
+    付き4項」の1点のみ。5項以上は未検証。`mul`のnegateフラグが立つケース、
+    今回未検証の順序組み合わせ(境界チェック無し版)は引き続き未検証。
+    open-cuda・aruaru-llmとの連携状況は前回エントリから変化なし。
+    テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS実機
+    検証・各クレートのexample充足状況棚卸しも前回エントリから変更なし
+    (未着手のまま)。
+  - 次にすべきこと: (1) 5項以上の境界チェック付きチェーン、または今回
+    未検証の順序組み合わせ(境界チェック無し版、`div`が先頭に来る等)、
+    (2) テクスチャサンプリング・スワップチェーンへの拡張、(3) AMD/Intel・
+    Linux/macOS実機検証、(4) 各クレートの公開APIexample充足状況の棚卸し、
+    (5) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+    ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
+    着手すること)。
