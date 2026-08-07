@@ -1533,3 +1533,73 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
     (5) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
     ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
     着手すること)。
+
+- **2026-08-07 直前エントリの次にすべきこと(1)を解消: 境界チェック付き
+  チェーンを5項へ拡張して実検証(DXBC/DXIL両方、コード変更は0行——
+  既存の`decode_chain_shape`/`resolve_dxil_calls_and_chain`一般化ロジックが
+  そのまま通用することを再確認)。ユーザー指示「dream-os・open-directx・
+  open-cuda・aruaru-llmの連携性強化・実用性向上・利便性向上・完成度向上」
+  (4リポジトリ並列作業、このリポジトリ内で完結)の一環**:
+  1. **事前確認**: `git status`クリーン、直前の境界チェック付き4項
+    チェーン対応がmainへ確定済みであることを確認してから着手。
+  2. **新規シェーダー2本**: `shaders/vector_add_mul_div_sub_add_chain5_
+    bounded.hlsl`(`if (i < ElementCount) { t1=A[i]+B[i]; t2=t1*A[i];
+    t3=t2/B[i]; t4=t3-A[i]; Out[i]=t4+B[i]; }`、UAV3本+cbuffer(b0)、境界
+    チェック付き4項〈add/mul/div/sub〉へaddをもう1回追加、`fxc.exe /T
+    cs_5_0`で実コンパイル)・`shaders/vector_add_mul_div_sub_add_chain5_
+    bounded_dxil.hlsl`(同一契約、`dxc.exe -T cs_6_0`で実コンパイル)。
+    `tools/compile-dxbc-shaders.ps1`に両方追記済み。
+  3. **実バイト列を確認してから着手(既存方針の継続)**: DXBC側
+    `examples/dump_shex`で実SHEX命令列をダンプ(22命令、境界チェック付き
+    4項チェーンの構成に5回目の演算(素直な`add`)が追加されただけの形
+    だった)。DXIL側`examples/dump_dxil`で`FUNCTION_BLOCK`をダンプし、
+    `Call`合計9個(境界チェック付き4項チェーンと同じ、UAV3本+cbuffer由来で
+    演算回数には依存しない)・`ExtractValue`3個・`Cmp2`1個・`Br`2個・
+    `BinOp`5個(add/mul/div/negated-add-as-sub/add)という構造を確認した。
+  4. **実装**: DXBC側`decode_chain_shape`・DXIL側`resolve_dxil_calls_and_
+    chain`のいずれも無改修で境界チェック+5項の組み合わせを正しく処理
+    できることを実機テストで確認した(プロダクションコードへの変更は
+    0行、直前3エントリと同じ結論)。
+  5. **実機テスト2本を新規追加**(`tests/vector_add_mul_div_sub_add_chain5_
+    bounded_real_vulkan.rs`〈DXBC〉・`tests/vector_add_mul_div_sub_add_
+    chain5_bounded_dxil_real_vulkan.rs`〈DXIL〉、既存の境界チェック付き
+    チェーン実機テストと同じパターン、ディスパッチ数320・論理要素数256)。
+    実際に確認した結果(誇張なし、実出力そのまま、NVIDIA GeForce GT 730)、
+    DXBC/DXIL両経路とも完全に同じ値:
+    ```
+    c[0]=81.012344, c[255]=57.960144, c[319]=-1
+    test dxbc_vector_add_mul_div_sub_add_chain5_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+    test dxil_vector_add_mul_div_sub_add_chain5_bounded_matches_cpu_reference_and_respects_bounds_on_real_vulkan_hardware ... ok
+    ```
+    有効範囲256要素すべてでCPU参照実装`((a[i]+b[i])*a[i])/b[i]-a[i]+b[i]`
+    と一致し、境界外64要素はセンチネル値のまま(書き込まれなかった)ことを
+    確認した。`read_uav_bind_points.len() == 6`(N+1規則、5項チェーンでも
+    成立)もDXBC側で実測確認した。
+  6. **ワークスペース全体の検証**: `cargo build --workspace`/`cargo clippy
+    --workspace --all-targets`はいずれも警告0件。`cargo test --workspace`
+    は既存の全実機テスト(グラフィックス5本+DXBC/DXIL Compute単一演算計8本
+    +DXBC/DXILチェーン群〈add/mul, sub/div, 3項, 4項, 4項〈sub先頭〉,
+    境界チェック付き2/3/4項〉計多数+今回の5項境界チェック付きチェーン2本)
+    +unittests(既存50件、今回の増分は既存呼び出しパスをそのまま通すのみ
+    のため単体テストは追加せず実機テストのみ追加)すべてgreenであることを
+    確認した(既存経路への回帰なし)。
+  7. **正直な開示・まだやっていないこと**: 検証できたのは「境界チェック
+    付き5項」の1点のみ。6項以上は未検証。`mul`のnegateフラグが立つケース、
+    5項以外の順序組み合わせ(境界チェック無し版、`div`が先頭に来る等)は
+    引き続き未検証。open-cuda・aruaru-llmとの連携状況は前回エントリから
+    変化なし(このパスではopen-cuda/aruaru-llm側のファイルには一切触れて
+    いない、指示通り担当リポジトリ内で完結させた)。テクスチャサンプリング・
+    スワップチェーン・AMD/Intel/Linux/macOS実機検証・各クレートの
+    example充足状況棚卸しも前回エントリから変更なし(未着手のまま)。
+    dream-os由来の東芝SBM/DeepSeek技術組み込み構想(本CLAUDE.md冒頭の
+    保留タスク)にも今回は着手していない(dream-os側の技術詳細調査が
+    前提のため、今回は既存の境界チェックチェーン一般化路線の延長を優先
+    した——次回の優先度判断はユーザー確認の上で行う)。
+  - 次にすべきこと: (1) 6項以上の境界チェック付きチェーン、または今回
+    未検証の順序組み合わせ(境界チェック無し版、`div`が先頭に来る等)、
+    (2) テクスチャサンプリング・スワップチェーンへの拡張、(3) AMD/Intel・
+    Linux/macOS実機検証、(4) 各クレートの公開APIexample充足状況の棚卸し、
+    (5) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+    ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
+    着手すること)、(6) 冒頭の東芝SBM/DeepSeek技術組み込み構想(調査から
+    着手が必要、dream-os側CLAUDE.mdの詳細確認が前提)。

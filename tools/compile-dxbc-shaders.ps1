@@ -52,6 +52,8 @@ Write-Host "OK: compiled vector_add_mul_chain_bounded.hlsl -> vector_add_mul_cha
 Write-Host "OK: compiled vector_add_mul_div_chain3_bounded.hlsl -> vector_add_mul_div_chain3_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 3-op chain, 2026-08-06)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_sub_chain4_bounded.hlsl -> vector_add_mul_div_sub_chain4_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 4-op chain, 2026-08-06)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_sub_add_chain5_bounded.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_sub_add_chain5_bounded.dxbc") /nologo
+Write-Host "OK: compiled vector_add_mul_div_sub_add_chain5_bounded.hlsl -> vector_add_mul_div_sub_add_chain5_bounded.dxbc (DXBC, SM5.0, cbuffer+ult+if+endif bounded 5-op chain, 2026-08-07)"
 
 # D3D11グラフィックスパイプライン(タスク2): 頂点/ピクセルシェーダーも
 # fxc.exe(SM<=5.1、DXBC)でコンパイルする。dxc.exeではない(dxc.exeは
@@ -116,3 +118,5 @@ Write-Host "OK: compiled vector_add_mul_chain_bounded_dxil.hlsl -> vector_add_mu
 Write-Host "OK: compiled vector_add_mul_div_chain3_bounded_dxil.hlsl -> vector_add_mul_div_chain3_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 3-op chain)"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_chain4_bounded.dxil")
 Write-Host "OK: compiled vector_add_mul_div_sub_chain4_bounded_dxil.hlsl -> vector_add_mul_div_sub_chain4_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 4-op chain)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_add_chain5_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_add_chain5_bounded.dxil")
+Write-Host "OK: compiled vector_add_mul_div_sub_add_chain5_bounded_dxil.hlsl -> vector_add_mul_div_sub_add_chain5_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 5-op chain, 2026-08-07)"
