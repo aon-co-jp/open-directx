@@ -2,6 +2,20 @@
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり(dream-os等8リポジトリ対象)。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
+> 📌 **最近の更新(2026-08-07)**: 境界チェック付きDXBC/DXILチェーンを
+> 6項へ拡張し、NVIDIA GT730実機で動作確認。dream-os/open-cuda/
+> aruaru-llmとの連携強化(SBM/DeepSeek移植等)を検討したが、既存の
+> DXBC/DXILチェーン生成ロジックへの深い理解を伴わない拡張は数値的な
+> 誤りを見逃すリスクがあると判断し、コード変更は行わず調査結果を
+> [CLAUDE.md](CLAUDE.md)へ正直に記録した。
+>
+> *English*: Extended the boundary-checked DXBC/DXIL chain to 6 terms,
+> verified on real NVIDIA GT730 hardware. Investigated deeper
+> integration with dream-os/open-cuda/aruaru-llm (SBM/DeepSeek
+> transplant) but decided against guessing extensions to the DXBC/DXIL
+> chain logic without deep domain understanding — no code changed there,
+> findings honestly recorded in [CLAUDE.md](CLAUDE.md).
+
 > **Updated 2026-07-25**: The dev-policy file (`CLAUDE.md`) heading was
 > renamed from "Development Policy & Dev Environment Rules" to
 > "Design Philosophy & Development Policy & Dev Environment Rules",
