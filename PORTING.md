@@ -532,3 +532,21 @@ These are **dev-dependencies only** — the published library
 does. A downstream consumer that wants to actually dispatch translated
 SPIR-V is expected to depend on `opencuda-vulkan` itself, the same way
 this crate's test does.
+
+## Bounds-checked chain generalization now covers 5 terms + kernel-level anti-cheat scope note (2026-08-06)
+
+The bounds-checked binary-op chain decoder (`decode_chain_shape` for
+DXBC, `resolve_dxil_calls_and_chain` for DXIL) has been exercised up to
+a **5-term** chain (`add->mul->div->sub->add`) on both DXBC and DXIL,
+with zero production-code changes required each time a new term count
+was added — only new compiled shaders + real-hardware tests. This is
+strong evidence the generalized instruction-walking approach (not
+per-shape hardcoding) was the right call from the start.
+
+**Scope note for anyone porting this project into a "run real Windows
+games on Linux" context**: kernel-level anti-cheat (Riot Vanguard,
+kernel-mode BattlEye, etc.) blocks Linux/Proton-style environments by
+design, independent of how complete this shader-translation layer gets.
+This is not a defect to "fix" — see `CLAUDE.md`'s 2026-08-06 HANDOFF
+entry for the full honest disclosure. Titles using such anti-cheat are
+out of reach for this project regardless of translation completeness.
