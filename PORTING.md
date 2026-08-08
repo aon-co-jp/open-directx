@@ -1,5 +1,20 @@
 # PORTING.md — what's reusable, by whom, and how
 
+> **2026-08-08 更新**: 境界チェック付き7項チェーンについてDXBC/DXIL両方の
+> 実装が揃った(`vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.hlsl`
+> を新規追加、実`dxc.exe`コンパイル+実GT730検証済み)。移設先で7項チェーンの
+> 変換ロジックを再利用する場合は、DXBC側・DXIL側どちらも同じ`decode_chain_
+> shape`/`translate_dxil_chain_to_spirv`系の関数を経由するため、片方だけ
+> 移植すると非対称なギャップが生じる点に注意(詳細はCLAUDE.md HANDOFF参照)。
+>
+> *English*: The boundary-checked 7-term chain now has both DXBC and DXIL
+> implementations (new `vector_add_mul_div_sub_add_mul_div_chain7_bounded_
+> dxil.hlsl`, real-`dxc.exe`-compiled and GT730-verified). When porting the
+> chain-translation logic elsewhere, note that DXBC and DXIL both go
+> through the same `decode_chain_shape`/`translate_dxil_chain_to_spirv`-
+> family functions — porting only one side reintroduces the asymmetry gap
+> just closed. See CLAUDE.md HANDOFF for details.
+
 > **2026-07-25 更新**: 開発方針ファイル(`CLAUDE.md`)の見出しを
 > 「設計思想＆開発方針＆開発環境ルール」へ改名しました
 > (設計思想・開発方針・開発環境ルールを明確に区別)。移設先でも
