@@ -143,6 +143,87 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き5) 実Linux環境(WSL2 Ubuntu)でグラフィックスパイプライン
+  デモを実際にビルド・実行——「dream-os/Linux上でopen-directxが実際に
+  何かを動かせることを見せる」というユーザー要望に対応**:
+  1. **背景**: ユーザーからarchive.orgのSpace Harrier(Internet Arcade)を
+     引き合いに出された際、これはブラウザ内WASMエミュレータ
+     (EmulatorJS/RetroArchのMAMEコア、WebGL/WebGPU描画)であり実際の
+     Windows DirectXバイナリとは無関係(そもそもDirectX自体を使わない
+     1985年のアーケード基板向けゲーム)であることを説明し、代わりに
+     このリポジトリ既存の`triangle_vs.hlsl`/`triangle_ps.hlsl`
+     (DXBC→SPIR-V変換・実描画まで実装済み)を実Linux機で動かす方が
+     筋が通ると提案し、ユーザーの同意を得て着手した。
+  2. **環境**: このマシンに実物理Linux機は無いため、既存の運用実績
+     (`open-runo`/`open-web-server`等のCLAUDE.md参照)がある**WSL2
+     Ubuntu**(`wsl -d Ubuntu`、カーネル`6.18.33.2-microsoft-standard-
+     WSL2`)を実Linux ABI環境として使用した——これはWindows上の仮想化
+     ではあるが、実際のLinuxカーネル・Linuxのシステムコール・Linux版
+     Vulkanローダー/ドライバ(Windows版とは別物)を使うため、「Linux上で
+     動くか」という問いに対する正当な検証環境である。
+  3. **セットアップ**: `libvulkan1`(Vulkanローダー)・
+     `mesa-vulkan-drivers`(Mesaの各種Vulkan ICD)をapt経由で導入
+     (`vulkan-tools`のみ、対話的sudoパスワード入力が必要で今回の
+     自動化セッションからは導入できなかった——ただし`vulkaninfo`
+     CLIツール自体は実行に必須ではないため、実デモの実行には支障
+     無かった)。
+  4. **実行結果(誇張なし、実出力そのまま)**: `/mnt/f/runo/open-directx`
+     (Windows側F:ドライブのリポジトリをWSL2からマウント経由でそのまま
+     参照、追加clone不要)で`cargo run -p directx-graphics-vulkan
+     --example render_triangle --release`を実際に実行し、**Windows向けに
+     ビルドされたバイナリを一切使わず、Linux ELFバイナリとしてゼロから
+     再コンパイル**した上で成功:
+     ```
+     描画成功: 256x256のグラデーション三角形を render_triangle.ppm に保存しました。
+     ```
+     生成された`render_triangle.ppm`(196,623バイト、正しいPPM P6
+     ヘッダ`256 256`、実際の赤/緑/青グラデーションのRGBピクセルデータ)
+     を確認した(検証後、生成物は削除済み・`.gitignore`対象のため
+     コミット対象外)。
+  5. **`cargo test -p directx-graphics-vulkan --release -- --nocapture`
+     も実際にLinux上で実行し、既存の実機テスト5本すべてがgreen**
+     (誇張なし、実出力そのまま):
+     ```
+     OK: enumerate_graphics_devices reported 1 graphics-capable device(s): [GraphicsDeviceInfo { name: "llvmpipe (LLVM 21.1.8, 256 bits)", vendor_id: 65541, vendor: "Unknown" }]
+     test enumerate_graphics_devices_reports_the_real_gpu_on_this_machine ... ok
+     test indexed_scene_with_depth_buffer_keeps_the_nearer_triangle_on_real_vulkan_hardware ... ok
+     test d3d11_triangle_pixel_position_maps_to_the_expected_ndc_coordinate_on_real_vulkan_hardware ... ok
+     test d3d11_triangle_draw_call_interpolates_distinct_per_vertex_colors_on_real_vulkan_hardware ... ok
+     test d3d11_triangle_draw_call_matches_passthrough_vertex_color_on_real_vulkan_hardware ... ok
+     test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+     ```
+     深度バッファ比較・ピクセル↔NDC変換式・頂点色補間・パススルー色
+     一致という、Windows実機(NVIDIA GT 730)で既に検証済みの4つの
+     強いアサーションすべてが、**同一のコード・同一のDXBC由来SPIR-V
+     バイト列で、Linux上でも一致する結果を出した**ことを確認した——
+     コードの再実装・条件分岐無し、`#[cfg(windows)]`のような
+     プラットフォーム分岐も一切書いていない(既存のコード自体が
+     元々プラットフォーム非依存であることの直接証明)。
+  6. **正直な開示(誇張しない)**: (1) **実際に使われたVulkanデバイスは
+     `llvmpipe`(Mesaのソフトウェアラスタライザ、CPU上でVulkanを
+     エミュレート)であり、実GPUハードウェアではない**——WSL2から
+     ホストのGPU(このマシンのNVIDIA GT 730)へVulkan経由でアクセス
+     するには追加のドライバ設定(WSLg/DirectX-to-Vulkan変換層である
+     `dozen`ICD等)が必要で、今回はそこまで到達していない。
+     つまり今回証明できたのは「コードがLinux ABI上で正しく動作する
+     こと」であり、「Linux上で実GPUハードウェアアクセラレーションが
+     効くこと」ではない——後者は次回以降の課題として正直に残す。
+     (2) `directx-shader-translate`クレート自体のCompute Shader系
+     テスト(`opencuda-vulkan`への`cross-repo`パス依存を持つ)はこの
+     パスではLinux上で実行していない(`open-cuda`リポジトリを
+     WSL側にも配置する必要があり、今回はグラフィックス側のみに
+     スコープを絞った)。(3) vulkan-tools(`vulkaninfo`)は対話的sudo
+     認証が必要で導入できなかった——今後同様の検証を行う際は、
+     ユーザー自身が事前に`sudo apt-get install vulkan-tools`を実行して
+     おくと、より詳細なデバイス診断ができる。
+  - 次にすべきこと: (1) WSL2からホストGPU(NVIDIA GT 730)への実
+    ハードウェアVulkanアクセス(`dozen`ICD等)の設定・実機検証、
+    (2) `directx-shader-translate`のCompute Shader系テストもLinux側で
+    実行できるよう`open-cuda`リポジトリをWSL側に用意する、(3) 実際の
+    物理Linux機(このマシン以外)での再現性確認、(4) 10項以上への
+    境界チェック付きチェーン拡張、(5) テクスチャサンプリング・
+    スワップチェーンへの拡張。
+
 - **2026-08-08(続き4) `mul`のnegateフラグが立つケースを実装・実機検証
   (複数回のHANDOFFエントリで「未検証」と記録されていたギャップを解消)**:
   1. **新規シェーダー**: `shaders/vector_mul_negate.hlsl`
