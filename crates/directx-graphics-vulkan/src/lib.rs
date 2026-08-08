@@ -942,25 +942,63 @@ pub struct TextureRgba8 {
     pub pixels: Vec<Rgba8>,
 }
 
-/// The 2Dスプライト描画プロトタイプ(2026-08-08): a full-viewport textured
-/// quad, sampling `texture` via `sprite_vs.dxbc`/`sprite_ps.dxbc`'s translated
-/// SPIR-V (the first shader pair in this repo to use texture sampling —
+/// A full-viewport textured quad, sampling `texture` via
+/// `sprite_vs.dxbc`/`sprite_ps.dxbc`'s translated SPIR-V (the first shader
+/// pair in this repo to use texture sampling —
 /// `directx_shader_translate::spirv_gen::{translate_sprite_vertex_shader,
 /// translate_sprite_pixel_shader}`). Uses `NEAREST` filtering (not `LINEAR`)
 /// so that read-back pixel colors map deterministically to source texel
 /// colors without blending ambiguity, which is what the accompanying tests
 /// need to assert exact texel values.
 ///
-/// This is a separate, self-contained function (not a variant of
-/// [`render_triangle_and_read_back`]) for the same reason
-/// [`render_indexed_scene_with_depth_and_read_back`] is separate: a
-/// genuinely different pipeline shape (descriptor sets, image upload,
-/// sampler) added to an already-tested function on the one GPU available
-/// here would risk an unverifiable regression.
+/// A thin wrapper around [`render_sprites_and_read_back`] with a single
+/// full-viewport instance (2026-08-08 — this used to be its own
+/// self-contained function; it was generalized to support multiple sprites,
+/// and this wrapper preserves the exact same rendered result so its existing
+/// real-hardware test keeps exercising the identical code path).
 pub fn render_textured_quad_and_read_back(
     vs_spirv: &[u32],
     ps_spirv: &[u32],
     texture: &TextureRgba8,
+    width: u32,
+    height: u32,
+) -> Result<Vec<Rgba8>> {
+    render_sprites_and_read_back(
+        vs_spirv,
+        ps_spirv,
+        texture,
+        &[SpriteInstance { dest_ndc: [-1.0, -1.0, 1.0, 1.0], uv_rect: [0.0, 0.0, 1.0, 1.0] }],
+        width,
+        height,
+    )
+}
+
+/// One sprite draw: `dest_ndc` is `[x0, y0, x1, y1]` (two opposite corners,
+/// NDC space, matching this crate's existing convention where `(-1,-1)` is
+/// the bottom-left of the viewport in D3D11's coordinate sense and `y`
+/// increases toward `(1,1)` at the top-right — the same convention
+/// [`render_textured_quad_and_read_back`]'s single hardcoded quad already
+/// used). `uv_rect` is `[u0, v0, u1, v1]` into the shared `texture` (2026-08-08,
+/// multi-sprite / sprite-sheet extension of the single-quad prototype).
+#[derive(Debug, Clone, Copy)]
+pub struct SpriteInstance {
+    pub dest_ndc: [f32; 4],
+    pub uv_rect: [f32; 4],
+}
+
+/// Renders `sprites.len()` independent textured quads (all sampling the same
+/// `texture`, e.g. a sprite sheet/atlas) into one framebuffer in a single draw
+/// call, and reads the result back. This is the data-driven generalization of
+/// [`render_textured_quad_and_read_back`] (added 2026-08-08, "multiple
+/// sprites on screen" increment toward a game-loop prototype) — that function
+/// is now a thin wrapper calling this one with a single full-viewport
+/// instance, so its already-passing real-hardware test continues to exercise
+/// the exact same code path.
+pub fn render_sprites_and_read_back(
+    vs_spirv: &[u32],
+    ps_spirv: &[u32],
+    texture: &TextureRgba8,
+    sprites: &[SpriteInstance],
     width: u32,
     height: u32,
 ) -> Result<Vec<Rgba8>> {
@@ -1267,24 +1305,30 @@ pub fn render_textured_quad_and_read_back(
         .build();
     unsafe { device.update_descriptor_sets(&[write], &[]) };
 
-    // --- Vertex buffer: a full-viewport quad (2 triangles, 6 vertices,
-    //     POSITION vec3 + TEXCOORD vec2), UV (0,0)..(1,1) across the quad so
-    //     the whole source texture maps onto the visible viewport. ---
+    // --- Vertex buffer: each sprite instance contributes one quad (2
+    //     triangles, 6 vertices, POSITION vec3 + TEXCOORD vec2), built from
+    //     its own `dest_ndc`/`uv_rect` (2026-08-08, data-driven — previously
+    //     this was a single hardcoded full-viewport quad). ---
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct Vertex {
         pos: [f32; 3],
         uv: [f32; 2],
     }
-    let vertices = [
-        Vertex { pos: [-1.0, -1.0, 0.0], uv: [0.0, 0.0] },
-        Vertex { pos: [1.0, -1.0, 0.0], uv: [1.0, 0.0] },
-        Vertex { pos: [1.0, 1.0, 0.0], uv: [1.0, 1.0] },
-        Vertex { pos: [-1.0, -1.0, 0.0], uv: [0.0, 0.0] },
-        Vertex { pos: [1.0, 1.0, 0.0], uv: [1.0, 1.0] },
-        Vertex { pos: [-1.0, 1.0, 0.0], uv: [0.0, 1.0] },
-    ];
-    let vbuf_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
+    if sprites.is_empty() {
+        return Err(GraphicsError::NoGraphicsDevice); // narrow error type; an empty draw is a caller bug
+    }
+    let mut vertices: Vec<Vertex> = Vec::with_capacity(sprites.len() * 6);
+    for s in sprites {
+        let [x0, y0, x1, y1] = s.dest_ndc;
+        let [u0, v0, u1, v1] = s.uv_rect;
+        let tl = Vertex { pos: [x0, y0, 0.0], uv: [u0, v0] };
+        let tr = Vertex { pos: [x1, y0, 0.0], uv: [u1, v0] };
+        let br = Vertex { pos: [x1, y1, 0.0], uv: [u1, v1] };
+        let bl = Vertex { pos: [x0, y1, 0.0], uv: [u0, v1] };
+        vertices.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+    }
+    let vbuf_size = std::mem::size_of_val(vertices.as_slice()) as vk::DeviceSize;
     let (vertex_buffer, vertex_buffer_memory) =
         create_host_visible_buffer(&device, &memory_properties, vbuf_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
     unsafe {

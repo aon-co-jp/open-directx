@@ -143,6 +143,47 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き7) 複数スプライト描画(スプライトシート対応)へ拡張、
+  Windows/Linux両方の実機で検証——直前エントリの「次にすべきこと(1)」の
+  一部を解消**:
+  1. **実装**(`crates/directx-graphics-vulkan/src/lib.rs`): 新規
+     `SpriteInstance { dest_ndc: [f32;4], uv_rect: [f32;4] }`(画面上の
+     矩形位置とテクスチャ内の切り出し矩形を独立指定)・新規
+     `render_sprites_and_read_back(vs, ps, texture, sprites: &[SpriteInstance],
+     width, height)`(N個のスプライトインスタンスを1回の描画コマンドで
+     まとめて描画、頂点バッファをスプライト数に応じて動的に構築)。
+     既存の`render_textured_quad_and_read_back`は、この新関数を単一の
+     フルビューポートインスタンスで呼ぶ薄いラッパーへ変更した——**既存の
+     実機テスト(市松模様4象限一致)は無変更のまま同じ結果を出すことを
+     確認済み**(リファクタが既存の検証済み挙動を壊していないことの
+     直接証拠)。
+  2. **実機検証(Windows NVIDIA GT 730 + Linux WSL2 Ubuntu/Mesa
+     llvmpipe、両方で一致)**: 新規テスト
+     `multiple_sprites_from_a_shared_atlas_render_at_independent_screen_
+     positions_on_real_vulkan_hardware`で、同じ4色市松模様アトラス
+     テクスチャから異なる矩形(左上=red・右下=yellow)を切り出し、
+     1回の描画コマンドで画面の左半分・右半分という独立した位置へ
+     それぞれ描画。読み戻したフレームバッファの左半分全ピクセルがred・
+     右半分全ピクセルがyellowと完全一致することを両OS実機で確認した。
+  3. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件(Windows)。`cargo test --workspace --release`で
+     全実機テスト(既存29本+今回1本の計30本)+unittests 53件すべて
+     green、既存経路への回帰なし。
+  4. **正直な開示**: (1) スプライトのアニメーション(時間経過に応じた
+     UV矩形の切り替え)・実際のキー入力によるゲームループはまだ未実装
+     ——今回は「複数の静的スプライトを異なる位置に同時描画できる」
+     ところまで。(2) 画像ファイル(PNG等)からのテクスチャ読み込みは
+     引き続き未実装(テストはコード内でRGBA8配列を直接構築)。(3)
+     `NEAREST`フィルタのみ対応、透過(アルファブレンド)は今回未検証
+     (`color_blend_attachment.blend_enable = vk::FALSE`のまま)。
+  - 次にすべきこと: (1) 簡単な入力処理とゲームループ(スプライト位置を
+    フレームごとに更新)の実装、(2) アルファブレンド(半透明スプライト)
+    への対応、(3) 画像ファイル(PNG等)からのテクスチャ読み込み、
+    (4) 10項以上への境界チェック付きチェーン拡張、(5) WSL2から
+    ホストGPUへの実ハードウェアVulkanアクセスの設定(前回エントリから
+    継続)。
+
 - **2026-08-08(続き6) 2Dスプライト描画プロトタイプ第一歩:
   テクスチャサンプリング(`Texture2D.Sample`)を初実装、Windows/Linux
   両方の実機で検証——ユーザー指示「dream-os/Linux上でopen-directx経由で
