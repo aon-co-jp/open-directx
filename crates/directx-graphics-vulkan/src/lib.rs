@@ -933,6 +933,537 @@ pub fn render_indexed_scene_with_depth_and_read_back(
     Ok(pixels)
 }
 
+/// An RGBA8 texture to upload and sample (2026-08-08, sprite rendering
+/// prototype). `pixels.len()` must equal `width * height`.
+#[derive(Debug, Clone)]
+pub struct TextureRgba8 {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<Rgba8>,
+}
+
+/// The 2Dスプライト描画プロトタイプ(2026-08-08): a full-viewport textured
+/// quad, sampling `texture` via `sprite_vs.dxbc`/`sprite_ps.dxbc`'s translated
+/// SPIR-V (the first shader pair in this repo to use texture sampling —
+/// `directx_shader_translate::spirv_gen::{translate_sprite_vertex_shader,
+/// translate_sprite_pixel_shader}`). Uses `NEAREST` filtering (not `LINEAR`)
+/// so that read-back pixel colors map deterministically to source texel
+/// colors without blending ambiguity, which is what the accompanying tests
+/// need to assert exact texel values.
+///
+/// This is a separate, self-contained function (not a variant of
+/// [`render_triangle_and_read_back`]) for the same reason
+/// [`render_indexed_scene_with_depth_and_read_back`] is separate: a
+/// genuinely different pipeline shape (descriptor sets, image upload,
+/// sampler) added to an already-tested function on the one GPU available
+/// here would risk an unverifiable regression.
+pub fn render_textured_quad_and_read_back(
+    vs_spirv: &[u32],
+    ps_spirv: &[u32],
+    texture: &TextureRgba8,
+    width: u32,
+    height: u32,
+) -> Result<Vec<Rgba8>> {
+    let entry = unsafe { Entry::load() }.map_err(|e| GraphicsError::LoaderLoad(e.to_string()))?;
+
+    let app_name = CString::new("open-directx").unwrap();
+    let app_info = vk::ApplicationInfo::builder()
+        .application_name(&app_name)
+        .application_version(vk::make_api_version(0, 0, 1, 0))
+        .engine_name(&app_name)
+        .engine_version(vk::make_api_version(0, 0, 1, 0))
+        .api_version(vk::API_VERSION_1_1);
+    let instance_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+    let instance = unsafe { entry.create_instance(&instance_info, None) }
+        .map_err(|e| GraphicsError::CreateInstance(e.to_string()))?;
+    let guard = InstanceGuard { instance: &instance };
+
+    let physical_devices = unsafe { instance.enumerate_physical_devices() }
+        .map_err(|e| GraphicsError::Vk("vkEnumeratePhysicalDevices", e))?;
+    let mut selected: Option<(vk::PhysicalDevice, u32)> = None;
+    for &pd in &physical_devices {
+        let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
+        if let Some((idx, _)) = families
+            .iter()
+            .enumerate()
+            .find(|(_, f)| f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        {
+            selected = Some((pd, idx as u32));
+            break;
+        }
+    }
+    let (physical_device, queue_family_index) = selected.ok_or(GraphicsError::NoGraphicsDevice)?;
+
+    let priorities = [1.0f32];
+    let queue_info = [vk::DeviceQueueCreateInfo::builder()
+        .queue_family_index(queue_family_index)
+        .queue_priorities(&priorities)
+        .build()];
+    let device_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    let device = unsafe { instance.create_device(physical_device, &device_info, None) }
+        .map_err(|e| GraphicsError::Vk("vkCreateDevice", e))?;
+    let dguard = DeviceGuard { device: &device };
+
+    let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+    let memory_properties = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+
+    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+
+    // --- Color attachment image (device-local, render target + copy source) ---
+    let image_info = vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(FORMAT)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let color_image = unsafe { device.create_image(&image_info, None) }
+        .map_err(|e| GraphicsError::Vk("vkCreateImage(color)", e))?;
+    let color_mem_req = unsafe { device.get_image_memory_requirements(color_image) };
+    let color_mem_type = find_memory_type(&memory_properties, color_mem_req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .ok_or(GraphicsError::NoGraphicsDevice)?;
+    let color_alloc = vk::MemoryAllocateInfo::builder().allocation_size(color_mem_req.size).memory_type_index(color_mem_type);
+    let color_memory = unsafe { device.allocate_memory(&color_alloc, None) }.map_err(|e| GraphicsError::Vk("vkAllocateMemory(color)", e))?;
+    unsafe { device.bind_image_memory(color_image, color_memory, 0) }.map_err(|e| GraphicsError::Vk("vkBindImageMemory(color)", e))?;
+
+    let color_view_info = vk::ImageViewCreateInfo::builder()
+        .image(color_image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let color_view = unsafe { device.create_image_view(&color_view_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateImageView(color)", e))?;
+
+    // --- Render pass (same shape as render_triangle_and_read_back) ---
+    let attachment = vk::AttachmentDescription::builder()
+        .format(FORMAT)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+        .build();
+    let color_ref = vk::AttachmentReference { attachment: 0, layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL };
+    let color_refs = [color_ref];
+    let subpass = vk::SubpassDescription::builder()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs)
+        .build();
+    let attachments = [attachment];
+    let subpasses = [subpass];
+    let dependency = vk::SubpassDependency::builder()
+        .src_subpass(vk::SUBPASS_EXTERNAL)
+        .dst_subpass(0)
+        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+        .build();
+    let dependencies = [dependency];
+    let render_pass_info = vk::RenderPassCreateInfo::builder()
+        .attachments(&attachments)
+        .subpasses(&subpasses)
+        .dependencies(&dependencies);
+    let render_pass = unsafe { device.create_render_pass(&render_pass_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateRenderPass", e))?;
+
+    let attachments_fb = [color_view];
+    let framebuffer_info = vk::FramebufferCreateInfo::builder()
+        .render_pass(render_pass)
+        .attachments(&attachments_fb)
+        .width(width)
+        .height(height)
+        .layers(1);
+    let framebuffer = unsafe { device.create_framebuffer(&framebuffer_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateFramebuffer", e))?;
+
+    // --- Texture image: staging buffer (host-visible) -> device-local
+    //     SAMPLED|TRANSFER_DST image, with the two layout transitions a
+    //     texture upload requires (UNDEFINED -> TRANSFER_DST_OPTIMAL for the
+    //     copy, then -> SHADER_READ_ONLY_OPTIMAL for sampling). ---
+    let tex_pixel_count = (texture.width as usize) * (texture.height as usize);
+    if texture.pixels.len() != tex_pixel_count {
+        return Err(GraphicsError::NoGraphicsDevice); // narrow error type; mismatched texture data is a caller bug
+    }
+    let tex_bytes_size = (tex_pixel_count * 4) as vk::DeviceSize;
+    let (staging_buffer, staging_memory) =
+        create_host_visible_buffer(&device, &memory_properties, tex_bytes_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+    unsafe {
+        let ptr = device
+            .map_memory(staging_memory, 0, tex_bytes_size, vk::MemoryMapFlags::empty())
+            .map_err(|e| GraphicsError::Vk("vkMapMemory(staging)", e))?;
+        let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, tex_bytes_size as usize);
+        for (i, p) in texture.pixels.iter().enumerate() {
+            dst[i * 4] = p.r;
+            dst[i * 4 + 1] = p.g;
+            dst[i * 4 + 2] = p.b;
+            dst[i * 4 + 3] = p.a;
+        }
+        device.unmap_memory(staging_memory);
+    }
+
+    let tex_image_info = vk::ImageCreateInfo::builder()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(FORMAT)
+        .extent(vk::Extent3D { width: texture.width, height: texture.height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let tex_image = unsafe { device.create_image(&tex_image_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateImage(texture)", e))?;
+    let tex_mem_req = unsafe { device.get_image_memory_requirements(tex_image) };
+    let tex_mem_type = find_memory_type(&memory_properties, tex_mem_req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .ok_or(GraphicsError::NoGraphicsDevice)?;
+    let tex_alloc = vk::MemoryAllocateInfo::builder().allocation_size(tex_mem_req.size).memory_type_index(tex_mem_type);
+    let tex_memory = unsafe { device.allocate_memory(&tex_alloc, None) }.map_err(|e| GraphicsError::Vk("vkAllocateMemory(texture)", e))?;
+    unsafe { device.bind_image_memory(tex_image, tex_memory, 0) }.map_err(|e| GraphicsError::Vk("vkBindImageMemory(texture)", e))?;
+
+    let tex_view_info = vk::ImageViewCreateInfo::builder()
+        .image(tex_image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(FORMAT)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let tex_view = unsafe { device.create_image_view(&tex_view_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateImageView(texture)", e))?;
+
+    // NEAREST (not LINEAR): the tests need read-back colors to equal exact
+    // source texel values, not a blend of neighbors.
+    let sampler_info = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::NEAREST)
+        .min_filter(vk::Filter::NEAREST)
+        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+        .unnormalized_coordinates(false);
+    let sampler = unsafe { device.create_sampler(&sampler_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateSampler", e))?;
+
+    // --- Upload: pool/buffer for the one-shot upload commands, submitted and
+    //     waited on before the render pool/buffer is even created (simpler
+    //     than interleaving into one command buffer with a manual dependency
+    //     between an image-transition write and a render pass read). ---
+    let upload_pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family_index);
+    let upload_pool = unsafe { device.create_command_pool(&upload_pool_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateCommandPool(upload)", e))?;
+    let upload_cmd_info = vk::CommandBufferAllocateInfo::builder()
+        .command_pool(upload_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let upload_cmd = unsafe { device.allocate_command_buffers(&upload_cmd_info) }.map_err(|e| GraphicsError::Vk("vkAllocateCommandBuffers(upload)", e))?[0];
+    let upload_begin = vk::CommandBufferBeginInfo::builder();
+    unsafe { device.begin_command_buffer(upload_cmd, &upload_begin) }.map_err(|e| GraphicsError::Vk("vkBeginCommandBuffer(upload)", e))?;
+
+    let subresource = vk::ImageSubresourceRange {
+        aspect_mask: vk::ImageAspectFlags::COLOR,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    };
+    let to_transfer_dst = vk::ImageMemoryBarrier::builder()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .image(tex_image)
+        .subresource_range(subresource)
+        .build();
+    unsafe {
+        device.cmd_pipeline_barrier(
+            upload_cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer_dst],
+        );
+        let copy_region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D { width: texture.width, height: texture.height, depth: 1 },
+        };
+        device.cmd_copy_buffer_to_image(upload_cmd, staging_buffer, tex_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_region]);
+
+        let to_shader_read = vk::ImageMemoryBarrier::builder()
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .image(tex_image)
+            .subresource_range(subresource)
+            .build();
+        device.cmd_pipeline_barrier(
+            upload_cmd,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_shader_read],
+        );
+    }
+    unsafe { device.end_command_buffer(upload_cmd) }.map_err(|e| GraphicsError::Vk("vkEndCommandBuffer(upload)", e))?;
+    let upload_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.map_err(|e| GraphicsError::Vk("vkCreateFence(upload)", e))?;
+    let upload_cmds = [upload_cmd];
+    let upload_submit = vk::SubmitInfo::builder().command_buffers(&upload_cmds).build();
+    unsafe { device.queue_submit(queue, &[upload_submit], upload_fence) }.map_err(|e| GraphicsError::Vk("vkQueueSubmit(upload)", e))?;
+    unsafe { device.wait_for_fences(&[upload_fence], true, u64::MAX) }.map_err(|e| GraphicsError::Vk("vkWaitForFences(upload)", e))?;
+
+    // --- Descriptor set: one combined image sampler at set=0/binding=0,
+    //     matching sprite_ps's translated SPIR-V layout. ---
+    let dsl_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .build();
+    let dsl_bindings = [dsl_binding];
+    let dsl_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&dsl_bindings);
+    let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&dsl_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateDescriptorSetLayout", e))?;
+
+    let pool_size = vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 };
+    let pool_sizes = [pool_size];
+    let descriptor_pool_info = vk::DescriptorPoolCreateInfo::builder().pool_sizes(&pool_sizes).max_sets(1);
+    let descriptor_pool = unsafe { device.create_descriptor_pool(&descriptor_pool_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateDescriptorPool", e))?;
+
+    let set_layouts = [descriptor_set_layout];
+    let ds_alloc_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(descriptor_pool).set_layouts(&set_layouts);
+    let descriptor_set = unsafe { device.allocate_descriptor_sets(&ds_alloc_info) }.map_err(|e| GraphicsError::Vk("vkAllocateDescriptorSets", e))?[0];
+
+    let image_info = vk::DescriptorImageInfo::builder()
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .image_view(tex_view)
+        .sampler(sampler)
+        .build();
+    let image_infos = [image_info];
+    let write = vk::WriteDescriptorSet::builder()
+        .dst_set(descriptor_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&image_infos)
+        .build();
+    unsafe { device.update_descriptor_sets(&[write], &[]) };
+
+    // --- Vertex buffer: a full-viewport quad (2 triangles, 6 vertices,
+    //     POSITION vec3 + TEXCOORD vec2), UV (0,0)..(1,1) across the quad so
+    //     the whole source texture maps onto the visible viewport. ---
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Vertex {
+        pos: [f32; 3],
+        uv: [f32; 2],
+    }
+    let vertices = [
+        Vertex { pos: [-1.0, -1.0, 0.0], uv: [0.0, 0.0] },
+        Vertex { pos: [1.0, -1.0, 0.0], uv: [1.0, 0.0] },
+        Vertex { pos: [1.0, 1.0, 0.0], uv: [1.0, 1.0] },
+        Vertex { pos: [-1.0, -1.0, 0.0], uv: [0.0, 0.0] },
+        Vertex { pos: [1.0, 1.0, 0.0], uv: [1.0, 1.0] },
+        Vertex { pos: [-1.0, 1.0, 0.0], uv: [0.0, 1.0] },
+    ];
+    let vbuf_size = std::mem::size_of_val(&vertices) as vk::DeviceSize;
+    let (vertex_buffer, vertex_buffer_memory) =
+        create_host_visible_buffer(&device, &memory_properties, vbuf_size, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+    unsafe {
+        let ptr = device
+            .map_memory(vertex_buffer_memory, 0, vbuf_size, vk::MemoryMapFlags::empty())
+            .map_err(|e| GraphicsError::Vk("vkMapMemory(vertex)", e))?;
+        std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, ptr as *mut u8, vbuf_size as usize);
+        device.unmap_memory(vertex_buffer_memory);
+    }
+
+    let vs_module_info = vk::ShaderModuleCreateInfo::builder().code(vs_spirv);
+    let vs_module = unsafe { device.create_shader_module(&vs_module_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateShaderModule(vs)", e))?;
+    let ps_module_info = vk::ShaderModuleCreateInfo::builder().code(ps_spirv);
+    let ps_module = unsafe { device.create_shader_module(&ps_module_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateShaderModule(ps)", e))?;
+
+    let entry_name = CString::new("main").unwrap();
+    let stages = [
+        vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::VERTEX).module(vs_module).name(&entry_name).build(),
+        vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::FRAGMENT).module(ps_module).name(&entry_name).build(),
+    ];
+
+    let binding_desc = vk::VertexInputBindingDescription {
+        binding: 0,
+        stride: std::mem::size_of::<Vertex>() as u32,
+        input_rate: vk::VertexInputRate::VERTEX,
+    };
+    let attr_descs = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription {
+            location: 1,
+            binding: 0,
+            format: vk::Format::R32G32_SFLOAT,
+            offset: std::mem::size_of::<[f32; 3]>() as u32,
+        },
+    ];
+    let binding_descs = [binding_desc];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo::builder()
+        .vertex_binding_descriptions(&binding_descs)
+        .vertex_attribute_descriptions(&attr_descs);
+
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::builder()
+        .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+        .primitive_restart_enable(false);
+
+    let viewport = vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 };
+    let scissor = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } };
+    let viewports = [viewport];
+    let scissors = [scissor];
+    let viewport_state = vk::PipelineViewportStateCreateInfo::builder().viewports(&viewports).scissors(&scissors);
+
+    let rasterization = vk::PipelineRasterizationStateCreateInfo::builder()
+        .depth_clamp_enable(false)
+        .rasterizer_discard_enable(false)
+        .polygon_mode(vk::PolygonMode::FILL)
+        .cull_mode(vk::CullModeFlags::NONE)
+        .front_face(vk::FrontFace::CLOCKWISE)
+        .depth_bias_enable(false)
+        .line_width(1.0);
+
+    let multisample = vk::PipelineMultisampleStateCreateInfo::builder().rasterization_samples(vk::SampleCountFlags::TYPE_1).sample_shading_enable(false);
+
+    let color_blend_attachment = vk::PipelineColorBlendAttachmentState {
+        blend_enable: vk::FALSE,
+        color_write_mask: vk::ColorComponentFlags::RGBA,
+        ..Default::default()
+    };
+    let color_blend_attachments = [color_blend_attachment];
+    let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().logic_op_enable(false).attachments(&color_blend_attachments);
+
+    let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder().set_layouts(&set_layouts);
+    let pipeline_layout = unsafe { device.create_pipeline_layout(&pipeline_layout_info, None) }.map_err(|e| GraphicsError::Vk("vkCreatePipelineLayout", e))?;
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo::builder()
+        .stages(&stages)
+        .vertex_input_state(&vertex_input)
+        .input_assembly_state(&input_assembly)
+        .viewport_state(&viewport_state)
+        .rasterization_state(&rasterization)
+        .multisample_state(&multisample)
+        .color_blend_state(&color_blend)
+        .layout(pipeline_layout)
+        .render_pass(render_pass)
+        .subpass(0)
+        .build();
+    let pipelines = unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None) }
+        .map_err(|(_, e)| GraphicsError::Vk("vkCreateGraphicsPipelines", e))?;
+    let pipeline = pipelines[0];
+
+    let readback_size = (width * height * 4) as vk::DeviceSize;
+    let (readback_buffer, readback_memory) =
+        create_host_visible_buffer(&device, &memory_properties, readback_size, vk::BufferUsageFlags::TRANSFER_DST)?;
+
+    let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family_index);
+    let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(|e| GraphicsError::Vk("vkCreateCommandPool", e))?;
+    let cmd_alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+    let cmd = unsafe { device.allocate_command_buffers(&cmd_alloc_info) }.map_err(|e| GraphicsError::Vk("vkAllocateCommandBuffers", e))?[0];
+
+    let begin_info = vk::CommandBufferBeginInfo::builder();
+    unsafe { device.begin_command_buffer(cmd, &begin_info) }.map_err(|e| GraphicsError::Vk("vkBeginCommandBuffer", e))?;
+
+    let clear_value = vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } };
+    let clear_values = [clear_value];
+    let render_pass_begin = vk::RenderPassBeginInfo::builder()
+        .render_pass(render_pass)
+        .framebuffer(framebuffer)
+        .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } })
+        .clear_values(&clear_values);
+    unsafe {
+        device.cmd_begin_render_pass(cmd, &render_pass_begin, vk::SubpassContents::INLINE);
+        device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+        device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline_layout, 0, &[descriptor_set], &[]);
+        device.cmd_bind_vertex_buffers(cmd, 0, &[vertex_buffer], &[0]);
+        device.cmd_draw(cmd, vertices.len() as u32, 1, 0, 0);
+        device.cmd_end_render_pass(cmd);
+
+        let region = vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D { width, height, depth: 1 },
+        };
+        device.cmd_copy_image_to_buffer(cmd, color_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, readback_buffer, &[region]);
+    }
+    unsafe { device.end_command_buffer(cmd) }.map_err(|e| GraphicsError::Vk("vkEndCommandBuffer", e))?;
+
+    let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.map_err(|e| GraphicsError::Vk("vkCreateFence", e))?;
+    let cmds = [cmd];
+    let submit_info = vk::SubmitInfo::builder().command_buffers(&cmds).build();
+    unsafe { device.queue_submit(queue, &[submit_info], fence) }.map_err(|e| GraphicsError::Vk("vkQueueSubmit", e))?;
+    unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.map_err(|e| GraphicsError::Vk("vkWaitForFences", e))?;
+
+    let pixels = unsafe {
+        let ptr = device
+            .map_memory(readback_memory, 0, readback_size, vk::MemoryMapFlags::empty())
+            .map_err(|e| GraphicsError::Vk("vkMapMemory(readback)", e))?;
+        let slice = std::slice::from_raw_parts(ptr as *const u8, readback_size as usize);
+        let mut out = Vec::with_capacity((width * height) as usize);
+        for chunk in slice.chunks_exact(4) {
+            out.push(Rgba8 { r: chunk[0], g: chunk[1], b: chunk[2], a: chunk[3] });
+        }
+        device.unmap_memory(readback_memory);
+        out
+    };
+
+    unsafe {
+        device.destroy_fence(fence, None);
+        device.destroy_fence(upload_fence, None);
+        device.destroy_command_pool(command_pool, None);
+        device.destroy_command_pool(upload_pool, None);
+        device.destroy_pipeline(pipeline, None);
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_descriptor_pool(descriptor_pool, None);
+        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+        device.destroy_sampler(sampler, None);
+        device.destroy_shader_module(vs_module, None);
+        device.destroy_shader_module(ps_module, None);
+        device.destroy_framebuffer(framebuffer, None);
+        device.destroy_render_pass(render_pass, None);
+        device.destroy_image_view(color_view, None);
+        device.destroy_image(color_image, None);
+        device.free_memory(color_memory, None);
+        device.destroy_image_view(tex_view, None);
+        device.destroy_image(tex_image, None);
+        device.free_memory(tex_memory, None);
+        device.destroy_buffer(staging_buffer, None);
+        device.free_memory(staging_memory, None);
+        device.destroy_buffer(vertex_buffer, None);
+        device.free_memory(vertex_buffer_memory, None);
+        device.destroy_buffer(readback_buffer, None);
+        device.free_memory(readback_memory, None);
+    }
+    drop(dguard);
+    drop(guard);
+
+    Ok(pixels)
+}
+
 fn create_host_visible_buffer(
     device: &ash::Device,
     memory_properties: &vk::PhysicalDeviceMemoryProperties,

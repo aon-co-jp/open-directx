@@ -1580,6 +1580,380 @@ fn emit_pixel_spirv() -> Vec<u32> {
     module.assemble()
 }
 
+/// 実SHEX命令列を、`sprite_vs.hlsl`が実際に生成する固定の命令列と厳密に
+/// 突き合わせる(2026-08-08、2Dスプライト描画プロトタイプの第一歩)。
+/// `triangle_vs.hlsl`(COLORパススルー、mask=15)とほぼ同じ骨格だが、
+/// COLORの代わりにTEXCOORD(mask=3、xyの2成分)をパススルーする点のみ
+/// 異なる——実`fxc.exe`出力(`sprite_vs.dxbc`)を`examples/dump_shex`で
+/// ダンプして確認した上で実装した。
+fn decode_sprite_vertex_shader_shape(instructions: &[Instruction]) -> Result<(), SpirvGenError> {
+    let reject = |msg: &str| Err(SpirvGenError::UnsupportedShader(format!("Sprite VS: {msg}")));
+
+    let mut it = instructions.iter();
+    let mut next = |what: &str| -> Result<&Instruction, SpirvGenError> {
+        it.next()
+            .ok_or_else(|| SpirvGenError::UnsupportedShader(format!("Sprite VS: 命令列が短すぎる({what}が見つからない)")))
+    };
+
+    match &next("dcl_globalFlags")?.kind {
+        InstructionKind::DclGlobalFlags { .. } => {}
+        _ => return reject("先頭はdcl_globalFlagsのはず"),
+    }
+
+    // dcl_input v0 (POSITION, mask=xyz=7)
+    match &next("dcl_input v0")?.kind {
+        InstructionKind::DclInput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite VS: dcl_inputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Input || uav_index(&op0.indices) != Some(0) || op0.components != ComponentSelect::Mask(7) {
+                return reject("dcl_inputの1つ目はv0・mask=7(xyz)のはず");
+            }
+        }
+        _ => return reject("2番目はdcl_inputのはず"),
+    }
+
+    // dcl_input v1 (TEXCOORD, mask=xy=3)
+    match &next("dcl_input v1")?.kind {
+        InstructionKind::DclInput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite VS: dcl_inputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Input || uav_index(&op0.indices) != Some(1) || op0.components != ComponentSelect::Mask(3) {
+                return reject("dcl_inputの2つ目はv1・mask=3(xy)のはず");
+            }
+        }
+        _ => return reject("3番目はdcl_inputのはず"),
+    }
+
+    // dcl_output_siv o0, SV_POSITION
+    match &next("dcl_output_siv o0")?.kind {
+        InstructionKind::DclOutput { system_value, operands } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite VS: dcl_output_sivにオペランドが無い".to_string()))?;
+            if *system_value != Some("position") || op0.reg_type != RegisterType::Output || uav_index(&op0.indices) != Some(0) {
+                return reject("4番目はdcl_output_siv o0(SV_POSITION)のはず");
+            }
+        }
+        _ => return reject("4番目はdcl_outputのはず"),
+    }
+
+    // dcl_output o1 (TEXCOORD, mask=xy=3)
+    match &next("dcl_output o1")?.kind {
+        InstructionKind::DclOutput { system_value, operands } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite VS: dcl_outputにオペランドが無い".to_string()))?;
+            if system_value.is_some() || op0.reg_type != RegisterType::Output || uav_index(&op0.indices) != Some(1) || op0.components != ComponentSelect::Mask(3) {
+                return reject("5番目はdcl_output o1(TEXCOORD、mask=3、SVでない)のはず");
+            }
+        }
+        _ => return reject("5番目はdcl_outputのはず"),
+    }
+
+    // mov o0.xyz, v0.xyzx
+    match &next("mov o0.xyz, v0")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) || dst.components != ComponentSelect::Mask(7) {
+                return reject("6番目のmovの書き込み先がo0.xyzではない");
+            }
+            if src.reg_type != RegisterType::Input || uav_index(&src.indices) != Some(0) {
+                return reject("6番目のmovの読み込み元がv0ではない");
+            }
+        }
+        _ => return reject("6番目はmovのはず"),
+    }
+
+    // mov o0.w, l(1.0)
+    match &next("mov o0.w, l(1.0)")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) || dst.components != ComponentSelect::Mask(8) {
+                return reject("7番目のmovの書き込み先がo0.wではない");
+            }
+            if src.reg_type != RegisterType::Immediate32 || src.immediate_values.first() != Some(&1065353216) {
+                return reject("7番目のmovの読み込み元が定数1.0fではない");
+            }
+        }
+        _ => return reject("7番目はmovのはず"),
+    }
+
+    // mov o1.xy, v1.xy
+    match &next("mov o1.xy, v1")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 2 => {
+            let dst = &operands[0];
+            let src = &operands[1];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(1) || dst.components != ComponentSelect::Mask(3) {
+                return reject("8番目のmovの書き込み先がo1.xyではない");
+            }
+            if src.reg_type != RegisterType::Input || uav_index(&src.indices) != Some(1) {
+                return reject("8番目のmovの読み込み元がv1ではない");
+            }
+        }
+        _ => return reject("8番目はmovのはず"),
+    }
+
+    match &next("ret")?.kind {
+        InstructionKind::Generic { operands } if operands.is_empty() => {}
+        _ => return reject("9番目はretのはず"),
+    }
+
+    if it.next().is_some() {
+        return reject("想定より命令が多い(9命令ちょうどのはず)");
+    }
+
+    Ok(())
+}
+
+/// 実SHEX命令列を、`sprite_ps.hlsl`が実際に生成する固定の命令列と厳密に
+/// 突き合わせる(2026-08-08)。`triangle_ps.hlsl`とは異なり、テクスチャ
+/// サンプリング(`dcl_sampler`/`dcl_resource`/`sample`)を含む——本
+/// リポジトリで初めてテクスチャサンプリングに対応した増分。
+fn decode_sprite_pixel_shader_shape(instructions: &[Instruction]) -> Result<(), SpirvGenError> {
+    let reject = |msg: &str| Err(SpirvGenError::UnsupportedShader(format!("Sprite PS: {msg}")));
+
+    let mut it = instructions.iter();
+    let mut next = |what: &str| -> Result<&Instruction, SpirvGenError> {
+        it.next()
+            .ok_or_else(|| SpirvGenError::UnsupportedShader(format!("Sprite PS: 命令列が短すぎる({what}が見つからない)")))
+    };
+
+    match &next("dcl_globalFlags")?.kind {
+        InstructionKind::DclGlobalFlags { .. } => {}
+        _ => return reject("先頭はdcl_globalFlagsのはず"),
+    }
+
+    // dcl_sampler s0 (default mode)
+    match &next("dcl_sampler s0")?.kind {
+        InstructionKind::DclSampler { mode, operands } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite PS: dcl_samplerにオペランドが無い".to_string()))?;
+            if *mode != "default" || op0.reg_type != RegisterType::Sampler || uav_index(&op0.indices) != Some(0) {
+                return reject("2番目はdcl_sampler s0(defaultモード)のはず");
+            }
+        }
+        _ => return reject("2番目はdcl_samplerのはず"),
+    }
+
+    // dcl_resource_texture2d t0, float4
+    match &next("dcl_resource t0")?.kind {
+        InstructionKind::DclResource { dimension, return_type, operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite PS: dcl_resourceにオペランドが無い".to_string()))?;
+            let all_float = return_type.len() == 4 && return_type.iter().all(|t| format!("{t:?}") == "Float");
+            if *dimension != "texture2d" || !all_float || op0.reg_type != RegisterType::Resource || uav_index(&op0.indices) != Some(0) {
+                return reject("3番目はdcl_resource_texture2d t0(float4)のはず");
+            }
+        }
+        _ => return reject("3番目はdcl_resourceのはず"),
+    }
+
+    // dcl_input_ps (linear) v1, TEXCOORD (mask=xy=3)
+    match &next("dcl_input_ps v1")?.kind {
+        InstructionKind::DclInput { interpolation, operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite PS: dcl_input_psにオペランドが無い".to_string()))?;
+            if *interpolation != Some("linear")
+                || op0.reg_type != RegisterType::Input
+                || uav_index(&op0.indices) != Some(1)
+                || op0.components != ComponentSelect::Mask(3)
+            {
+                return reject("4番目はdcl_input_ps(linear) v1・mask=3(xy)のはず");
+            }
+        }
+        _ => return reject("4番目はdcl_inputのはず"),
+    }
+
+    // dcl_output o0, mask=xyzw=15
+    match &next("dcl_output o0")?.kind {
+        InstructionKind::DclOutput { operands, .. } => {
+            let op0 = operands.first().ok_or_else(|| SpirvGenError::UnsupportedShader("Sprite PS: dcl_outputにオペランドが無い".to_string()))?;
+            if op0.reg_type != RegisterType::Output || uav_index(&op0.indices) != Some(0) || op0.components != ComponentSelect::Mask(15) {
+                return reject("5番目はdcl_output o0・mask=15のはず");
+            }
+        }
+        _ => return reject("5番目はdcl_outputのはず"),
+    }
+
+    // sample o0.xyzw, v1.xy, t0.xyzw, s0
+    match &next("sample o0, v1, t0, s0")?.kind {
+        InstructionKind::Generic { operands } if operands.len() == 4 => {
+            let dst = &operands[0];
+            let coord = &operands[1];
+            let resource = &operands[2];
+            let sampler = &operands[3];
+            if dst.reg_type != RegisterType::Output || uav_index(&dst.indices) != Some(0) {
+                return reject("6番目のsampleの書き込み先がo0ではない");
+            }
+            if coord.reg_type != RegisterType::Input || uav_index(&coord.indices) != Some(1) {
+                return reject("6番目のsampleの座標がv1ではない");
+            }
+            if resource.reg_type != RegisterType::Resource || uav_index(&resource.indices) != Some(0) {
+                return reject("6番目のsampleのリソースがt0ではない");
+            }
+            if sampler.reg_type != RegisterType::Sampler || uav_index(&sampler.indices) != Some(0) {
+                return reject("6番目のsampleのサンプラーがs0ではない");
+            }
+        }
+        _ => return reject("6番目はsampleのはず"),
+    }
+
+    match &next("ret")?.kind {
+        InstructionKind::Generic { operands } if operands.is_empty() => {}
+        _ => return reject("7番目はretのはず"),
+    }
+
+    if it.next().is_some() {
+        return reject("想定より命令が多い(7命令ちょうどのはず)");
+    }
+
+    Ok(())
+}
+
+/// DXBCバイト列(`sprite_vs.hlsl`相当のD3D11頂点シェーダー、SM5.0)を解析し、
+/// 実際のSHEX命令列を検証しながらSPIR-Vへ翻訳する。一致しなければ
+/// `SpirvGenError::UnsupportedShader`を返す。
+pub fn translate_sprite_vertex_shader(bytes: &[u8]) -> Result<GraphicsTranslatedKernel, SpirvGenError> {
+    let instructions = shex_instructions(bytes)?;
+    decode_sprite_vertex_shader_shape(&instructions)?;
+    Ok(GraphicsTranslatedKernel {
+        spirv_words: emit_sprite_vertex_spirv(),
+        entry_point: "main",
+        stage: ShaderStage::Vertex,
+    })
+}
+
+/// DXBCバイト列(`sprite_ps.hlsl`相当のD3D11ピクセルシェーダー、SM5.0)を
+/// 解析し、実際のSHEX命令列を検証しながらSPIR-Vへ翻訳する。一致しなければ
+/// `SpirvGenError::UnsupportedShader`を返す。テクスチャサンプリングに
+/// 対応した初めてのシェーダー(2026-08-08)。
+pub fn translate_sprite_pixel_shader(bytes: &[u8]) -> Result<GraphicsTranslatedKernel, SpirvGenError> {
+    let instructions = shex_instructions(bytes)?;
+    decode_sprite_pixel_shader_shape(&instructions)?;
+    Ok(GraphicsTranslatedKernel {
+        spirv_words: emit_sprite_pixel_spirv(),
+        entry_point: "main",
+        stage: ShaderStage::Fragment,
+    })
+}
+
+/// `sprite_vs.hlsl`が検証を通った場合にのみ返す、固定のSPIR-Vモジュール。
+/// `triangle_vs`用`emit_vertex_spirv`とほぼ同じだが、COLOR(vec4)の代わりに
+/// TEXCOORD(vec2)をパススルーする。
+fn emit_sprite_vertex_spirv() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let vec2_ty = b.type_vector(float_ty, 2);
+    let vec3_ty = b.type_vector(float_ty, 3);
+    let vec4_ty = b.type_vector(float_ty, 4);
+
+    let in_pos_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec3_ty);
+    let var_in_pos = b.variable(in_pos_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_in_pos, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    let in_uv_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec2_ty);
+    let var_in_uv = b.variable(in_uv_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_in_uv, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(1)]);
+
+    let out_position_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec4_ty);
+    let var_out_position = b.variable(out_position_ptr_ty, None, spirv::StorageClass::Output, None);
+    b.decorate(var_out_position, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::Position)]);
+
+    let out_uv_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec2_ty);
+    let var_out_uv = b.variable(out_uv_ptr_ty, None, spirv::StorageClass::Output, None);
+    b.decorate(var_out_uv, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let pos_in = b.load(vec3_ty, None, var_in_pos, None, vec![]).expect("OpLoad pos");
+    let px = b.composite_extract(float_ty, None, pos_in, vec![0]).expect("extract x");
+    let py = b.composite_extract(float_ty, None, pos_in, vec![1]).expect("extract y");
+    let pz = b.composite_extract(float_ty, None, pos_in, vec![2]).expect("extract z");
+    let one = b.constant_bit32(float_ty, 1.0f32.to_bits());
+    let pos_out = b.composite_construct(vec4_ty, None, vec![px, py, pz, one]).expect("construct SV_POSITION");
+    b.store(var_out_position, pos_out, None, vec![]).expect("OpStore SV_POSITION");
+
+    let uv_in = b.load(vec2_ty, None, var_in_uv, None, vec![]).expect("OpLoad uv");
+    b.store(var_out_uv, uv_in, None, vec![]).expect("OpStore TEXCOORD");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(
+        spirv::ExecutionModel::Vertex,
+        main_fn,
+        "main",
+        vec![var_in_pos, var_in_uv, var_out_position, var_out_uv],
+    );
+
+    let module = b.module();
+    module.assemble()
+}
+
+/// `sprite_ps.hlsl`が検証を通った場合にのみ返す、固定のSPIR-Vモジュール。
+/// `set=0, binding=0`のcombined image sampler(`OpTypeSampledImage`)から
+/// `OpImageSampleImplicitLod`でサンプルし、そのままSV_TARGETへ出力する。
+fn emit_sprite_pixel_spirv() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let vec2_ty = b.type_vector(float_ty, 2);
+    let vec4_ty = b.type_vector(float_ty, 4);
+
+    let in_uv_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, vec2_ty);
+    let var_in_uv = b.variable(in_uv_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_in_uv, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    let out_color_ptr_ty = b.type_pointer(None, spirv::StorageClass::Output, vec4_ty);
+    let var_out_color = b.variable(out_color_ptr_ty, None, spirv::StorageClass::Output, None);
+    b.decorate(var_out_color, spirv::Decoration::Location, vec![DrOperand::LiteralBit32(0)]);
+
+    // combined image sampler: `Texture2D SpriteTex : register(t0)` +
+    // `SamplerState SpriteSampler : register(s0)`をHLSLコンパイラが暗黙に
+    // 対で扱う慣行に合わせ、Vulkan側もset=0/binding=0の単一combined image
+    // samplerとして表現する(D3D側のt0/s0という別レジスタ空間をVulkan側の
+    // 単一デスクリプタへ畳み込む、DXVK等でも一般的なマッピング)。
+    let image_ty = b.type_image(
+        float_ty,
+        spirv::Dim::Dim2D,
+        0,
+        0,
+        0,
+        1,
+        spirv::ImageFormat::Unknown,
+        None,
+    );
+    let sampled_image_ty = b.type_sampled_image(image_ty);
+    let sampler_ptr_ty = b.type_pointer(None, spirv::StorageClass::UniformConstant, sampled_image_ty);
+    let var_sampler = b.variable(sampler_ptr_ty, None, spirv::StorageClass::UniformConstant, None);
+    b.decorate(var_sampler, spirv::Decoration::DescriptorSet, vec![DrOperand::LiteralBit32(0)]);
+    b.decorate(var_sampler, spirv::Decoration::Binding, vec![DrOperand::LiteralBit32(0)]);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let uv = b.load(vec2_ty, None, var_in_uv, None, vec![]).expect("OpLoad uv");
+    let sampled_image = b.load(sampled_image_ty, None, var_sampler, None, vec![]).expect("OpLoad sampledImage");
+    let color = b
+        .image_sample_implicit_lod(vec4_ty, None, sampled_image, uv, None, vec![])
+        .expect("OpImageSampleImplicitLod");
+    b.store(var_out_color, color, None, vec![]).expect("OpStore SV_TARGET");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::Fragment, main_fn, "main", vec![var_in_uv, var_out_color]);
+    b.execution_mode(main_fn, spirv::ExecutionMode::OriginUpperLeft, []);
+
+    let module = b.module();
+    module.assemble()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1854,5 +2228,56 @@ mod tests {
         assert!(translate_chain_shader(TRIANGLE_VS_DXBC).is_err());
         assert!(translate_shader(TRIANGLE_PS_DXBC).is_err());
         assert!(translate_chain_shader(TRIANGLE_PS_DXBC).is_err());
+    }
+
+    const SPRITE_VS_DXBC: &[u8] = include_bytes!("../shaders/sprite_vs.dxbc");
+    const SPRITE_PS_DXBC: &[u8] = include_bytes!("../shaders/sprite_ps.dxbc");
+
+    #[test]
+    fn translates_real_fxc_compiled_sprite_vs_dxbc_to_valid_vertex_spirv() {
+        let kernel = translate_sprite_vertex_shader(SPRITE_VS_DXBC)
+            .expect("real fxc-compiled sprite_vs.dxbc (POSITION/TEXCOORD passthrough) must translate to SPIR-V");
+        assert_eq!(kernel.stage, ShaderStage::Vertex);
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203);
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let module = rspirv::dr::load_bytes(&bytes).expect("re-parse generated sprite VS SPIR-V");
+        assert!(
+            module.entry_points.iter().any(|ep| matches!(
+                ep.operands.first(),
+                Some(DrOperand::ExecutionModel(spirv::ExecutionModel::Vertex))
+            )),
+            "re-parsed module must declare OpEntryPoint Vertex"
+        );
+    }
+
+    #[test]
+    fn translates_real_fxc_compiled_sprite_ps_dxbc_to_valid_fragment_spirv_with_texture_sampling() {
+        let kernel = translate_sprite_pixel_shader(SPRITE_PS_DXBC).expect(
+            "real fxc-compiled sprite_ps.dxbc (Texture2D.Sample) must translate to SPIR-V",
+        );
+        assert_eq!(kernel.stage, ShaderStage::Fragment);
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203);
+
+        let bytes: Vec<u8> = kernel.spirv_words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let module = rspirv::dr::load_bytes(&bytes).expect("re-parse generated sprite PS SPIR-V");
+        assert!(
+            module.entry_points.iter().any(|ep| matches!(
+                ep.operands.first(),
+                Some(DrOperand::ExecutionModel(spirv::ExecutionModel::Fragment))
+            )),
+            "re-parsed module must declare OpEntryPoint Fragment"
+        );
+    }
+
+    #[test]
+    fn sprite_translators_honestly_reject_the_non_sprite_triangle_shaders_and_vice_versa() {
+        // 既存のtriangle_vs/ps用デコーダとは独立した別パターンクラスである
+        // ことの確認(「対応している」という誤ったシグナルを出さない、
+        // 既存方針の継続)。
+        assert!(translate_sprite_vertex_shader(TRIANGLE_VS_DXBC).is_err());
+        assert!(translate_sprite_pixel_shader(TRIANGLE_PS_DXBC).is_err());
+        assert!(translate_vertex_shader(SPRITE_VS_DXBC).is_err());
+        assert!(translate_pixel_shader(SPRITE_PS_DXBC).is_err());
     }
 }

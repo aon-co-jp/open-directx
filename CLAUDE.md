@@ -143,6 +143,69 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き6) 2Dスプライト描画プロトタイプ第一歩:
+  テクスチャサンプリング(`Texture2D.Sample`)を初実装、Windows/Linux
+  両方の実機で検証——ユーザー指示「dream-os/Linux上でopen-directx経由で
+  GT730のPCでGAME…の動作の為の試作品」に対応、まずゲームプロトタイプ
+  (簡単な2Dスプライト描画デモ)に絞って着手した**:
+  1. **新規シェーダー**: `shaders/sprite_vs.hlsl`(POSITION+TEXCOORD
+     パススルー頂点シェーダー、`triangle_vs.hlsl`のCOLOR版と対をなす)・
+     `shaders/sprite_ps.hlsl`(`Texture2D SpriteTex : register(t0)` +
+     `SamplerState SpriteSampler : register(s0)`で`Sample()`するピクセル
+     シェーダー、**本リポジトリで初めてテクスチャサンプリングを含む
+     シェーダー**)を`fxc.exe /T vs_5_0`/`ps_5_0`で実コンパイル。
+  2. **実SHEX命令列を`examples/dump_shex`でダンプして確認**(推測実装
+     ではない、既存方針の継続): PSは`dcl_sampler s0`(default)→
+     `dcl_resource_texture2d t0`(float4)→`dcl_input_ps`(linear) v1(TEXCOORD,
+     mask=3)→`dcl_output o0`(mask=15)→`sample o0, v1, t0, s0`→`ret`という
+     7命令ちょうどの形だった。
+  3. **実装**(`crates/directx-shader-translate/src/spirv_gen.rs`):
+     `decode_sprite_vertex_shader_shape`/`decode_sprite_pixel_shader_shape`
+     (既存のtriangle_vs/ps用デコーダとは独立した別パターンクラス)・
+     `translate_sprite_vertex_shader`/`translate_sprite_pixel_shader`
+     (新規公開API)・`emit_sprite_vertex_spirv`(TEXCOORD vec2パススルー)・
+     `emit_sprite_pixel_spirv`(`OpTypeImage`+`OpTypeSampledImage`による
+     combined image sampler、set=0/binding=0、`OpImageSampleImplicitLod`)。
+     生成したSPIR-V2本は`spirv-val.exe`で実際に検証(exit=0)。
+  4. **`crates/directx-graphics-vulkan`に`render_textured_quad_and_read_back`
+     を新設**(既存の`render_triangle_and_read_back`とは独立した別関数、
+     既存関数を壊さない既存の設計方針を踏襲): ステージングバッファ経由の
+     テクスチャアップロード(`UNDEFINED`→`TRANSFER_DST_OPTIMAL`→
+     `SHADER_READ_ONLY_OPTIMAL`の2段階レイアウト遷移)、`NEAREST`
+     フィルタのサンプラー(補間無しでテクセル値をそのまま検証できるよう
+     意図的に選択)、descriptor set layout(combined image sampler、
+     FRAGMENTステージ)、フルビューポート矩形(2三角形・6頂点、UV
+     (0,0)〜(1,1))を実装。`TextureRgba8`(新規公開struct)で任意サイズの
+     RGBA8テクスチャを渡せる。
+  5. **実機検証(Windows、NVIDIA GT 730 + Linux、WSL2 Ubuntu/Mesa
+     llvmpipe、両方で完全一致)**: 新規テスト
+     `sprite_quad_samples_a_2x2_checkerboard_texture_exactly_on_real_vulkan_hardware`
+     で、2x2の市松模様テクスチャ(赤/緑/青/黄)を実際にアップロード・
+     サンプルし、フレームバッファの4象限それぞれが対応するテクセル値と
+     完全一致することを確認した——**Windows実機とLinux実機(WSL2)の両方で
+     同一コード・同一結果**(誇張なし、両OSで実際に`cargo test`を実行し
+     確認)。
+  6. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件(Windows)。`cargo test --workspace --release`で
+     全実機テスト(既存28本+今回1本の計29本)+unittests 53件すべてgreen、
+     既存経路への回帰なし。
+  7. **正直な開示**: (1) これは「1枚の静的テクスチャを1枚の矩形へ
+     サンプルする」最小実装であり、ゲームループ(入力・更新・複数
+     スプライト・アニメーション・スプライトシート切り出し)は未実装。
+     (2) `NEAREST`フィルタのみ対応(`LINEAR`補間は未検証)。(3)
+     テクスチャの生成元(PNG等の画像ファイル読み込み)は無く、テストは
+     コード内で直接RGBA8配列を構築している——実際のスプライト素材
+     ファイルを読み込む機能は次回の課題。(4) Linux側の実行は引き続き
+     Mesa `llvmpipe`(ソフトウェアラスタライザ)で、実GPUハードウェア
+     アクセラレーションではない(前回エントリと同じ制約)。
+  - 次にすべきこと: (1) 複数スプライト・アニメーション(スプライト
+    シート切り出し、UV矩形の動的指定)への拡張、(2) 簡単な入力処理
+    (キーボード等)とゲームループの実装、(3) 画像ファイル(PNG等)からの
+    テクスチャ読み込み、(4) 10項以上への境界チェック付きチェーン拡張、
+    (5) WSL2からホストGPU(NVIDIA GT 730)への実ハードウェアVulkan
+    アクセスの設定(前回エントリから継続)。
+
 - **2026-08-08(続き5) 実Linux環境(WSL2 Ubuntu)でグラフィックスパイプライン
   デモを実際にビルド・実行——「dream-os/Linux上でopen-directxが実際に
   何かを動かせることを見せる」というユーザー要望に対応**:

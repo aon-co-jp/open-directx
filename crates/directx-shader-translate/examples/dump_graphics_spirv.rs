@@ -4,7 +4,9 @@
 //! `cargo run -p directx-shader-translate --example dump_graphics_spirv -- vs out.spv`
 //! `cargo run -p directx-shader-translate --example dump_graphics_spirv -- ps out.spv`
 
-use directx_shader_translate::spirv_gen::{translate_pixel_shader, translate_vertex_shader};
+use directx_shader_translate::spirv_gen::{
+    translate_pixel_shader, translate_sprite_pixel_shader, translate_sprite_vertex_shader, translate_vertex_shader,
+};
 
 fn main() {
     let stage = std::env::args().nth(1).expect("usage: dump_graphics_spirv <vs|ps> <out.spv>");
@@ -18,6 +20,14 @@ fn main() {
         "ps" => {
             let bytes = include_bytes!("../shaders/triangle_ps.dxbc");
             translate_pixel_shader(bytes).expect("translate triangle_ps.dxbc").spirv_words
+        }
+        "sprite_vs" => {
+            let bytes = include_bytes!("../shaders/sprite_vs.dxbc");
+            translate_sprite_vertex_shader(bytes).expect("translate sprite_vs.dxbc").spirv_words
+        }
+        "sprite_ps" => {
+            let bytes = include_bytes!("../shaders/sprite_ps.dxbc");
+            translate_sprite_pixel_shader(bytes).expect("translate sprite_ps.dxbc").spirv_words
         }
         other => panic!("unknown stage: {other}"),
     };
