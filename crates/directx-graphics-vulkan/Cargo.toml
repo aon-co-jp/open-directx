@@ -16,6 +16,9 @@ description = "Minimal real Vulkan graphics pipeline (render pass + framebuffer 
 # 最小限に抑える)。
 ash = { version = "0.37", default-features = false, features = ["loaded"] }
 thiserror = "1"
+# 実PNGファイルからのテクスチャ読み込み(2026-08-08、スプライト描画
+# プロトタイプの増分)向け。車輪の再発明を避け実績あるPNGデコーダを採用。
+png = "0.17"
 
 [dev-dependencies]
 directx-shader-translate = { path = "../directx-shader-translate" }

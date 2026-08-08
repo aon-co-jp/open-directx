@@ -143,6 +143,49 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き12) 実PNGファイルからのテクスチャ読み込みを実装、
+  Windows/Linux両方の実機で検証——直前エントリの「次にすべきこと(2)」を
+  解消**:
+  1. **新規モジュール`crates/directx-graphics-vulkan/src/png_loader.rs`**:
+     `png`クレート(0.17系、実績あるPNGデコーダ、自前実装はしない)を
+     使い`load_png_rgba8(bytes) -> Result<TextureRgba8, PngLoadError>`を
+     実装。RGB/RGBA/グレースケール/グレースケール+アルファ/パレット
+     (インデックスカラー)のすべてを`Transformations::EXPAND|STRIP_16`で
+     統一的にRGBA8へ正規化する(パレット展開・16bit→8bit正規化は
+     `png`クレート自身の変換機能を利用、自前実装しない)。
+  2. **単体テスト3件**: 既知のRGBA画像(半透明ピクセル含む)を`png`
+     クレートのエンコーダで実際にPNGバイト列へエンコード→デコードする
+     往復検証(アルファチャンネルの保持も含む)、および非PNGバイト列の
+     正直な拒否。
+  3. **実アセット`assets/sample_sprite.png`を新規生成**:
+     `examples/generate_sample_sprite_png.rs`(このリポジトリのテストが
+     使う実PNGファイルを外部画像ツールに頼らず`png`クレートで直接生成
+     するための再現可能なツール)で、2x2市松模様(3象限は不透明・1象限は
+     半透明)の実PNGファイルを生成しコミットした。
+  4. **実機検証(Windows NVIDIA GT 730 + Linux WSL2 Ubuntu/Mesa
+     llvmpipe、両方で完全一致)**: 新規テスト
+     `real_png_file_decodes_and_renders_correctly_on_real_vulkan_hardware`
+     で、この実PNGファイルを実際にデコード→`render_textured_quad_and_
+     read_back`で実描画し、不透明3象限が完全一致・半透明象限が
+     アルファブレンド式通りの合成色(`Rgba8{r:13,g:13,b:138,a:195}`)に
+     なることを両OS実機で確認した。
+  5. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件(Windows)。`cargo test --workspace --release`で
+     全実機テスト(既存32本+今回1本の計33本)+unittests 56件(53+
+     png_loader3件)すべてgreen、既存経路への回帰なし。
+  6. **正直な開示**: (1) インターレースPNGは`png`クレートが自動展開する
+     設計に依存しており、実際にインターレース画像での検証は行っていない
+     (非インターレースの通常PNGのみ実機検証済み)。(2) 16bit/チャンネル
+     PNGも`STRIP_16`変換に依存しており実際の16bit画像での検証は
+     行っていない。(3) `directx-graphics-window`(実ウィンドウ版)からは
+     まだ呼び出していない(1x1単色テクスチャのままの構成)。
+  - 次にすべきこと: (1) `directx-graphics-window`側でPNGアセットを
+    実際に読み込んで表示する(現状は1x1単色のみ)、(2) 複数の動く
+    スプライト+衝突判定、(3) ウィンドウリサイズ対応、(4) 10項以上への
+    境界チェック付きチェーン拡張(DXBC/DXILチェーン系、別系統の
+    未着手事項)。
+
 - **2026-08-08(続き11) アルファブレンド(半透明スプライト)対応を実装、
   Windows/Linux両方の実機で検証——直前エントリの「次にすべきこと(2)」を
   解消**:

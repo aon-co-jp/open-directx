@@ -24,6 +24,8 @@
 
 use std::ffi::CString;
 
+pub mod png_loader;
+
 use ash::{vk, Entry};
 use thiserror::Error;
 
