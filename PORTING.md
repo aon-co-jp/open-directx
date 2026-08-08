@@ -1,5 +1,30 @@
 # PORTING.md — what's reusable, by whom, and how
 
+> **2026-08-08 更新(続き、2Dスプライト描画プロトタイプ)**: 新規クレート
+> `crates/directx-graphics-window`(winit+ash-window、実ウィンドウ+実
+> スワップチェーン+実キーボード入力)・`directx-graphics-vulkan`の
+> `render_sprites_and_read_back`/`SpriteInstance`/`TextureRgba8`/
+> `png_loader`を追加。**移設時の注意**: `directx-graphics-window`は
+> `directx-graphics-vulkan`とは独立したVulkanインスタンス/デバイスを
+> 持つ設計(オフスクリーン描画とウィンドウ描画のVulkanコンテキストは
+> 統合されていない)。またアルファブレンドは`render_sprites_and_read_
+> back`(オフスクリーン版)のみ有効化済みで、`directx-graphics-window`
+> (実ウィンドウ版)側にはまだ反映していない——両方使う場合は同期を
+> 取ること。PNGローダー(`png_loader::load_png_rgba8`)は`png`クレート
+> (0.17系)への依存を新規追加している。
+>
+> *English*: Added a new `crates/directx-graphics-window` crate
+> (winit + ash-window: real window, real swapchain, real keyboard
+> input) and `directx-graphics-vulkan`'s `render_sprites_and_read_back`/
+> `SpriteInstance`/`TextureRgba8`/`png_loader`. **Porting note**:
+> `directx-graphics-window` holds its own independent Vulkan
+> instance/device (not unified with the offscreen rendering context).
+> Alpha blending is currently enabled only in `render_sprites_and_read_
+> back` (offscreen), not yet mirrored into `directx-graphics-window`
+> (real window) — keep them in sync if you use both. The PNG loader
+> (`png_loader::load_png_rgba8`) adds a new dependency on the `png`
+> crate (0.17.x).
+
 > **2026-08-08 更新**: 境界チェック付き7項チェーンについてDXBC/DXIL両方の
 > 実装が揃った(`vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.hlsl`
 > を新規追加、実`dxc.exe`コンパイル+実GT730検証済み)。移設先で7項チェーンの

@@ -1,5 +1,31 @@
 # open-directx
 
+> 📌 **最近の更新(2026-08-08、2Dスプライト描画プロトタイプ)**:
+> ユーザー提案「dream-os/Linux上でopen-directx経由でGT730のPCでGAME…の
+> 試作品を開発」を受け、まず2Dスプライト描画に絞って着手。テクスチャ
+> サンプリング(`Texture2D.Sample`)初実装→複数スプライト/スプライト
+> シート対応→ゲームループ(位置更新+跳ね返り物理)→**実ウィンドウ+
+> 実Vulkanスワップチェーン+実キーボード入力**(`directx-graphics-window`
+> クレート新設、ユーザー自身が実行し「パドルが動いて玉を弾き返した」と
+> 目視確認済み)→アルファブレンド(半透明スプライト)→実PNGファイル
+> からのテクスチャ読み込み、という一連の増分をすべてWindows実機
+> (NVIDIA GT 730)、一部はLinux実機(WSL2 Ubuntu)でも検証した。次の候補:
+> 複数の動くスプライト+衝突判定、ウィンドウリサイズ対応。詳細は
+> [CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Following the user's proposal to build game/mining/LLM
+> prototypes for the GT 730 via open-directx on dream-os/Linux, started
+> narrowly with a 2D sprite-rendering prototype: first texture sampling
+> support, then multi-sprite/sprite-sheet support, a game loop
+> (position update + bounce physics), a **real window + real Vulkan
+> swapchain + real keyboard input** (new `directx-graphics-window`
+> crate — the user ran it themselves and confirmed "the paddle moved
+> and hit the ball back"), alpha blending, and loading textures from
+> real PNG files. All verified on real Windows hardware (NVIDIA GT 730),
+> some also on real Linux hardware (WSL2 Ubuntu). Next candidates:
+> multiple moving sprites with collision detection, window resize
+> support. See [CLAUDE.md](CLAUDE.md) for details.
+
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり(dream-os等8リポジトリ対象)。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
 > 📌 **最近の更新(2026-08-08)**: 境界チェック付き7項チェーンについて
