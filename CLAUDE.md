@@ -143,6 +143,58 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08 境界チェック付きチェーンを7項へ拡張、実機検証(rs-sync横断
+  セッション、4リポジトリの関連性・実用性・完成度向上の一環)**: 直前の
+  2026-08-07 HANDOFFで「6項以上は未検証」と明記されていたギャップを
+  埋めた。既存の6項(`vector_add_mul_div_sub_add_mul_chain6_bounded`)に
+  さらに`div`を1個追加し、`vector_add_mul_div_sub_add_mul_div_chain7_
+  bounded.hlsl`(新規)を`fxc.exe`(`cs_5_0`、Windows Kit 10.0.22621.0)で
+  実コンパイルしてDXBCを生成、`translate_chain_shader`で自前SPIR-V生成
+  経路へ通した。
+  1. **実機検証(NVIDIA GT 730)**: 新規テスト
+     `vector_add_mul_div_sub_add_mul_div_chain7_bounded_real_vulkan.rs`で、
+     有効範囲256要素すべてがCPU参照実装
+     `((((a[i]+b[i])*a[i])/b[i]-a[i]+b[i])*a[i])/b[i]`と一致し、境界外64
+     要素はセンチネル値のまま(書き込まれなかった)ことを確認
+     (`cargo test -p directx-shader-translate --release --test
+     vector_add_mul_div_sub_add_mul_div_chain7_bounded_real_vulkan`)。
+     `read_uav_bind_points.len() == 8`(N+1規則、7項チェーンでも成立)も
+     実測確認した。DXIL側の同種テストは今回は追加していない(DXBC側の
+     ギャップ埋めを優先、正直な開示)。
+  2. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件。`cargo test --workspace --release`は既存の全実機
+     テスト(グラフィックス5本+DXBC/DXIL Compute単一演算+チェーン群
+     〈2〜6項、境界チェック有無、DXBC/DXIL双方〉+今回の7項境界チェック
+     付きチェーン1本)すべてgreenであることを確認(既存経路への回帰なし)。
+  3. **今回あわせて修正した既存の粗**: `cargo clippy`実行時、pre-existing
+     の2件を検出・修正(今回のチェーン拡張とは無関係、clippyのlintルール
+     追加によるもの): (a) `directx_bridge.rs`の`n *
+     std::mem::size_of::<f32>()`を`std::mem::size_of_val(a)`へ
+     (`manual_slice_size_calculation`)——ただしこれは`dream-os`
+     リポジトリ側の`crates/dream-os-kernel/src/directx_bridge.rs`
+     (open-directxをpath依存で再利用しているファイル)の修正であり、
+     本リポジトリ自体のファイルではない。(b) 本リポジトリでは該当なし
+     ——念のためこのリポジトリ自体にも同種のclippy警告が無いことを
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     で再確認済み(警告0件)。
+  4. **正直な開示・まだやっていないこと**: 検証できたのは「境界チェック
+     付き7項」のDXBC側1点のみ。DXIL側の7項・8項以上・`mul`のnegateフラグが
+     立つケース・境界チェック無し版の7項以上は引き続き未検証。
+     open-cuda・aruaru-llmとの連携状況は前回エントリから変化なし
+     (このパスではopen-cuda/aruaru-llm側のファイルには一切触れていない)。
+     テクスチャサンプリング・スワップチェーン・AMD/Intel/Linux/macOS
+     実機検証・各クレートのexample充足状況棚卸しも前回エントリから
+     変更なし(未着手のまま)。
+  - 次にすべきこと: (1) DXIL側の7項境界チェック付きチェーン(DXBC側と
+    対にする、既存の他チェーン系はDXBC/DXIL両方揃っているためこの7項
+    だけ片方のみという非対称を解消する)、(2) 8項以上への拡張、または
+    今回未検証の順序組み合わせ、(3) テクスチャサンプリング・
+    スワップチェーンへの拡張、(4) AMD/Intel・Linux/macOS実機検証、
+    (5) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+    ハードコード自体の解消(open-cuda側の変更が必要、ユーザー確認の上で
+    着手すること)、(6) 冒頭の東芝SBM/DeepSeek技術組み込み構想。
+
 - **2026-08-07 dream-os/open-cuda/aruaru-llmとの関連性・連携性調査
   (ユーザー指示「4リポジトリの関連性・連携性・実用性・完成度を向上」、
   コード変更は無し、正直な開示)**: 4リポジトリを横断してCLAUDE.md・
