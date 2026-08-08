@@ -1,0 +1,16 @@
+[package]
+name = "directx-graphics-window"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Real windowed (winit + Vulkan swapchain) run of the 2D sprite prototype — the interactive counterpart to directx-graphics-vulkan's offscreen render-and-read-back functions, which cannot be visually confirmed by an automated agent. Not exercised by automated tests: run `cargo run -p directx-graphics-window --release` and look at the window."
+
+[dependencies]
+ash = { version = "0.37", default-features = false, features = ["loaded"] }
+ash-window = "0.12"
+raw-window-handle = "0.5"
+winit = "0.28"
+directx-shader-translate = { path = "../directx-shader-translate" }
+directx-graphics-vulkan = { path = "../directx-graphics-vulkan" }

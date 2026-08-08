@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/directx-shader-translate",
     "crates/directx-graphics-vulkan",
+    "crates/directx-graphics-window",
 ]
 
 [workspace.package]
