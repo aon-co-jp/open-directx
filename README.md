@@ -2,6 +2,21 @@
 
 > 📌 保留タスク(2026-08-06): 東芝SBM・DeepSeek技術の組み込み構想あり(dream-os等8リポジトリ対象)。詳細は[CLAUDE.md](CLAUDE.md)参照。
 
+> 📌 **最近の更新(2026-08-08)**: 境界チェック付き7項チェーンについて
+> DXBC側のみでDXIL側が無いという非対称を解消——`vector_add_mul_div_sub_
+> add_mul_div_chain7_bounded_dxil.hlsl`を新規に`dxc.exe`で実コンパイルし、
+> NVIDIA GT730実機でCPU参照実装との数値一致・境界チェックの動作を確認
+> 済み(ワークスペース全体50単体テスト+実機テスト22本すべてgreen、
+> 警告0件)。詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Closed the DXBC-only vs. DXIL-missing asymmetry for the
+> boundary-checked 7-term chain — added and real-`dxc.exe`-compiled
+> `vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.hlsl`, verified
+> on real NVIDIA GT730 hardware (matches the CPU reference, boundary
+> check confirmed; full workspace: 50 unit tests + 22 real-hardware
+> tests all green, zero warnings). See [CLAUDE.md](CLAUDE.md) for
+> details.
+
 > 📌 **最近の更新(2026-08-07)**: 境界チェック付きDXBC/DXILチェーンを
 > 6項へ拡張し、NVIDIA GT730実機で動作確認。dream-os/open-cuda/
 > aruaru-llmとの連携強化(SBM/DeepSeek移植等)を検討したが、既存の

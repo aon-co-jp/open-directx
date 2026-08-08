@@ -143,6 +143,61 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き) 境界チェック付き7項チェーンのDXIL側を実装、
+  DXBC/DXIL非対称を解消(rs-sync横断セッション、dream-os/open-directxを
+  対象範囲としたインクリメント作業の一環)**: 直前の同日HANDOFFエントリ
+  「正直な開示・まだやっていないこと」で明記されていた「DXIL側の同種
+  テストは今回は追加していない」というギャップを埋めた。
+  1. **新規シェーダー**: `shaders/vector_add_mul_div_sub_add_mul_div_
+     chain7_bounded_dxil.hlsl`(既存の`vector_add_mul_div_sub_add_mul_
+     chain6_bounded_dxil.hlsl`と同一の分離パターン、DXBC版
+     `vector_add_mul_div_sub_add_mul_div_chain7_bounded.hlsl`と同一契約・
+     同一演算内容)を実際に`dxc.exe -T cs_6_0 -E main`
+     (`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`)でコンパイルし、実DXILバイト列
+     (`vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.dxil`、
+     3536バイト)を得た。`tools/compile-dxbc-shaders.ps1`に追記済み。
+  2. **既存インフラの再利用(新規デコーダロジックは0行)**: 既存の
+     `resolve_dxil_calls_and_chain`/`translate_dxil_chain_to_spirv`
+     (2026-08-05〜06付エントリで境界チェック付きチェーンをN項まで扱える
+     よう既に一般化済み)がこの7項シェーダーにも無改修でそのまま適用
+     できることを実機テストで確認した——DXBC側チェーンデコーダが3〜6項へ
+     拡張されるたびに「コード変更は0行」だったのと同じパターンが、DXIL側
+     でもこの増分で成立した。
+  3. **実機検証(NVIDIA GT 730)**: 新規テスト
+     `vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil_real_
+     vulkan.rs`で、`cargo test -p directx-shader-translate --release
+     --test vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil_real_
+     vulkan -- --nocapture`を実行し、有効範囲256要素すべてがCPU参照実装
+     `(((((a[i]+b[i])*a[i])/b[i]-a[i]+b[i])*a[i])/b[i])`と一致し
+     (`c[0]=1.0001523, c[255]=89.04022`)、境界外64要素はセンチネル値
+     `-1`のまま(`c[319]=-1`)であることを実際に確認した。
+     `kernel.bounds_check == true`・`kernel.local_size == (64,1,1)`も
+     実測確認した。
+  4. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件。`cargo test --workspace --release`で単体テスト
+     50件+実機テスト22本(既存21本+今回の1本)すべてgreen、既存経路への
+     回帰なし。
+  5. **正直な開示・まだやっていないこと**: (1) 8項以上への拡張は未着手。
+     (2) `mul`のnegateフラグが立つケース、境界チェック無し版での今回
+     未検証の順序組み合わせは引き続き未検証(前回エントリから継続)。
+     (3) `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+     ハードコード自体の解消は未着手(open-cuda側の変更が必要、ユーザー
+     確認の上で着手する条件付きのため今回も見送り)。(4) テクスチャ
+     サンプリング・スワップチェーン・AMD/Intel/Linux/macOS実機検証・
+     各クレートのexample充足状況棚卸しは前回エントリから変更なし
+     (未着手のまま)。(5) dream-os側(SBM Isingカーネル・
+     flash-attentionブリッジ・RAID6/Z2ブリッジ・Android実機デモ)は
+     このパスでは調査したが変更していない(担当スコープの別リポジトリ、
+     このセッションでは並行して別増分を検討中)。
+  - 次にすべきこと: (1) 8項以上への境界チェック付きチェーン拡張、
+    (2) `mul`のnegateフラグが立つケースの検証、(3) テクスチャ
+    サンプリング・スワップチェーンへの拡張、(4) AMD/Intel・
+    Linux/macOS実機検証、(5) `opencuda-vulkan::VulkanDevice::
+    launch_kernel`のカーネル名ハードコード自体の解消(open-cuda側の
+    変更が必要、ユーザー確認の上で着手すること)、(6) 冒頭の東芝
+    SBM/DeepSeek技術組み込み構想。
+
 - **2026-08-08 境界チェック付きチェーンを7項へ拡張、実機検証(rs-sync横断
   セッション、4リポジトリの関連性・実用性・完成度向上の一環)**: 直前の
   2026-08-07 HANDOFFで「6項以上は未検証」と明記されていたギャップを

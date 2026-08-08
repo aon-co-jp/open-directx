@@ -124,3 +124,5 @@ Write-Host "OK: compiled vector_add_mul_div_sub_chain4_bounded_dxil.hlsl -> vect
 Write-Host "OK: compiled vector_add_mul_div_sub_add_chain5_bounded_dxil.hlsl -> vector_add_mul_div_sub_add_chain5_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 5-op chain, 2026-08-07)"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_chain6_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_chain6_bounded.dxil")
 Write-Host "OK: compiled vector_add_mul_div_sub_add_mul_chain6_bounded_dxil.hlsl -> vector_add_mul_div_sub_add_mul_chain6_bounded.dxil (DXIL, SM6.0, cbuffer+bounds-checked 6-op chain, 2026-08-07)"
+& $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.dxil")
+Write-Host "OK: compiled vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.hlsl -> vector_add_mul_div_sub_add_mul_div_chain7_bounded_dxil.dxil (DXIL, SM6.0, cbuffer+bounds-checked 7-op chain, 2026-08-08, DXIL counterpart to the DXBC-only chain7)"
