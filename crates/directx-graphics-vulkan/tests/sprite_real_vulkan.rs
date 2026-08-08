@@ -141,3 +141,68 @@ fn multiple_sprites_from_a_shared_atlas_render_at_independent_screen_positions_o
          描画できることを実Vulkan経路で確認した"
     );
 }
+
+/// アルファブレンド(透過スプライト)対応の実機検証(2026-08-08新設)。
+/// 1枚のアトラス(左半分=不透明青、右半分=半透明白)から、不透明な
+/// フルビューポート背景スプライトと、画面中央だけを覆う半透明前景
+/// スプライトをそれぞれ切り出して重ね描画し、重なった領域が標準的な
+/// "over"ブレンド式(`result = src.rgb*a + dst.rgb*(1-a)`)通りの色に
+/// なることを確認する。重ならない領域(背景のみ)は純粋な青のままである
+/// ことも合わせて確認し、ブレンドが本当に「重なった部分だけ」に効いて
+/// いることを実証する。
+#[test]
+fn semi_transparent_sprite_blends_over_opaque_background_using_standard_over_formula_on_real_vulkan_hardware() {
+    let vs = translate_sprite_vertex_shader(SPRITE_VS_DXBC).expect("sprite_vs.dxbc must translate");
+    let ps = translate_sprite_pixel_shader(SPRITE_PS_DXBC).expect("sprite_ps.dxbc must translate");
+
+    let blue = Rgba8 { r: 0, g: 0, b: 255, a: 255 };
+    let alpha_u8 = 128u8; // ≈0.502
+    let white_translucent = Rgba8 { r: 255, g: 255, b: 255, a: alpha_u8 };
+    // 2x1アトラス: 左(u<0.5)=不透明青、右(u>=0.5)=半透明白。
+    let atlas = TextureRgba8 { width: 2, height: 1, pixels: vec![blue, white_translucent] };
+
+    // 背景(不透明・フルビューポート)を先に描き、前景(半透明・画面中央
+    // だけを覆う矩形)を後から重ねる——描画順序がそのままブレンド順序に
+    // なる(`render_sprites_and_read_back`は配列の先頭から順に1回の
+    // レンダーパス内で描画するため、後の要素が前の要素の上に重なる)。
+    let bg = SpriteInstance { dest_ndc: [-1.0, -1.0, 1.0, 1.0], uv_rect: [0.0, 0.0, 0.5, 1.0] };
+    let fg = SpriteInstance { dest_ndc: [-0.5, -0.5, 0.5, 0.5], uv_rect: [0.5, 0.0, 1.0, 1.0] };
+
+    let width = 8u32;
+    let height = 8u32;
+    let pixels = match render_sprites_and_read_back(&vs.spirv_words, &ps.spirv_words, &atlas, &[bg, fg], width, height) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("実Vulkanデバイスが無いためスキップ: {e:#}");
+            return;
+        }
+    };
+    assert_eq!(pixels.len(), (width * height) as usize);
+
+    let at = |x: u32, y: u32| pixels[(y * width + x) as usize];
+
+    // 標準over式: result = src.rgb*a + dst.rgb*(1-a)
+    // = white(255)*(a/255) + blue*(1-a/255)。R8G8B8A8_UNORMの丸め込みを
+    // 考慮し許容差2で比較する。
+    let a = alpha_u8 as f32 / 255.0;
+    let expected_r = (255.0 * a + 0.0 * (1.0 - a)).round() as i32;
+    let expected_g = (255.0 * a + 0.0 * (1.0 - a)).round() as i32;
+    let expected_b = (255.0 * a + 255.0 * (1.0 - a)).round() as i32;
+    let center = at(4, 4);
+    assert!(
+        (center.r as i32 - expected_r).abs() <= 2 && (center.g as i32 - expected_g).abs() <= 2 && (center.b as i32 - expected_b).abs() <= 2,
+        "中央(半透明スプライトで覆われている領域)がover式の期待値と一致しない: {center:?} \
+         (期待≈r{expected_r},g{expected_g},b{expected_b})"
+    );
+
+    // 四隅(半透明スプライトの矩形[-0.5,-0.5,0.5,0.5]の外側)は背景の
+    // 不透明青のまま——ブレンドが半透明スプライトの範囲外まで漏れて
+    // いないことを確認する。
+    let corner = at(0, 0);
+    assert_eq!(corner, blue, "四隅はブレンド対象外で背景の不透明青のはず: {corner:?}");
+
+    println!(
+        "OK: 半透明スプライト(alpha={alpha_u8})が標準over式(result=src*a+dst*(1-a))通りに\
+         不透明な背景(青)とブレンドされることを実Vulkan経路で確認した(中央={center:?}、四隅={corner:?})"
+    );
+}

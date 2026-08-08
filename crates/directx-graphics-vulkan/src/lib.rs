@@ -1390,10 +1390,23 @@ pub fn render_sprites_and_read_back(
 
     let multisample = vk::PipelineMultisampleStateCreateInfo::builder().rasterization_samples(vk::SampleCountFlags::TYPE_1).sample_shading_enable(false);
 
+    // 標準的な"over"アルファブレンド(2026-08-08、透過スプライト対応)を
+    // 有効化した。`result = src.rgb * src.a + dst.rgb * (1 - src.a)`
+    // (アルファチャンネルも同じ式で合成)——src.a=1.0(不透明)の場合は
+    // `result = src.rgb`となり従来の`blend_enable=false`と数値的に等価
+    // なため、既存の不透明スプライトのみを使うテスト
+    // (`sprite_quad_samples_a_2x2_checkerboard_texture_exactly_...`等)は
+    // 無変更のまま結果が一致することを確認済み(既存経路への非破壊的な
+    // 拡張)。
     let color_blend_attachment = vk::PipelineColorBlendAttachmentState {
-        blend_enable: vk::FALSE,
+        blend_enable: vk::TRUE,
+        src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::SRC_ALPHA,
+        dst_alpha_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        alpha_blend_op: vk::BlendOp::ADD,
         color_write_mask: vk::ColorComponentFlags::RGBA,
-        ..Default::default()
     };
     let color_blend_attachments = [color_blend_attachment];
     let color_blend = vk::PipelineColorBlendStateCreateInfo::builder().logic_op_enable(false).attachments(&color_blend_attachments);

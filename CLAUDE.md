@@ -143,6 +143,46 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き11) アルファブレンド(半透明スプライト)対応を実装、
+  Windows/Linux両方の実機で検証——直前エントリの「次にすべきこと(2)」を
+  解消**:
+  1. **実装**(`crates/directx-graphics-vulkan/src/lib.rs`、
+     `render_sprites_and_read_back`のパイプライン構築部分): 標準的な
+     "over"アルファブレンド(`src_color_blend_factor=SRC_ALPHA`,
+     `dst_color_blend_factor=ONE_MINUS_SRC_ALPHA`, `color_blend_op=ADD`、
+     アルファチャンネルも同じ式)を有効化。**src.a=1.0(不透明)の場合は
+     数値的に`blend_enable=false`時と等価**なため、既存の全ての
+     不透明スプライトテスト(市松模様4象限一致・複数スプライト等)は
+     無変更のまま同じ結果を出すことを確認済み(既存経路への非破壊的な
+     拡張、リグレッション無し)。
+  2. **実機検証(Windows NVIDIA GT 730 + Linux WSL2 Ubuntu/Mesa
+     llvmpipe、両方で完全一致)**: 新規テスト
+     `semi_transparent_sprite_blends_over_opaque_background_using_
+     standard_over_formula_on_real_vulkan_hardware`で、2x1アトラス
+     (左=不透明青、右=alpha=128の半透明白)から背景(フルビューポート・
+     不透明)と前景(画面中央・半透明)をそれぞれ切り出して重ね描画し、
+     重なった領域が標準over式`result=src.rgb*a+dst.rgb*(1-a)`通りの色
+     (実測`Rgba8{r:128,g:128,b:255,a:191}`、期待値との差は丸め誤差の
+     範囲内)になること、重ならない四隅は背景の不透明青のままである
+     ことを確認した。両OSで実測値が完全一致。
+  3. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件(Windows)。`cargo test --workspace --release`で
+     全実機テスト(既存31本+今回1本の計32本)+unittests 53件すべて
+     green、既存経路への回帰なし。
+  4. **正直な開示**: (1) このブレンド有効化は`render_sprites_and_read_
+     back`(オフスクリーン版)のみ——`directx-graphics-window`(実
+     ウィンドウ版)のパイプラインは今回変更していない(`blend_enable:
+     vk::FALSE`のまま、次回同期させる余地あり)。(2) 加算ブレンド・
+     乗算ブレンド等、over以外のブレンドモードは未対応。(3) 深度
+     テストとブレンドの組み合わせ(半透明オブジェクトの描画順序問題)は
+     未検証(今回のテストは深度バッファ無しの2Dスプライト限定)。
+  - 次にすべきこと: (1) `directx-graphics-window`側にもブレンド設定を
+    反映(実ウィンドウデモで半透明スプライトを使いたい場合)、(2) 画像
+    ファイル(PNG等)からのテクスチャ読み込み、(3) 複数の動くスプライト+
+    衝突判定、(4) ウィンドウリサイズ対応、(5) 10項以上への境界チェック
+    付きチェーン拡張(DXBC/DXILチェーン系、別系統の未着手事項)。
+
 - **2026-08-08(続き10) ユーザーによる実行・目視確認完了——直前エントリの
   「次にすべきこと(1)」(ユーザー自身による実行・目視確認)が解消され、
   2Dスプライト描画プロトタイプが実ウィンドウでのインタラクティブな
