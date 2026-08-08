@@ -2,3 +2,5 @@
 Cargo.lock
 render_triangle.ppm
 render_triangle.png
+bouncing_sprite_frame_*.ppm
+bouncing_sprite.gif
