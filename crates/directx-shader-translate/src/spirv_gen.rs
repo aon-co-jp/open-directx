@@ -62,6 +62,16 @@ pub enum BinaryOp {
     /// 命令形状(`ld_structured`x2->演算->`store_structured`)で、オペコード
     /// だけがDivに変わる形を実機出力(`vector_div.dxbc`)で確認した。
     Div,
+    /// `mul dest, -srcB, srcA`(いずれか片方のソースオペランドにnegate) —
+    /// `A * (-B)` = `-(A*B)`。2026-08-08、`vector_mul_negate.hlsl`
+    /// (`Output[i] = A[i] * (-B[i])`)の実fxc.exe出力で、`mul`命令の第1
+    /// ソースオペランドに`negate: true`が実際に立つことを確認した——以前の
+    /// HANDOFFで「mulのnegateフラグは未検証」としていたケースがこれに
+    /// 相当する。両方のソースがnegateされる場合は理論上打ち消し合って
+    /// 通常の`Mul`と同じになるが、そのパターンは実シェーダーで確認して
+    /// いないため、今回はどちらか片方のみがnegateされているケースに
+    /// 限定して対応する(両方negateは`decode_shader_shape`側で拒否)。
+    MulNeg,
 }
 
 /// 翻訳結果のSPIR-Vモジュールと、Vulkanディスパッチに必要な最小限のメタ情報。
@@ -278,7 +288,26 @@ fn decode_shader_shape(instructions: &[Instruction]) -> Result<ShaderShape, Spir
                     op = Some(if src1.negate { BinaryOp::Sub } else { BinaryOp::Add });
                 }
                 Opcode::Mul => {
-                    op = Some(BinaryOp::Mul);
+                    // 実fxc.exe出力(`vector_mul_negate.dxbc`)で確認した形:
+                    // ソースオペランドのどちらか片方に`negate`が立っていれば
+                    // `A * (-B)`への最適化(`MulNeg`)、両方に立つ場合は
+                    // (打ち消し合うはずだが実シェーダーで未確認のため)対応
+                    // スコープ外として拒否する。
+                    let src1 = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("mulの第1ソースオペランドが無い".to_string())
+                    })?;
+                    let src2 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("mulの第2ソースオペランドが無い".to_string())
+                    })?;
+                    op = Some(match (src1.negate, src2.negate) {
+                        (false, false) => BinaryOp::Mul,
+                        (true, false) | (false, true) => BinaryOp::MulNeg,
+                        (true, true) => {
+                            return Err(SpirvGenError::UnsupportedShader(
+                                "mulの両方のソースオペランドにnegateが立つケースは未検証のため対応スコープ外".to_string(),
+                            ));
+                        }
+                    });
                 }
                 Opcode::Div => {
                     op = Some(BinaryOp::Div);
@@ -482,6 +511,10 @@ fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
             BinaryOp::Mul => b.f_mul(float_ty, None, val_a, val_b).expect("OpFMul"),
             BinaryOp::Sub => b.f_sub(float_ty, None, val_a, val_b).expect("OpFSub"),
             BinaryOp::Div => b.f_div(float_ty, None, val_a, val_b).expect("OpFDiv"),
+            BinaryOp::MulNeg => {
+                let product = b.f_mul(float_ty, None, val_a, val_b).expect("OpFMul");
+                b.f_negate(float_ty, None, product).expect("OpFNegate")
+            }
         };
 
         let ac_c = b
@@ -1073,6 +1106,13 @@ pub(crate) fn emit_chain_spirv_for_kernel(
                     BinaryOp::Mul => b.f_mul(float_ty, None, l, r).expect("OpFMul"),
                     BinaryOp::Sub => b.f_sub(float_ty, None, l, r).expect("OpFSub"),
                     BinaryOp::Div => b.f_div(float_ty, None, l, r).expect("OpFDiv"),
+                    // `decode_chain_shape`は`Add`以外のnegateを明示的に拒否
+                    // するため(このモジュール内の該当コメント参照)、チェーン
+                    // 内の式木に`MulNeg`が現れることは無い——単独`vector_mul`
+                    // シェーダー専用の`decode_shader_shape`のみが生成する。
+                    BinaryOp::MulNeg => unreachable!(
+                        "decode_chain_shapeはMulNegを生成しない(Add以外のnegateは拒否済み)"
+                    ),
                 }
             }
         }

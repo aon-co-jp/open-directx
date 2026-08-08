@@ -143,6 +143,53 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-08(続き4) `mul`のnegateフラグが立つケースを実装・実機検証
+  (複数回のHANDOFFエントリで「未検証」と記録されていたギャップを解消)**:
+  1. **新規シェーダー**: `shaders/vector_mul_negate.hlsl`
+     (`Output[i] = InputA[i] * (-InputB[i])`)を`fxc.exe /T cs_5_0`で実
+     コンパイル。
+  2. **実SHEX命令を`examples/dump_shex`でダンプして確認**(推測実装では
+     ない、既存方針の継続): `Mul`命令の第1ソースオペランド
+     (`operands[1]`、Bのロード結果)に`negate: true`が実際に立つことを
+     確認した——`sub`最適化(`Add`の第1オペランドへのnegate)とは別の
+     独立したケースとして、`Mul`自体にもfxcが同じnegate機構を使うことを
+     裏付けた。
+  3. **実装**(`crates/directx-shader-translate/src/spirv_gen.rs`):
+     `BinaryOp::MulNeg`(`A * (-B) = -(A*B)`)を新設。`decode_shader_shape`
+     の`Opcode::Mul`分岐で両ソースオペランドのnegateを検査し、片方のみ
+     negateなら`MulNeg`、両方negate(理論上は打ち消し合うはずだが実
+     シェーダーで未確認)は`SpirvGenError::UnsupportedShader`で正直に
+     拒否する。`emit_body`(単独シェーダー用)は`OpFMul`+`OpFNegate`で
+     正しく計算するよう対応。チェーンクラス側(`emit_chain_spirv`の
+     `emit_expr`)は`decode_chain_shape`が`Add`以外のnegateを既に拒否して
+     いるため`MulNeg`が渡ってくることはなく、`unreachable!()`で明示。
+  4. **実機検証(NVIDIA GT 730)**: 新規テスト
+     `vector_mul_negate_real_vulkan.rs`で、256要素すべてがCPU参照実装
+     `a[i]*-b[i]`と一致することを確認(`c[0]=-65, c[255]=-160.625`)。
+     修正前のコード(`op = Some(BinaryOp::Mul)`固定)のままだったら
+     negateを無視して`a[i]*b[i]`(符号違いの誤った値)を黙って返して
+     いたはずであり、これは「誤ったSPIR-Vを黙って生成しない」という
+     既存方針に対する実際の潜在バグだったことが今回の検証で判明した
+     (今回のパスで実際に遭遇する前に発見・修正できた)。
+  5. **ワークスペース全体の検証**: `cargo build --workspace --release`・
+     `cargo clippy --workspace --all-targets --release -- -D warnings`
+     いずれも警告0件。`cargo test --workspace --release`で全実機テスト
+     (既存27本+今回1本の計28本)+unittests 50件すべてgreen、既存経路
+     への回帰なし。
+  6. **正直な開示**: (1) 両ソースオペランドが同時にnegateされるケース
+     (理論上は`Mul`へ戻るはずだが実シェーダー未確認)は引き続き未検証・
+     拒否のまま。(2) `Div`/`Sub`単体でのnegateバリエーション(例:
+     `A / (-B)`)は今回のスコープ外、次回検討候補。(3) チェーン内での
+     `Mul`のnegateは`decode_chain_shape`側でまだ拒否のまま(今回は単独
+     `vector_mul`パターンのみ対応)。
+  - 次にすべきこと: (1) チェーン内での`Mul`negate対応、(2) `Div`/`Sub`
+    のnegateバリエーション、(3) 10項以上への境界チェック付きチェーン
+    拡張、(4) テクスチャサンプリング・スワップチェーンへの拡張、
+    (5) AMD/Intel・Linux/macOS実機検証、(6)
+    `opencuda-vulkan::VulkanDevice::launch_kernel`のカーネル名
+    ハードコード解消(open-cuda側変更要)、(7) 冒頭の東芝SBM/DeepSeek
+    技術組み込み構想。
+
 - **2026-08-08(続き3) 境界チェック付きチェーンを9項へ拡張、実機検証
   (DXBC/DXIL両方、コード変更は0行)。直前エントリの「次にすべきこと(1):
   9項以上への境界チェック付きチェーン拡張」を解消**:
