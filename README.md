@@ -92,7 +92,10 @@ Vulkan's own reach:
 | Linux | native Vulkan | Should build/run unmodified (no Windows-specific code exists to block it) — **not yet tested on a real Linux machine in this environment** |
 | Android | native Vulkan | `open-cuda` has verified `aarch64-linux-android` cross-compilation succeeds (per its CLAUDE.md); real-device execution (`vkCreateInstance` on an actual phone) is still pending |
 | macOS | Vulkan via [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (translates to Metal) | Not yet attempted — MoltenVK is a translation layer, not native Vulkan, so this is a weaker guarantee than Linux/Android |
-| iOS | Vulkan via MoltenVK (translates to Metal) | Not yet attempted. **Same MoltenVK caveat as macOS applies** — Vulkan does not run natively on iOS, only through this translation layer, so parity with the Windows/Vulkan-native path is not guaranteed until actually tried on a device |
+| iOS / iPadOS (added 2026-08-17) | Vulkan via MoltenVK (translates to Metal) | Not yet attempted. **Same MoltenVK caveat as macOS applies** — Vulkan does not run natively on iOS/iPadOS, only through this translation layer, so parity with the Windows/Vulkan-native path is not guaranteed until actually tried on a device. Also requires the Apple Developer Program for official distribution. |
+| Various UNIX/BSD (added 2026-08-17) | native Vulkan, likely | Unresearched — Vulkan support varies by distribution/driver; expected to reuse most of the Linux path once investigated |
+| Sony PlayStation 4/5/6/7 | n/a | Explicitly out of scope for now — see the "PlayStation family targets" note below and `CLAUDE.md` |
+| Nintendo Switch 2 / 3 (added 2026-08-17) | n/a | Same "future ambition, deferred pending official SDK/NDA" status as PlayStation. **Switch 3 has not been officially announced by Nintendo as of 2026-08-17 — its inclusion here is only a placeholder for if/when it is announced, not based on real product information.** |
 
 GPU vendor coverage (PCI vendor ID matching, consistent across this repo
 and `open-cuda`: NVIDIA `0x10DE`, AMD `0x1002`/`0x1022`, Intel `0x8086`):
