@@ -1,5 +1,11 @@
 # 設計思想＆開発方針＆開発環境ルール(open-directx)
 
+*English*: [CLAUDE-English.md](CLAUDE-English.md) ·
+*Other languages*: [Deutsch](CLAUDE-German.md) · [Italiano](CLAUDE-Italian.md) ·
+[Français](CLAUDE-French.md) · [Русский](CLAUDE-Russian.md) ·
+[Українська](CLAUDE-Ukrainian.md) · [עברית](CLAUDE-Hebrew.md) ·
+[فارسی](CLAUDE-Persian.md) · [العربية](CLAUDE-Arabic.md)
+
 > **📌 保留タスク(2026-08-06、次回セッションで着手予定)/ Pending task (added 2026-08-06, to be started next session)**:
 > ユーザー指示により、**東芝の疑似量子コンピューター技術(Simulated
 > Bifurcation Machine)**と**DeepSeekの技術**(インターネットニュースだけ

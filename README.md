@@ -1,5 +1,11 @@
 # open-directx
 
+*日本語*: [README-Japanese.md](README-Japanese.md) ·
+*Other languages*: [Deutsch](README-German.md) · [Italiano](README-Italian.md) ·
+[Français](README-French.md) · [Русский](README-Russian.md) ·
+[Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
+[فارسی](README-Persian.md) · [العربية](README-Arabic.md)
+
 > 📌 **最近の更新(2026-08-08、2Dスプライト描画プロトタイプ)**:
 > ユーザー提案「dream-os/Linux上でopen-directx経由でGT730のPCでGAME…の
 > 試作品を開発」を受け、まず2Dスプライト描画に絞って着手。テクスチャ

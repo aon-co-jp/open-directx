@@ -1,5 +1,11 @@
 # PORTING.md — what's reusable, by whom, and how
 
+*日本語*: [PORTING-Japanese.md](PORTING-Japanese.md) ·
+*Other languages*: [Deutsch](PORTING-German.md) · [Italiano](PORTING-Italian.md) ·
+[Français](PORTING-French.md) · [Русский](PORTING-Russian.md) ·
+[Українська](PORTING-Ukrainian.md) · [עברית](PORTING-Hebrew.md) ·
+[فارسی](PORTING-Persian.md) · [العربية](PORTING-Arabic.md)
+
 > **2026-08-08 更新(続き、2Dスプライト描画プロトタイプ)**: 新規クレート
 > `crates/directx-graphics-window`(winit+ash-window、実ウィンドウ+実
 > スワップチェーン+実キーボード入力)・`directx-graphics-vulkan`の
