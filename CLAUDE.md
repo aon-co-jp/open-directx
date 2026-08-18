@@ -161,6 +161,27 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-18 ワークスペース全体をLinux実機(WSL2 Ubuntu)で初めて
+  ビルド・テスト検証(ユーザー指示「Linux実機での動作確認」への対応、
+  README.mdの対応プラットフォーム表に残っていた「Linuxは未検証」を
+  解消)**: `cargo build --workspace --release`成功(約9分半、
+  クロスファイルシステム〈`/mnt/f/runo`〉経由のためWindows側より低速)。
+  `cargo test --workspace --release`で**実機Vulkanテストを含む全テストが
+  0件失敗**(`*_matches_cpu_reference_on_real_vulkan_hardware`系テスト
+  すべてがpass、DXBC/DXIL両経路のvector演算チェーン・境界チェック
+  テストを含む)。**正直な開示**: このWSL2環境のVulkanデバイスは
+  Meshaの`llvmpipe`(ソフトウェアラスタライザ、CPU実行)であり、実GPU
+  ドライバ経由の検証ではない——コードパス自体がLinux上で正しく動作
+  することは実証できたが、Windows側のGT730実機のような「本物のGPU
+  ドライバでの検証」には該当しない(既存のPNGローダー検証〈2026-08-08〉
+  で確立済みの検証方法〈WSL2 Ubuntu/Mesa llvmpipe〉を踏襲)。
+  README.md/README-Japanese.md/CLAUDE-English.md等の対応プラット
+  フォーム表・記述をこの結果に合わせて更新した。
+  - 次にすべきこと: (1) 実GPUドライバを持つ実機Linux環境(WSL2ではなく
+    ネイティブLinuxマシン、またはNVIDIA/AMD/IntelドライバをインストールしたLinux)での再検証、
+    (2) Android実機でのVulkan実行検証(README記載の「`vkCreateInstance`が
+    実機で成功するかは未検証」は本パスでは対象外のまま)。
+
 - **2026-08-08(続き12) 実PNGファイルからのテクスチャ読み込みを実装、
   Windows/Linux両方の実機で検証——直前エントリの「次にすべきこと(2)」を
   解消**:

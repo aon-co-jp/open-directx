@@ -95,7 +95,7 @@ Vulkan's own reach:
 | Platform | Path | Status |
 |---|---|---|
 | Windows | native Vulkan | **Verified on real hardware** (this repo's dev machine, NVIDIA GeForce GT 730) |
-| Linux | native Vulkan | Should build/run unmodified (no Windows-specific code exists to block it) — **not yet tested on a real Linux machine in this environment** |
+| Linux | native Vulkan | **Verified 2026-08-18** — `cargo build --workspace --release` and `cargo test --workspace --release` both succeed on real Linux (WSL2 Ubuntu), all real-hardware Vulkan tests pass (0 failures across the full workspace). Honest disclosure: the Vulkan device backing these tests is Mesa's `llvmpipe` (a software/CPU rasterizer), not a discrete/integrated GPU — so this confirms the code path works correctly on Linux, but does not exercise a real GPU driver on Linux the way the Windows GT730 runs do. |
 | Android | native Vulkan | `open-cuda` has verified `aarch64-linux-android` cross-compilation succeeds (per its CLAUDE.md); real-device execution (`vkCreateInstance` on an actual phone) is still pending |
 | macOS | Vulkan via [MoltenVK](https://github.com/KhronosGroup/MoltenVK) (translates to Metal) | Not yet attempted — MoltenVK is a translation layer, not native Vulkan, so this is a weaker guarantee than Linux/Android |
 | iOS / iPadOS (added 2026-08-17) | Vulkan via MoltenVK (translates to Metal) | Not yet attempted. **Same MoltenVK caveat as macOS applies** — Vulkan does not run natively on iOS/iPadOS, only through this translation layer, so parity with the Windows/Vulkan-native path is not guaranteed until actually tried on a device. Also requires the Apple Developer Program for official distribution. |
