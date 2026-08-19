@@ -161,6 +161,37 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-19 「常駐サービスが無いのは欠陥」というユーザー指摘への調査回答
+  (open-cuda側と同時対応、詳細な調査結果は`open-cuda/CLAUDE.md`の同日
+  HANDOFF参照)**:
+  1. **調査結果**: 本物のMicrosoft DirectXは`d3d11.dll`等のDLL群
+     (「DirectX Runtime」)を各アプリが動的リンクして使う**ランタイム
+     ライブラリ方式**であり、独立の常駐バックグラウンドサービスは存在
+     しない([Microsoft DirectX-Specs](https://microsoft.github.io/DirectX-Specs/)、
+     DirectX Runtime配布物の一般的な技術文書で確認)。GPUベンダーの
+     カーネル/ユーザーモードドライバは常駐するが、これはDirectX自体
+     ではなくGPUベンダー提供物。
+  2. **結論**: **本プロジェクト(DirectX互換層)が現状「常駐サービス無し、
+     ライブラリ+デモバイナリのみ」であることは本家DirectXのアーキ
+     テクチャと一致しており「欠陥」ではない**。本プロジェクトが目指す
+     「Windows DirectXアプリを他OSでそのまま動かす」ゴールも、
+     DXVK/vkd3d-protonと同様にアプリプロセスへ動的にフックする
+     ライブラリ方式で達成可能であり、常駐サービス化を要求しない。
+  3. **常駐が妥当なケースの検討**: Windows自体のDWM(Desktop Window
+     Manager)のような「複数プロセス間のGPUリソース調停・コンポジタ」
+     役は本プロジェクトのスコープ外(本プロジェクトはDirectX API呼び出し
+     をVulkanへ翻訳する互換層であり、ウィンドウコンポジタではない)。
+     `open-cuda`側で検討した`nvidia-persistenced`型の「GPU初期化状態の
+     プロセス間キャッシュ」は、本プロジェクトが`open-cuda`の
+     `opencuda-vulkan`をバックエンドとして利用する設計のため、実装する
+     ならopen-cuda側に持たせるのが自然(本プロジェクト側での重複実装は
+     しない)。
+  4. **結論として今回は実装せず**、技術的根拠(本家DirectXがランタイム
+     ライブラリ方式であること)のみをここに記録する。
+  - 出典: [Microsoft DirectX-Specs](https://microsoft.github.io/DirectX-Specs/)、
+    DirectX End-User Runtimeがインストーラ配布のDLL群であることを示す
+    Microsoft公式ダウンロードページ群。
+
 - **2026-08-18 ワークスペース全体をLinux実機(WSL2 Ubuntu)で初めて
   ビルド・テスト検証(ユーザー指示「Linux実機での動作確認」への対応、
   README.mdの対応プラットフォーム表に残っていた「Linuxは未検証」を
