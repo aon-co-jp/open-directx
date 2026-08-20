@@ -161,6 +161,106 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 ## HANDOFF
 
+- **2026-08-20 LLM推論向けハードウェアアクセラレーション基盤としての第一歩:
+  固定2x2 GEMM(行列積)のコンピュートシェーダー垂直スライスを実装・実機
+  検証(ユーザー指示「open-directxをLLM推論用のハードウェアアクセラレー
+  ション基盤として機能拡張」への対応)**:
+  1. **既存基盤の調査結果**: `directx-graphics-vulkan`はグラフィックス
+     パイプライン専用(`VkGraphicsPipelineCreateInfo`、レンダーパス/
+     フレームバッファ)であり、コンピュートシェーダーには非対応
+     ——Cargo.toml自身のdescriptionに明記済みの通り
+     (`open-cuda`の`opencuda-vulkan`はCompute専用、逆にこちらは
+     Graphics専用という完全な役割分担)。一方`directx-shader-translate`
+     は既に**DXBC/DXIL→SPIR-Vのコンピュートシェーダー翻訳基盤を持って
+     いた**——ただし対応形状は「同一添字での要素ごとの2項演算チェーン
+     (`ld_structured`×N→add/mul/sub/div→`store_structured`、制御フロー
+     無し、境界チェック有り/無し)」に限定されており、GEMMが要求する
+     「読み込み添字自体を算術演算で計算する」形・動的ループ
+     (`loop`/`endloop`命令)には非対応だった。`open-cuda`側の
+     `opencuda-vulkan::real::VulkanDevice::launch_kernel`は既に
+     `"matmul"`/`"matmul_f32"`カーネル名を実装済み(可変サイズGEMM、
+     実機検証済み)だが、これは`open-directx`のDXBC翻訳経路とは独立の
+     別実装(open-cuda自身のGLSL製シェーダー)であり、GEMM演算自体の
+     実装が既にopen-cuda側にあること・open-directx固有の価値は
+     「DXBC/HLSL由来のシェーダー資産をVulkanで実行できる翻訳層」で
+     あることを踏まえ、重複実装を避けるためopen-directx側では
+     「DXBCを実際に翻訳してGEMM計算を実行する」ことの実証に絞った。
+  2. **実装方針**: 一般のM×K×N可変サイズGEMM(ループを伴う)への対応は
+     既存デコーダ群のアーキテクチャ(制御フロー無し、というこれまでの
+     全パターンの共通前提)を大きく超える規模のコンパイラ作業になる
+     ため見送り、CLAUDE.md方針の「過大な実装を避け、まず1つの演算が
+     実機で正しく動くことを実証する」に従い、**固定サイズ2x2×2x2=2x2の
+     GEMMをK=2で完全アンロールした`shaders/gemm2x2.hlsl`
+     (`numthreads(2,2,1)`、ディスパッチグリッドと出力サイズが厳密に
+     一致するため境界チェック不要)**を新規に書き、`fxc.exe /T cs_5_0`で
+     実際にDXBCへコンパイル、`examples/dump_shex`で実SHEX命令列を
+     ダンプして確認した(推測実装ではない)。実際の命令列は
+     `imad→ld_structured→iadd→ld_structured→mul→ld_structured→ishl→
+     ld_structured→iadd→mad→store_structured→ret`(添字計算に
+     `imad`/`iadd`/`ishl`を使う、既存デコーダのいずれとも異なる新形状)。
+  3. **実装した範囲**: `crates/directx-shader-translate/src/spirv_gen.rs`
+     に`translate_gemm2x2_shader`(公開API)・`decode_gemm2x2_shape`
+     (実SHEX命令列が上記の既知固定形状と一致するかを実際に検証、
+     一致しなければ`SpirvGenError::UnsupportedShader`で誠実に拒否)・
+     `emit_gemm2x2_spirv`(検証済みの形に対し`C[i][j]=A[i][0]*B[0][j]+
+     A[i][1]*B[1][j]`を`gl_GlobalInvocationID.x/y`から直接計算する
+     SPIR-Vを直接組み立て、既存の`emit_spirv_impl`と同じ設計方針)を
+     新設。`opencuda-vulkan`の`"vector_add"`カーネル契約(3ストレージ
+     バッファ+push constant `uint`1個)をそのまま流用(gemm2x2は固定
+     サイズのためm/k/nパラメータ自体が不要、push constantは未使用の
+     ダミーとして宣言のみ)。単体テスト3件(翻訳成功・ガベージ拒否・
+     形状の異なるvector_add DXBCの誠実な拒否)を追加。
+     `aruaru-llm`側への実配線は**今回のスコープ外**(次回課題、下記
+     「aruaru-llmへの配線状況」参照)。
+  4. **実機検証結果(型チェックのみで完了と報告しない方針を徹底、
+     このマシンのNVIDIA GeForce GT 730、非対称な値の行列
+     `A=[[1,2],[3,4]]`・`B=[[5,6],[7,8]]`で転置ミス等の取り違えバグを
+     検出できる設計)**: 新規テスト
+     `crates/directx-shader-translate/tests/gemm2x2_real_vulkan.rs::
+     dxbc_gemm2x2_matches_cpu_reference_on_real_vulkan_hardware`が
+     実際にDXBC→SPIR-V翻訳→実Vulkanディスパッチ→結果読み戻しまで
+     完走し、GPU出力`[19.0, 22.0, 43.0, 50.0]`がCPU参照実装(素朴な
+     2x2行列積)の期待値`[[19,22],[43,50]]`と完全一致することを
+     確認した(`cargo test --release --test gemm2x2_real_vulkan --
+     --nocapture`実行結果、`device: OpenCUDA Vulkan Device (NVIDIA
+     GeForce GT 730)`のログ付き、スキップ分岐は発火せず実機経路を
+     通過)。**GT730でのDirectX/Vulkan Compute対応自体に問題は
+     見られなかった**(古い世代のGPUのため懸念していた通りだが、
+     この固定サイズ2x2×1ワークグループという極小規模のディスパッチ
+     では制約に遭遇しなかった——より大きいサイズでの実証は未実施の
+     ため、より大規模なGEMMでも同様に動作するかは今回確認していない)。
+  5. **検証結果**: `cargo build -p directx-shader-translate --release`/
+     `cargo build --workspace --release`警告0件・成功。`cargo test -p
+     directx-shader-translate --release`(lib 56件+全tests、新規
+     lib単体テスト3件+実機テスト1件を含む)全green、既存の全実機
+     テスト(vector_add/mul/div/sub系・チェーン2〜9項・DXBC/DXIL両方)
+     への回帰無し。`cargo clippy --workspace --all-targets --release
+     -- -D warnings`警告0件(`type_complexity`警告1件を型エイリアス
+     `Gemm2x2Shape`で解消)。
+  6. **正直な開示・制約**: (a) 固定2x2サイズのみ——可変サイズ
+     (M×K×N、ループを伴う)GEMMへの一般化は未着手(次フェーズの課題、
+     動的ループ命令〈`loop`/`endloop`〉の対応が新たに必要になる規模の
+     大きい増分)。(b) `decode_gemm2x2_shape`は汎用的なレジスタ式木の
+     評価ではなく、`gemm2x2.hlsl`という**この1本の既知の実DXBC出力と
+     一致するかどうかのみ**を検証する狭い専用デコーダ(既存の
+     `decode_shader_shape`/`decode_chain_shape`とは独立、共有ロジックは
+     無い)。(c) Attention(Softmax/QK^T等)は今回未着手——GEMM1個の
+     実証のみに絞った(タスク指示通り)。(d) `aruaru-llm`側への配線
+     (`aruaru-llm`のCargo.tomlへのoptional依存追加、実際の推論経路への
+     組み込み)は**未実施**——open-directx単体でコンピュートシェーダーが
+     動くことの実証を優先し、次回スコープとして残す。(e) `open-cuda`側の
+     既存GEMM実装(`matmul`/`matmul_f32`、可変サイズ・実機検証済み)との
+     重複は無い(今回の実装はopen-directx固有の「DXBC翻訳」という価値の
+     実証であり、open-cuda側のGEMMカーネル自体は変更していない)。
+  - 次にすべきこと: (1) `aruaru-llm`への実配線(open-cudaの
+    `set_matmul_spirv`パターンに倣い、open-directx経由のSPIR-Vを
+    optionalなハードウェアアクセラレーションバックエンドとして選択
+    できるようにする)、(2) 可変サイズGEMMへの一般化(ループ対応、
+    規模の大きいコンパイラ作業)、(3) より大きい行列サイズでの実機
+    検証(このセッションでは2x2のみ、GT730の実際の性能限界・制約の
+    有無は未確認)、(4) Attention計算(Softmax等)のDXBC翻訳対応
+    (今回はGEMM1個のみに絞ったタスク指示のスコープ通り)。
+
 - **2026-08-19 「常駐サービスが無いのは欠陥」というユーザー指摘への調査回答
   (open-cuda側と同時対応、詳細な調査結果は`open-cuda/CLAUDE.md`の同日
   HANDOFF参照)**:

@@ -1954,6 +1954,272 @@ fn emit_sprite_pixel_spirv() -> Vec<u32> {
     module.assemble()
 }
 
+// ---------------------------------------------------------------------
+// GEMM(行列積)垂直スライス: `shaders/gemm2x2.hlsl`専用の翻訳経路。
+// ---------------------------------------------------------------------
+//
+// **正直なスコープ**: 上記の`decode_shader_shape`/`decode_chain_shape`は
+// いずれも「同じ添字(スレッドID)で読み書きする要素ごとの演算」専用の
+// デコーダであり、GEMM(行列積、C[i][j]=Σ_k A[i][k]*B[k][j])が要求する
+// 「読み込み添字自体をスレッドIDから算術演算(乗算・加算)で計算する」
+// 形には対応していない。CLAUDE.mdのPhase 0が要求する「1つのシンプルな
+// コンピュートシェーダーが実際にDXBC→SPIR-Vへ翻訳されVulkan実行される」
+// という垂直スライスを、動的ループ(`loop`/`endloop`命令、本クレートの
+// 既存デコーダ群がいずれも扱っていない制御フロー)を避けたまま実証する
+// ため、**固定サイズ2x2×2x2=2x2のGEMMをK=2で完全アンロールした
+// `shaders/gemm2x2.hlsl`(`numthreads(2,2,1)`、境界チェック不要——
+// ディスパッチグリッドと出力サイズが厳密に一致するため)専用のデコーダ**
+// として新規に追加した。一般のM×K×N GEMM(可変サイズ、ループを伴う)への
+// 一般化は今回のスコープ外(次フェーズの課題として正直に残す)。
+//
+// 実際に`fxc.exe /T cs_5_0`でコンパイルし`examples/dump_shex`で確認した
+// 実SHEX命令列(19命令、制御フロー無し)は次の通り:
+// `dcl_globalFlags -> dcl_uav_structured(u0,u1,u2) -> dcl_input(vThreadID)
+// -> dcl_temps(1) -> dcl_thread_group(2,2,1) -> imad -> ld_structured(u0)
+// -> iadd -> ld_structured(u1) -> mul -> ld_structured(u1) -> ishl
+// -> ld_structured(u0) -> iadd -> mad -> store_structured(u2) -> ret`
+// (`C[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j]`、`i=threadID.y`,
+// `j=threadID.x`)。このデコーダは、レジスタ単位の式木を汎用的に評価する
+// のではなく、**この既知の命令列と一致するかどうかだけを実際に検証する**
+// (オペコード列・UAVバインドポイント・スレッドグループサイズを実際に
+// パースした`SHEX`から読み取り、1つでも食い違えば
+// `SpirvGenError::UnsupportedShader`を返す——「対応している」という
+// 誤ったシグナルを出さない、というCLAUDE.md方針の継続)。
+
+/// [`translate_gemm2x2_shader`]の結果。固定2x2×2x2GEMM専用のため、
+/// 汎用[`TranslatedKernel`]と異なりM/K/Nパラメータは持たない
+/// (常に2x2固定、`shape.uav_bind_points`のみ実DXBCから抽出する)。
+#[derive(Debug, Clone)]
+pub struct Gemm2x2TranslatedKernel {
+    /// 生成されたSPIR-Vモジュール(リトルエンディアン32bitワード列)。
+    pub spirv_words: Vec<u32>,
+    /// `OpEntryPoint`のエントリポイント名(常に`"main"`)。
+    pub entry_point: &'static str,
+    /// `dcl_thread_group`から得た実際のスレッドグループサイズ(常に`(2,2,1)`
+    /// になるはずだが、決め打ちにせず実DXBCから抽出した値をそのまま返す)。
+    pub local_size: (u32, u32, u32),
+    /// `dcl_uav_structured`から得た、A/B/C(この順)のUAVバインドポイント。
+    pub uav_bind_points: (u32, u32, u32),
+}
+
+/// DXBCバイト列(`shaders/gemm2x2.hlsl`相当のD3D11 Compute Shader、
+/// SM5.0)を解析し、実際のSHEX命令列が既知の固定2x2GEMM形状と一致するか
+/// 検証しながらSPIR-Vへ翻訳する。一致しなければ
+/// `SpirvGenError::UnsupportedShader`を返す(黙って的外れなSPIR-Vを
+/// 生成しない)。
+pub fn translate_gemm2x2_shader(bytes: &[u8]) -> Result<Gemm2x2TranslatedKernel, SpirvGenError> {
+    let containers = scan_dxbc(bytes);
+    let container = containers.into_iter().next().ok_or_else(|| {
+        SpirvGenError::Translate(TranslateError::Parse("DXBCコンテナが見つからない".to_string()))
+    })?;
+
+    let mut instructions: Option<Vec<Instruction>> = None;
+    for chunk in &container.chunks {
+        if let ChunkData::Shader(program) = chunk.parse() {
+            instructions = Some(program.instructions);
+        }
+    }
+    let instructions = instructions.ok_or(SpirvGenError::Translate(TranslateError::MissingChunk("SHEX")))?;
+
+    let (uav_a, uav_b, uav_c, thread_group) = decode_gemm2x2_shape(&instructions)?;
+    let spirv_words = emit_gemm2x2_spirv(uav_a, uav_b, uav_c);
+
+    Ok(Gemm2x2TranslatedKernel {
+        spirv_words,
+        entry_point: "main",
+        local_size: thread_group,
+        uav_bind_points: (uav_a, uav_b, uav_c),
+    })
+}
+
+/// 実SHEX命令列が、`shaders/gemm2x2.hlsl`の既知の固定形状(上記コメント
+/// 参照)と一致するかを検証する。オペコード列自体は実際に`fxc.exe`出力を
+/// ダンプして確認したものと突き合わせる——推測でオペコードを並べたもの
+/// ではない。戻り値は`(uav_a, uav_b, uav_c, thread_group)`。
+type Gemm2x2Shape = (u32, u32, u32, (u32, u32, u32));
+
+fn decode_gemm2x2_shape(instructions: &[Instruction]) -> Result<Gemm2x2Shape, SpirvGenError> {
+    let mut uavs: Vec<u32> = Vec::new();
+    let mut thread_group: Option<(u32, u32, u32)> = None;
+    let mut opcodes: Vec<Opcode> = Vec::new();
+
+    for ins in instructions {
+        match &ins.kind {
+            InstructionKind::DclGlobalFlags { .. } => {}
+            InstructionKind::DclUavStructured { stride, operands, .. } => {
+                if *stride != 4 {
+                    return Err(SpirvGenError::UnsupportedShader(format!(
+                        "dcl_uav_structuredのstrideが4(float)ではない: {stride}"
+                    )));
+                }
+                let op = operands.first().ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("dcl_uav_structuredにオペランドが無い".to_string())
+                })?;
+                let bind = uav_index(&op.indices).ok_or_else(|| {
+                    SpirvGenError::UnsupportedShader("dcl_uav_structuredのUAVバインドポイントを解決できない".to_string())
+                })?;
+                uavs.push(bind);
+            }
+            InstructionKind::DclInput { .. } => {}
+            InstructionKind::DclTemps { .. } => {}
+            InstructionKind::DclThreadGroup { x, y, z } => {
+                thread_group = Some((*x, *y, *z));
+            }
+            InstructionKind::Generic { .. } => {
+                opcodes.push(ins.opcode);
+            }
+            _ => {
+                return Err(SpirvGenError::UnsupportedShader(format!(
+                    "gemm2x2の想定外の宣言命令: {:?}",
+                    ins.kind
+                )));
+            }
+        }
+    }
+
+    if uavs.len() != 3 {
+        return Err(SpirvGenError::UnsupportedShader(format!(
+            "gemm2x2はUAV3本(A/B/C)を要求するが{}本だった",
+            uavs.len()
+        )));
+    }
+    let thread_group = thread_group
+        .ok_or_else(|| SpirvGenError::UnsupportedShader("dcl_thread_groupが見つからない".to_string()))?;
+    if thread_group != (2, 2, 1) {
+        return Err(SpirvGenError::UnsupportedShader(format!(
+            "gemm2x2はnumthreads(2,2,1)を要求するが{thread_group:?}だった"
+        )));
+    }
+
+    // 実fxc.exe出力(examples/dump_shexで確認済み)と一致する固定オペコード列。
+    const EXPECTED: &[Opcode] = &[
+        Opcode::IMad,
+        Opcode::LdStructured,
+        Opcode::Iadd,
+        Opcode::LdStructured,
+        Opcode::Mul,
+        Opcode::LdStructured,
+        Opcode::Ishl,
+        Opcode::LdStructured,
+        Opcode::Iadd,
+        Opcode::Mad,
+        Opcode::StoreStructured,
+        Opcode::Ret,
+    ];
+    if opcodes != EXPECTED {
+        return Err(SpirvGenError::UnsupportedShader(format!(
+            "gemm2x2の想定オペコード列と一致しない: got {opcodes:?}"
+        )));
+    }
+
+    Ok((uavs[0], uavs[1], uavs[2], thread_group))
+}
+
+/// `decode_gemm2x2_shape`で検証済みのUAVバインドポイントから、固定2x2GEMM
+/// (`C[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j]`、`i=gl_GlobalInvocationID.y`,
+/// `j=gl_GlobalInvocationID.x`)を実行するSPIR-Vを直接組み立てる
+/// (DXBC命令列を1対1で逐次変換するのではなく、`decode_gemm2x2_shape`が
+/// 実際に検証した固定形状に対して、数学的に同値なSPIR-Vを直接発行する
+/// ——既存の`emit_spirv_impl`/`emit_chain_spirv_for_kernel`と同じ
+/// 「検証済みの形に対して直接SPIR-Vを組む」設計方針)。
+/// `opencuda-vulkan`の`"vector_add"`カーネル契約(3ストレージバッファ+
+/// push constant `uint n`)に合わせるため、未使用のpush constantも
+/// 宣言する(呼び出し側は`n=4`等ダミー値を渡せばよい、シェーダー側は
+/// 参照しない)。
+fn emit_gemm2x2_spirv(uav_a: u32, uav_b: u32, uav_c: u32) -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let uint_ty = b.type_int(32, 0);
+    let uvec3_ty = b.type_vector(uint_ty, 3);
+
+    let rt_array_ty = b.type_runtime_array(float_ty);
+    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(4)]);
+    let buf_struct_ty = b.type_struct(vec![rt_array_ty]);
+    b.decorate(buf_struct_ty, spirv::Decoration::BufferBlock, vec![]);
+    b.member_decorate(buf_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let buf_ptr_ty = b.type_pointer(None, spirv::StorageClass::Uniform, buf_struct_ty);
+
+    let make_buffer_var = |b: &mut Builder, binding: u32| -> u32 {
+        let var = b.variable(buf_ptr_ty, None, spirv::StorageClass::Uniform, None);
+        b.decorate(var, spirv::Decoration::DescriptorSet, vec![DrOperand::LiteralBit32(0)]);
+        b.decorate(var, spirv::Decoration::Binding, vec![DrOperand::LiteralBit32(binding)]);
+        var
+    };
+    let var_a = make_buffer_var(&mut b, uav_a);
+    let var_b = make_buffer_var(&mut b, uav_b);
+    let var_c = make_buffer_var(&mut b, uav_c);
+
+    // push constant: struct Params { uint n; } (opencuda-vulkanの
+    // "vector_add"カーネル契約に合わせるためだけの未使用フィールド)。
+    let params_struct_ty = b.type_struct(vec![uint_ty]);
+    b.decorate(params_struct_ty, spirv::Decoration::Block, vec![]);
+    b.member_decorate(params_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let params_ptr_ty = b.type_pointer(None, spirv::StorageClass::PushConstant, params_struct_ty);
+    let _var_params = b.variable(params_ptr_ty, None, spirv::StorageClass::PushConstant, None);
+
+    let gid_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, uvec3_ty);
+    let var_gid = b.variable(gid_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_gid, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::GlobalInvocationId)]);
+
+    let float_ptr_uniform_ty = b.type_pointer(None, spirv::StorageClass::Uniform, float_ty);
+
+    let main_fn = b
+        .begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty)
+        .expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let const_0 = b.constant_bit32(uint_ty, 0);
+    let const_1 = b.constant_bit32(uint_ty, 1);
+    let const_2 = b.constant_bit32(uint_ty, 2);
+
+    let gid_vec = b.load(uvec3_ty, None, var_gid, None, vec![]).expect("OpLoad gid");
+    let j = b.composite_extract(uint_ty, None, gid_vec, vec![0]).expect("j = gid.x");
+    let i = b.composite_extract(uint_ty, None, gid_vec, vec![1]).expect("i = gid.y");
+
+    // idx_a0 = i*2 + 0, idx_a1 = i*2 + 1
+    let i2 = b.i_mul(uint_ty, None, i, const_2).expect("i*2");
+    let idx_a1 = b.i_add(uint_ty, None, i2, const_1).expect("i*2+1");
+
+    let load_f32 = |b: &mut Builder, var: u32, idx: u32| -> u32 {
+        let ac = b.access_chain(float_ptr_uniform_ty, None, var, vec![const_0, idx]).expect("OpAccessChain");
+        b.load(float_ty, None, ac, None, vec![]).expect("OpLoad")
+    };
+
+    let a0 = load_f32(&mut b, var_a, i2);
+    let a1 = load_f32(&mut b, var_a, idx_a1);
+
+    // idx_b0 = 0*2 + j = j, idx_b1 = 1*2 + j
+    let idx_b1 = b.i_add(uint_ty, None, const_2, j).expect("2+j");
+    let b0 = load_f32(&mut b, var_b, j);
+    let b1 = load_f32(&mut b, var_b, idx_b1);
+
+    let t0 = b.f_mul(float_ty, None, a0, b0).expect("a0*b0");
+    let t1 = b.f_mul(float_ty, None, a1, b1).expect("a1*b1");
+    let result = b.f_add(float_ty, None, t0, t1).expect("a0*b0 + a1*b1");
+
+    // idx_c = i*2 + j
+    let idx_c = b.i_add(uint_ty, None, i2, j).expect("i*2+j");
+    let ac_c = b
+        .access_chain(float_ptr_uniform_ty, None, var_c, vec![const_0, idx_c])
+        .expect("OpAccessChain c[idx_c]");
+    b.store(ac_c, result, None, vec![]).expect("OpStore c[idx_c]");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::GLCompute, main_fn, "main", vec![var_gid]);
+    b.execution_mode(main_fn, spirv::ExecutionMode::LocalSize, [2, 2, 1]);
+
+    let module = b.module();
+    module.assemble()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1961,6 +2227,38 @@ mod tests {
     /// `crates/directx-shader-translate/shaders/vector_add.dxbc`と同じ実
     /// fxc.exe出力(lib.rsのテストで使っているのと同一バイト列)。
     const VECTOR_ADD_DXBC: &[u8] = include_bytes!("../shaders/vector_add.dxbc");
+    const GEMM2X2_DXBC: &[u8] = include_bytes!("../shaders/gemm2x2.dxbc");
+
+    #[test]
+    fn translates_real_fxc_compiled_gemm2x2_dxbc_to_valid_spirv() {
+        let kernel = translate_gemm2x2_shader(GEMM2X2_DXBC)
+            .expect("real fxc-compiled gemm2x2.dxbc (fixed 2x2 unrolled GEMM) must translate");
+
+        assert_eq!(kernel.uav_bind_points, (0, 1, 2));
+        assert_eq!(kernel.local_size, (2, 2, 1));
+        assert_eq!(kernel.entry_point, "main");
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203);
+
+        assert_valid_spirv(&kernel.spirv_words);
+    }
+
+    #[test]
+    fn gemm2x2_translator_honestly_rejects_garbage_bytes() {
+        let garbage = [0u8; 16];
+        assert!(translate_gemm2x2_shader(&garbage).is_err(), "non-DXBC bytes must not translate successfully");
+    }
+
+    #[test]
+    fn gemm2x2_translator_honestly_rejects_the_unrelated_vector_add_shader() {
+        // gemm2x2専用デコーダは、たまたまUAV3本を持つだけの別形状
+        // (vector_add: ld_structured x2 -> add -> store_structured、
+        // ループ/算術添字なし)を誤って受理しないことを確認する。
+        let result = translate_gemm2x2_shader(VECTOR_ADD_DXBC);
+        assert!(
+            result.is_err(),
+            "vector_add's opcode sequence does not match gemm2x2's fixed shape, so translation must be honestly rejected"
+        );
+    }
 
     #[test]
     fn translates_real_fxc_compiled_vector_add_dxbc_to_valid_spirv() {

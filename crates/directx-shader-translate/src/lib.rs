@@ -27,7 +27,8 @@ pub use dxil::{
     translate_dxil_vector_add_to_spirv, DxilChainSpirvError, DxilModule, DxilParseError, DxilSpirvError,
 };
 pub use spirv_gen::{
-    translate_shader, translate_vector_add_shader, BinaryOp, SpirvGenError, TranslatedKernel,
+    translate_gemm2x2_shader, translate_shader, translate_vector_add_shader, BinaryOp,
+    Gemm2x2TranslatedKernel, SpirvGenError, TranslatedKernel,
 };
 
 /// `open-cuda`の`opencuda-vulkan::VulkanDevice::launch_kernel`が実際に受理する
