@@ -175,6 +175,43 @@ basée sur des informations produit réelles** (noté explicitement pour
 
 ## HANDOFF (entrées les plus récentes uniquement — voir CLAUDE.md pour le journal complet)
 
+- **2026-08-20 : tranche verticale de compute shader pour un GEMM
+  (2x2 fixe) implémentée et vérifiée sur matériel réel**, première
+  étape vers l'accélération matérielle pour l'inférence LLM. Nouvelle
+  fonction `translate_gemm2x2_shader` dans `directx-shader-translate` :
+  un shader HLSL GEMM 2x2x2 a été réellement compilé avec `fxc.exe`,
+  son DXBC décodé, traduit en SPIR-V, puis exécuté sur du Vulkan réel
+  (NVIDIA GT 730) en réutilisant le contrat de kernel de
+  `opencuda-vulkan`. La sortie GPU correspondait exactement à la
+  référence CPU. Limite honnête : taille fixe 2x2 uniquement — le GEMM
+  général à taille variable (avec boucles), les opérations d'Attention
+  et le branchement vers `aruaru-llm` restent hors périmètre.
+- **2026-08-19 : étude de faisabilité d'un mécanisme de mise à jour
+  automatique (façon self-update GitHub Releases d'`open-english`) —
+  reportée.** Le seul binaire `fn main` du workspace est
+  `directx-graphics-window` (démo Breakout pour inspection visuelle),
+  sans service persistant ni endpoint `/healthz` ; le motif ne
+  s'applique donc pas.
+- **2026-08-19 : examen de l'objection « l'absence de service
+  persistant est un défaut » — conclusion : non.** Le vrai DirectX de
+  Microsoft est distribué sous forme de DLL runtime liées dynamiquement
+  par les applications, pas comme service d'arrière-plan indépendant ;
+  la conception actuelle (bibliothèque + binaire de démo uniquement)
+  correspond à l'architecture de DirectX original.
+- **2026-08-20 : mémo d'idée `open-cg-cad` consigné (non commencé).**
+  Concept d'un futur outil de modélisation 3D avec capture de
+  mouvement, modification de spécifications en langage naturel pilotée
+  par chat IA, et support DirectX/OpenGL/WebGL/WebGPU.
+- **2026-08-20 (suite) : concept « immobilier IA × constructeur IA »
+  consigné**, combinant `open-cg-cad` et `aruaru-llm` pour générer
+  automatiquement des modèles 3D (maisons, immeubles, ponts, tunnels,
+  etc.) à partir de données de terrain ; étendu ensuite aux trains à
+  sustentation magnétique et aux modèles CAO de semi-conducteurs
+  (CPU/GPU/NPU), avec une mise en garde honnête sur la difficulté de
+  couvrir architecture, génie civil, matériel ferroviaire et conception
+  de semi-conducteurs dans un seul système. Simple mémo d'idée, non
+  commencé.
+
 - **2026-08-08 (suite 12) : chargement de texture depuis un véritable
   fichier PNG implémenté, vérifié sur du matériel Windows + Linux
   réel.** Un nouveau module `png_loader.rs` (utilisant la crate `png`,

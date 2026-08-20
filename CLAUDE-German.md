@@ -175,6 +175,42 @@ basierend** (ausdrücklich vermerkt, um nicht zu übertreiben).
 
 ## HANDOFF (nur jüngste Einträge — siehe CLAUDE.md für das vollständige Protokoll)
 
+- **2026-08-20: Compute-Shader-Vertikalschnitt für GEMM (fest 2x2)
+  implementiert und auf echter Hardware verifiziert**, als erster
+  Schritt zur Hardwarebeschleunigung für LLM-Inferenz. Neue Funktion
+  `translate_gemm2x2_shader` in `directx-shader-translate`: ein
+  HLSL-2x2x2-GEMM-Shader wurde real mit `fxc.exe` kompiliert, sein
+  DXBC dekodiert, nach SPIR-V übersetzt und über den Kernel-Vertrag von
+  `opencuda-vulkan` real auf Vulkan (NVIDIA GT 730) ausgeführt. Die
+  GPU-Ausgabe stimmte exakt mit der CPU-Referenzmatrixmultiplikation
+  überein. Ehrliche Einschränkung: nur feste Größe 2x2 — allgemeines
+  GEMM mit variabler Größe (inkl. Schleifen), Attention-Operationen und
+  die Anbindung an `aruaru-llm` bleiben außerhalb des Umfangs.
+- **2026-08-19: Untersucht, ob ein Auto-Update-Mechanismus (wie das
+  GitHub-Releases-Self-Update von `open-english`) sinnvoll wäre —
+  zurückgestellt.** Die einzige `fn main`-Binary im Workspace ist
+  `directx-graphics-window` (eine Breakout-artige Sichtprüfungs-Demo)
+  ohne dauerhaften Dienst oder `/healthz`-Endpunkt, das Muster passt
+  daher nicht.
+- **2026-08-19: Untersucht, ob das Fehlen eines dauerhaften
+  Hintergrunddienstes ein Mangel ist — Ergebnis: nein.** Echtes
+  Microsoft DirectX wird als Laufzeit-DLLs ausgeliefert, die Apps
+  dynamisch verlinken, nicht als eigenständiger Hintergrunddienst; das
+  aktuelle Design (nur Bibliothek + Demo-Binary) entspricht der
+  Architektur des Original-DirectX.
+- **2026-08-20: Ideenskizze `open-cg-cad` festgehalten (nicht
+  begonnen).** Ein zukünftiges 3D-Modellierungstool mit
+  Motion-Capture, KI-Chat-gesteuerten Spezifikationsänderungen in
+  natürlicher Sprache und Unterstützung für DirectX/OpenGL/WebGL/WebGPU.
+- **2026-08-20 (Fortsetzung): Konzept „KI-Immobilien × KI-Baufirma"
+  festgehalten**, das `open-cg-cad` mit `aruaru-llm` kombiniert, um aus
+  Grundstücksdaten automatisch 3D-Modelle zu erzeugen (Häuser, Gebäude,
+  Brücken, Tunnel usw.); später erweitert um Magnetschwebebahnen und
+  CAD-Modelle für Halbleiter (CPU/GPU/NPU), mit dem ehrlichen Hinweis
+  auf die Schwierigkeit, Architektur, Tiefbau, Schienenfahrzeuge und
+  Halbleiterdesign in einem System abzudecken. Nur Ideenskizze, nicht
+  begonnen.
+
 - **2026-08-08 (Fortsetzung 12): Laden echter PNG-Dateitexturen
   implementiert, auf echter Windows- und Linux-Hardware verifiziert.**
   Neues Modul `png_loader.rs` (mit der `png`-Crate, Version 0.17.x)

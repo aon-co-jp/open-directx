@@ -156,6 +156,42 @@ information** (stated explicitly to avoid overclaiming).
 
 ## HANDOFF (most recent entries only — see CLAUDE.md for the full log)
 
+- **2026-08-20: Fixed-size 2x2 GEMM compute-shader vertical slice
+  implemented and verified on real hardware**, as a first step toward
+  hardware acceleration for LLM inference. Added
+  `translate_gemm2x2_shader` to `directx-shader-translate`: a HLSL
+  2x2x2 GEMM shader was compiled for real with `fxc.exe`, its DXBC
+  decoded, translated to SPIR-V, and dispatched on real Vulkan
+  (NVIDIA GT 730) reusing `opencuda-vulkan`'s kernel contract. GPU
+  output matched the CPU-reference matrix product exactly. Honest
+  scope: fixed 2x2 size only — general variable-size GEMM (with
+  loops), Attention ops, and wiring into `aruaru-llm` remain out of
+  scope for this pass.
+- **2026-08-19: Investigated whether an auto-update mechanism (like
+  `open-english`'s GitHub-Releases self-update) could be added —
+  deferred.** The only `fn main` binary in the workspace is
+  `directx-graphics-window` (a visual-inspection Breakout-style demo)
+  with no persistent service or `/healthz` endpoint, so the pattern
+  doesn't apply.
+- **2026-08-19: Investigated the claim that "lacking a persistent
+  background service is a defect" — conclusion: it is not.** Real
+  Microsoft DirectX ships as runtime DLLs that apps dynamically link
+  against, not as an independent background service; the current
+  design (library + demo binary only) matches upstream DirectX's
+  architecture.
+- **2026-08-20: Recorded an `open-cg-cad` idea memo (not started).** A
+  future 3D modeling tool concept with motion capture, AI-chat-driven
+  natural-language spec changes, and DirectX/OpenGL/WebGL/WebGPU
+  support.
+- **2026-08-20 (continued): Recorded an "AI real estate × AI
+  construction" concept** combining `open-cg-cad` with `aruaru-llm` to
+  auto-generate 3D models (houses, buildings, bridges, tunnels, etc.)
+  from land/site data; later updated to also cover maglev trains and
+  CPU/GPU/NPU semiconductor CAD models, with an honest note about the
+  difficulty of covering architecture, civil engineering, rolling
+  stock, and semiconductor design in one system. Idea memo only, not
+  started.
+
 - **2026-08-08 (continued, part 12): Real PNG file texture loading
   implemented, verified on real Windows and Linux hardware.** New
   module `png_loader.rs` (using the `png` crate, version 0.17.x)
