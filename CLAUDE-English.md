@@ -241,3 +241,30 @@ Other languages: [日本語 (原文、完全なHANDOFF履歴)](CLAUDE.md) ·
 [Français](CLAUDE-French.md) · [Русский](CLAUDE-Russian.md) ·
 [Українська](CLAUDE-Ukrainian.md) · [עברית](CLAUDE-Hebrew.md) ·
 [فارسی](CLAUDE-Persian.md) · [العربية](CLAUDE-Arabic.md)
+
+
+---
+
+## HANDOFF 2026-08-23 — CPU SIMD applicability re-checked (conclusion unchanged, no code changes)
+
+Following the extension of
+[`open-cpu`](https://github.com/aon-co-jp/open-cpu) to handle combinations
+of CPU instruction sets, the 2026-08-22 conclusion — "no CPU hot loop, out
+of scope" — was re-examined. **It still holds.**
+
+This repository is a DirectX-compatible cross-platform abstraction layer:
+the actual drawing and computation happen in Vulkan/GPU shaders, while the
+CPU side is API translation and resource management with no large
+element-wise loops. Moving vertex processing onto the CPU would change
+that, but it would also contradict this repository's design direction of
+pushing work onto the GPU.
+
+One item worth noting from the survey done on the `open-cpu` side: **GFNI
+and VPCLMULQDQ have been adopted in Intel ISA-L 2.32**, and GF(2^8) /
+CRC implementations are going through a generational change. Full details
+with source links are recorded in `open-cpu/CLAUDE.md` (2026-08-23
+HANDOFF). This is unrelated to this repository's graphics-abstraction
+domain.
+
+Next step: none. Revisit only if a design change introduces a CPU-side hot
+loop.
