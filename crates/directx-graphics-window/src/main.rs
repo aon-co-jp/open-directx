@@ -615,21 +615,37 @@ unsafe fn create_solid_texture(
     queue_family_index: u32,
     color: Rgba8,
 ) -> Result<(vk::Image, vk::ImageView), String> {
-    let texture = TextureRgba8 { width: 1, height: 1, pixels: vec![color] };
-    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    create_texture_from_rgba(device, memory_properties, queue, queue_family_index, &TextureRgba8 { width: 1, height: 1, pixels: vec![color] })
+}
 
-    let tex_bytes_size = 4u64;
+/// 任意サイズのRGBA8テクスチャを実際にアップロードする(`create_solid_texture`
+/// の1x1専用実装を一般化したもの、`assets/sample_sprite.png`等の実PNG読み込み
+/// テクスチャに使う。2026-08-10、`directx-graphics-vulkan`のPNGローダー
+/// 〈`png_loader::load_png_rgba8`、実機検証済み〉を実ウィンドウ版でも使うための
+/// 一般化)。
+unsafe fn create_texture_from_rgba(
+    device: &ash::Device,
+    memory_properties: &vk::PhysicalDeviceMemoryProperties,
+    queue: vk::Queue,
+    queue_family_index: u32,
+    texture: &TextureRgba8,
+) -> Result<(vk::Image, vk::ImageView), String> {
+    const FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
+    let (width, height) = (texture.width, texture.height);
+
+    let tex_bytes_size = (width as u64) * (height as u64) * 4;
     let (staging_buffer, staging_memory) = create_host_visible_buffer(device, memory_properties, tex_bytes_size, vk::BufferUsageFlags::TRANSFER_SRC)?;
     let ptr = device.map_memory(staging_memory, 0, tex_bytes_size, vk::MemoryMapFlags::empty()).map_err(|e| e.to_string())?;
-    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, 4);
-    let p = texture.pixels[0];
-    dst.copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    let dst = std::slice::from_raw_parts_mut(ptr as *mut u8, tex_bytes_size as usize);
+    for (i, p) in texture.pixels.iter().enumerate() {
+        dst[i * 4..i * 4 + 4].copy_from_slice(&[p.r, p.g, p.b, p.a]);
+    }
     device.unmap_memory(staging_memory);
 
     let image_info = vk::ImageCreateInfo::builder()
         .image_type(vk::ImageType::TYPE_2D)
         .format(FORMAT)
-        .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+        .extent(vk::Extent3D { width, height, depth: 1 })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
