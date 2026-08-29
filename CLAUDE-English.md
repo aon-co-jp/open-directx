@@ -7,7 +7,11 @@
 > REST API / API-key mentions anywhere in its `CLAUDE.md`** — it is a
 > GPU compute library with no HTTP server surface, so this SET policy
 > does not apply here. See aruaru-db/CLAUDE.md's 2026-08-29 HANDOFF for
-> the investigation.
+> the investigation. **This "not applicable" finding reflects the
+> current state only, not a permanent exemption** — if open-directx's
+> own DirectX-compatibility implementation matures and deepens its
+> ties to open-cuda, aruaru-llm, aruaru-db, open-web-server, and
+> RPoem, this scoping should be re-evaluated at that point.
 
 > **Note**: This is a condensed translation of the current state. The
 > full historical HANDOFF log (dozens of entries since 2026-07-25)
