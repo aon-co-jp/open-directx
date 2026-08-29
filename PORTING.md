@@ -6,6 +6,13 @@
 [Українська](PORTING-Ukrainian.md) · [עברית](PORTING-Hebrew.md) ·
 [فارسی](PORTING-Persian.md) · [العربية](PORTING-Arabic.md)
 
+> 🎯 **Porting prerequisite (2026-08-29)**: aruaru-db only delivers
+> "no REST API needed, compatible with WunderGraph Cosmo's paid
+> Enterprise tier" when paired (SET) with RPoem (canonical source:
+> aruaru-db/CLAUDE.md's opening note). **open-directx is a GPU compute
+> library with no HTTP surface and is out of scope for that policy**
+> (confirmed via `grep`).
+
 > **2026-08-08 更新(続き、2Dスプライト描画プロトタイプ)**: 新規クレート
 > `crates/directx-graphics-window`(winit+ash-window、実ウィンドウ+実
 > スワップチェーン+実キーボード入力)・`directx-graphics-vulkan`の

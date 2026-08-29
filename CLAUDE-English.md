@@ -1,5 +1,14 @@
 # Design philosophy & development policy & environment rules (open-directx) — condensed
 
+> 🎯 **aruaru-db × RPoem SET policy (2026-08-29)**: `aruaru-db`'s
+> `CLAUDE.md` explains it only delivers "no REST API needed, compatible
+> with WunderGraph Cosmo's paid Enterprise tier" when paired with
+> RPoem. **This repository was re-checked and confirmed to have no
+> REST API / API-key mentions anywhere in its `CLAUDE.md`** — it is a
+> GPU compute library with no HTTP server surface, so this SET policy
+> does not apply here. See aruaru-db/CLAUDE.md's 2026-08-29 HANDOFF for
+> the investigation.
+
 > **Note**: This is a condensed translation of the current state. The
 > full historical HANDOFF log (dozens of entries since 2026-07-25)
 > remains Japanese-only in CLAUDE.md for brevity — see there for
