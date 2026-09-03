@@ -2782,3 +2782,100 @@ quality/deps/license, (2) shrink `directx-shader-translate` to a thin
 wrapper over the chosen frontend, (3) restrict `directx-graphics-vulkan`
 to the no-Vulkan fallback. Source of truth:
 `open-cuda/OmniGPU-Design.md` §11.6 / §12.3. Still no code.
+
+## HANDOFF追記(2026-09-03続き) 32GB VRAM級3ベンダー前提+F16/F32/F64/F128
+指示への本リポジトリ分の対応——DXILのHalf(F16)型デコードを追加、
+F128はHLSL/DXILに型自体が存在しないため対象外と正直に開示
+
+ユーザー指示「open-directx・open-cuda・aruaru-llmは今後、NVIDIA(RTX)・
+AMD・Intel3ベンダー横断で32GB VRAM級GPUを前提に、F16/F32/F64を意識して
+開発せよ」(後続で「F128まで対応」も追加)。**open-cuda側は並行する別
+エージェントが`opencuda-core`/`opencuda-blas`へF16/F32/F64/F128の精度型・
+GEMM実装を追加する担当のため、本リポジトリでは触れていない**——本
+リポジトリの担当範囲(DXBC/DXIL→SPIR-Vシェーダ翻訳・グラフィックスAPI
+互換層、コンピュートカーネル本体は対象外)での意味だけを切り出した。
+
+### 調査結果: このリポジトリの実装層に「precision」を扱う既存コードは
+`crates/directx-shader-translate/src/dxil.rs`の`DxilType`(LLVM
+TYPE_BLOCKのデコード)のみ
+
+`grep -n -i "f16|f32|f64|half|double|min16float|precision"`で
+`directx-shader-translate`配下を検索した結果、`DxilType::{Float,Double}`
+(LLVM `TYPE_CODE_FLOAT`=3/`TYPE_CODE_DOUBLE`=4)のデコードのみが実在し、
+**`half`(LLVM `TYPE_CODE_HALF`=10、HLSLの`half`/`min16float`がSM6.2+の
+native 16-bit types機能でDXILへコンパイルされた際に現れる型コード)は
+デコード対象に含まれておらず、遭遇すると`DxilType::Other{code:10}`へ
+落ちて意味を解釈しないまま通過する**、という具体的なギャップが実際に
+見つかった。これは「32GB VRAM級の大容量メモリを活かしてF16(半精度)
+シェーダ・テクスチャで帯域を節約する」というユーザー指示の意図に、
+このリポジトリのスコープ(シェーダ翻訳層)で唯一直接対応する実装可能な
+箇所だった。
+
+### 実装した内容(narrow but real、正直な範囲)
+
+- `crates/directx-shader-translate/src/dxil.rs`の`DxilType`列挙体へ
+  `Half`バリアントを追加、`decode_type_record`のcode=10分岐で
+  `DxilType::Half`を返すようにした(LLVM公式`BitCodeFormat.html`の
+  type codes表に基づく、既存の`Float`/`Double`と同じ実装パターン)。
+- 単体テスト`decode_type_record_recognizes_llvm_half_type_code`を追加
+  (code=10がHalf、既存の3/4がFloat/Doubleのままであることを確認)。
+  **正直な開示**: 実際にhalf精度シェーダーを`dxc.exe -enable-16bit-types`
+  でコンパイルした実バイト列は今回取得していない(このマシンのdxc.exe
+  バージョンでの16-bit types有効化手順の確認から必要になり、このパスの
+  スコープを超えると判断)——型コード単体のデコードロジックの検証に
+  留めた。TYPE_BLOCKで型として認識できるようになっただけで、
+  `emit_spirv_impl`等のSPIR-V生成側(`OpTypeFloat 32`固定)はF16出力に
+  未対応のまま、`resolve_dxil_calls_and_chain`等の呼び出し解決ロジックも
+  Half型を前提にした分岐は持たない——**「halfシェーダーが翻訳できる
+  ようになった」という意味ではなく、「TYPE_BLOCKレベルでhalf型を
+  読み違えて誤った意味を割り当てなくなった」という型システムの正確性
+  向上に留まる**、と正直に区切る。
+- `cargo build --workspace --release`/`cargo clippy --workspace
+  --all-targets --release -- -D warnings`いずれも警告0件。
+  `cargo test -p directx-shader-translate --release --lib`は既存56件+
+  新規1件の計57件全green(既存経路への回帰なし、実機Vulkanテストは
+  今回変更していないため未再実行)。
+
+### F128(quad precision)についての正直な開示: HLSL/DXILには型自体が
+存在しないため、シェーダ翻訳層としては対象外
+
+調査の結果、**HLSLの数値型はint8/int16/half(min16float)/float/double
+の範囲に限られ、quad precision(128bit浮動小数点)に相当する型は
+HLSL言語仕様・DXILシェーダモデル(SM6.9まで含む現行仕様)のいずれにも
+存在しない**([Microsoft HLSL言語仕様](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/dx-graphics-hlsl-data-types)
+記載の組み込みスカラー型一覧に基づく)。LLVM bitcode自体は
+`TYPE_CODE_FP128`(code=14)という型コードを一般には持つが、dxc.exeが
+これを実際に出力することはない(HLSL側にそもそも対応する構文が無い
+ため)。したがって「DXBC/DXILシェーダ翻訳層でF128対応する」という
+タスクは、**存在しないHLSL/DXIL構文への対応を作ることになり誠実でない
+——本リポジトリでは意図的に対象外とし、コードは追加していない**
+(code=14を`DxilType::Fp128`のように追加しても、実際にdxcが生成しない
+以上テストで検証しようがなく、「対応しているふり」になるため見送った)。
+
+F16/F32/F64/F128の実際の精度型・GEMM実装(32GB VRAM級テンソルの
+多精度演算)は、**`open-cuda/OmniGPU-Design.md`(正本)を参照する
+`opencuda-core`/`opencuda-blas`側が正しい実装場所**(並行エージェントが
+対応中、本リポジトリでは重複実装しない)。
+
+### 32GB VRAM級・3ベンダー(NVIDIA/AMD/Intel)前提について
+
+このリポジトリのコード自体には元々`cfg(windows)`等のプラットフォーム
+限定gateも、VRAM容量やベンダーIDに応じた分岐ロジックも存在しない
+(2026-07-27付README対応表エントリで確認済み、ベンダーID
+NVIDIA `0x10DE`・AMD `0x1002`/`0x1022`・Intel `0x8086`は
+`directx-graphics-vulkan::vendor_name_from_id`で診断のみ)。
+シェーダ翻訳・SPIR-V生成自体はVRAM容量に依存しないため、「32GB VRAM級を
+前提に」という指示はこのリポジトリでは**テクスチャ/バッファサイズの
+上限設計判断が将来必要になった場合の設計指針**として記録するに留める
+(現状、固定サイズの小規模テストシェーダーのみを扱っており、実際に
+VRAM容量が問題になる規模のワークロードは無い)。3ベンダー実機検証
+(AMD/Intel実GPU)は前回・前々回エントリから変わらず未実施
+(このマシンはNVIDIA GeForce GT 730のみ)。
+
+- 次にすべきこと: (1) 実際に`dxc.exe -enable-16bit-types`でhalf精度
+  シェーダーをコンパイルし、TYPE_BLOCK/命令列レベルでHalf型が実際に
+  どう現れるかを実バイト列で確認した上で`emit_spirv_impl`等のSPIR-V
+  生成側もF16(`OpTypeFloat 16`)出力に対応させる(今回はTYPE_BLOCK
+  デコードのみ、実バイト列未取得)、(2) AMD/Intel実機でのベンダー
+  診断・実描画検証(前回エントリから継続)、(3) 大容量VRAMを前提とした
+  テクスチャ/バッファサイズ上限の設計判断(具体的な必要性が生じてから)。

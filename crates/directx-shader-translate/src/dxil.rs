@@ -154,6 +154,14 @@ pub enum DxilType {
     Void,
     Float,
     Double,
+    /// `half`(LLVM `TYPE_CODE_HALF`=10)。HLSLの`half`/`min16float`型
+    /// (Shader Model 6.2以降、`-enable-16bit-types`でDXILへ native 16-bit
+    /// float型として現れる)に対応する。2026-09-03、ユーザー指示
+    /// 「F16/F32/F64/F128を見据えた開発」への対応でTYPE_BLOCKデコードへ
+    /// 追加(このシェーダ翻訳層で実際に対応できるHLSL/DXIL側の唯一の
+    /// 追加precision——F128はHLSL/DXILに型自体が存在しないため対象外、
+    /// 詳細はCLAUDE.mdのHANDOFF参照)。
+    Half,
     Integer { bits: u64 },
     /// ポインタ型。`pointee`は型テーブル中のインデックス。
     Pointer { pointee: usize, address_space: u64 },
@@ -207,6 +215,7 @@ fn decode_type_record(code: u64, fields: &[u64], pending_struct_name: &mut Optio
         2 => DxilType::Void,
         3 => DxilType::Float,
         4 => DxilType::Double,
+        10 => DxilType::Half,
         7 => DxilType::Integer { bits: fields.first().copied().unwrap_or(0) },
         8 => DxilType::Pointer {
             pointee: fields.first().copied().unwrap_or(0) as usize,
@@ -2243,6 +2252,24 @@ mod tests {
         let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_MUL_CHAIN_DXIL)
             .expect("vector_add_mul_chain.dxil (no bounds check) must still translate to SPIR-V");
         assert!(!kernel.bounds_check, "vector_add_mul_chain.dxilには境界チェックが無い");
+    }
+
+    /// `decode_type_record`がLLVM `TYPE_CODE_HALF`(code=10、
+    /// `llvm.org/docs/BitCodeFormat.html`のtype codes表準拠)を
+    /// `DxilType::Half`として正しく認識することを確認する。HLSLの
+    /// `half`/`min16float`(SM6.2+ native 16-bit types)がコンパイルされると
+    /// この型コードがTYPE_BLOCKに現れる——2026-09-03、F16/F32/F64志向の
+    /// ユーザー指示に対応してデコード対象へ追加した際の回帰防止テスト
+    /// (実際にhalf精度シェーダーをdxc.exeでコンパイルした実バイト列は
+    /// 未取得のため、型コード単体のデコードロジックを直接検証する形に
+    /// 留める——正直な開示、CLAUDE.md該当HANDOFF参照)。
+    #[test]
+    fn decode_type_record_recognizes_llvm_half_type_code() {
+        let mut pending_struct_name = None;
+        assert_eq!(decode_type_record(10, &[], &mut pending_struct_name), DxilType::Half);
+        // 既存のFloat(3)/Double(4)コードには影響していないことも併せて確認。
+        assert_eq!(decode_type_record(3, &[], &mut pending_struct_name), DxilType::Float);
+        assert_eq!(decode_type_record(4, &[], &mut pending_struct_name), DxilType::Double);
     }
 
     #[test]
