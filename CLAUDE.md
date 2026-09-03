@@ -2724,3 +2724,24 @@ NDA対象であり、非公式なリバースエンジニアリングは各種�
 
 現時点では技術検討・実装のいずれも行っていない。続きの指示・詳細確認を
 待って対応する。
+
+## HANDOFF追記(2026-09-03) 役割再定義: 並行 GPU バックエンド → DXBC/DXIL→SPIR-V フロントエンド(正本: open-cuda/OmniGPU-Design.md §11・§12)
+
+エコシステム横断の GPU 移植性設計見直し(ユーザー指示、5 リポジトリ対象)。
+一次資料 **vkd3d-proton / DXVK 3.0**([DXIL to SPIR-V](https://deepwiki.com/HansKristian-Work/vkd3d-proton/4.2-dxil-to-spir-v)、
+[Phoronix](https://www.phoronix.com/news/DXVK-3.0-Release)): DXVK と
+vkd3d-proton は共通の DXBC フロントエンドを持ち、DXBC(SM4/5)も DXIL(SM6)も
+外部ライブラリ `dxil-spirv` 経由で **SPIR-V** へ変換する。DXVK 3.0 の
+`DXBC-SPIRV` は SSA ベースコンパイラでコンパクトな SPIR-V を吐く。
+
+### open-directx への波及方針(§12.3)
+- **「DirectX 互換の並行 GPU バックエンド」から「DXBC/DXIL → SPIR-V
+  フロントエンド」へ役割を再定義**。DirectX 由来のシェーダ・OS レベルの
+  グラフィックス命令を SPIR-V へ翻訳し、**open-cuda の単一 Vulkan 経路へ
+  流す**のが本筋(vkd3d-proton/DXVK が実証済み)。
+- `dxil-spirv` の設計(共通 DXBC フロントエンド + SSA IR、翻訳のワーカー
+  スレッドオフロード)を参照実装として、翻訳品質・コンパクトさを目標に。
+- 独立リポジトリ `open-directx` と open-cuda 内蔵の `opencuda-directx`
+  クレートは別物(混同注意、open-cuda §8.5 / aruaru-llm 2026-08-20 参照)。
+
+今回はコード未着手。役割再定義の明記 + ロードマップ着手が次の作業。
