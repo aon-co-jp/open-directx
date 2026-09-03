@@ -2745,3 +2745,40 @@ vkd3d-proton は共通の DXBC フロントエンドを持ち、DXBC(SM4/5)も D
   クレートは別物(混同注意、open-cuda §8.5 / aruaru-llm 2026-08-20 参照)。
 
 今回はコード未着手。役割再定義の明記 + ロードマップ着手が次の作業。
+
+### 2026-09-03(続き)世界中の言語で再調査 → 役割再定義の実現性が確定
+
+ユーザー指示「世界中の言語で Google/GitHub 再調査してから記録」。EN/JA/ZH +
+GitHub 中心で再検索した結果、上記の役割再定義方針は**強化される方向**:
+- **`dxil-spirv`([HansKristian-Work/dxil-spirv](https://github.com/HansKristian-Work/dxil-spirv))
+  は 2026-02 に production SM 6.9 到達**
+  ([DXC Vulkan interop 2026](https://www.huuphan.com/2026/03/directx-shader-compiler-7-massive.html))。
+  DXBC(SM4/5)も `dxbc-spirv` 経由で扱える。→ 「DXBC/DXIL → SPIR-V
+  フロントエンド」は最新の SM まで含めて実証済みの道。
+- **`naga`**(wgpu の翻訳器)も HLSL/DXIL を SPIR-V/MSL 等へ相互変換でき
+  (golden parity HLSL 72/72)、翻訳器の選択肢は `dxil-spirv` と `naga` の
+  2 系統。open-directx は**新規実行系を持たず**、どちらかを DXBC/DXIL
+  フロントエンドとして採用し出力 SPIR-V を open-cuda の Vulkan 経路へ渡す。
+- **ロードマップ(次の作業)**:
+  1. `dxil-spirv` と `naga` の DXBC/DXIL→SPIR-V 変換品質・依存の重さ・
+     ライセンスを比較する調査 PR。
+  2. 既存の `directx-shader-translate` クレートを、上記いずれかの
+     フロントエンドを薄くラップする形へ縮退させる設計。
+  3. `directx-graphics-vulkan` は「Vulkan が無い Windows 向けの純
+     フォールバック」に用途を限定(常時は Vulkan 経路)。
+
+正本は `open-cuda/OmniGPU-Design.md` §11.6・§12.3。コードは引き続き未着手。
+
+**English**: World-language (EN/JA/ZH) + GitHub re-research confirms the
+role redefinition. `dxil-spirv` reached **production SM 6.9 (2026-02)**;
+DXBC (SM4/5) is handled via `dxbc-spirv`. `naga` also converts HLSL/DXIL
+↔ SPIR-V (golden parity HLSL 72/72), so the DXBC/DXIL→SPIR-V frontend
+can use either `dxil-spirv` or `naga`. open-directx keeps **no execution
+runtime of its own** — it wraps one of those frontends and feeds the
+resulting SPIR-V into open-cuda's single Vulkan path;
+`directx-graphics-vulkan` is limited to a pure fallback for Windows
+without Vulkan. Roadmap: (1) compare `dxil-spirv` vs `naga` translation
+quality/deps/license, (2) shrink `directx-shader-translate` to a thin
+wrapper over the chosen frontend, (3) restrict `directx-graphics-vulkan`
+to the no-Vulkan fallback. Source of truth:
+`open-cuda/OmniGPU-Design.md` §11.6 / §12.3. Still no code.
