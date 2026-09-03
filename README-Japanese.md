@@ -1,5 +1,20 @@
 # open-directx
 
+> 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
+> aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
+> F16/F32/F64、さらにF128まで見据えて開発する」への対応として、
+> DXIL(LLVMビットコード型システム)デコーダが`half`/`min16float`
+> (HLSL SM6.2+のネイティブ16bit型)に対応する`TYPE_CODE_HALF`
+> (LLVMコード10)を未知の型として取りこぼしていた実バグを発見・修正
+> (`crates/directx-shader-translate/src/dxil.rs`)。**正直な開示**:
+> F128(四倍精度)はHLSL/DXILに対応する構文自体が存在しないため
+> (HLSLの数値型は`min16float`/`half`/`float`/`double`まで)、本
+> リポジトリのシェーダー変換層では対象外と判断した——実際の
+> 多精度計算カーネル実装は`open-cuda/OmniGPU-Design.md`§13を参照。
+> このリポジトリには32GB VRAM/GPUベンダー判定に関わるコードパス
+> 自体が存在しない(診断用のベンダー名参照のみ)。詳細は
+> [CLAUDE.md](CLAUDE.md)参照。
+>
 > 📌 **最近の更新(2026-08-08、2Dスプライト描画プロトタイプ)**:
 > ユーザー提案「dream-os/Linux上でopen-directx経由でGT730のPCでGAME…の
 > 試作品を開発」を受け、まず2Dスプライト描画に絞って着手。テクスチャ

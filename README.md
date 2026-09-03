@@ -6,6 +6,31 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
+> aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
+> F16/F32/F64、さらにF128まで見据えて開発する」への対応として、
+> DXIL(LLVMビットコード型システム)デコーダが`half`/`min16float`
+> (HLSL SM6.2+のネイティブ16bit型)に対応する`TYPE_CODE_HALF`
+> (LLVMコード10)を未知の型として取りこぼしていた実バグを発見・修正。
+> **正直な開示**: F128(四倍精度)はHLSL/DXILに対応する構文自体が
+> 存在しないため(HLSLの数値型は`min16float`/`half`/`float`/`double`
+> まで)対象外と判断した——実際の多精度計算カーネルは
+> `open-cuda/OmniGPU-Design.md`§13参照。このリポジトリには32GB VRAM/
+> GPUベンダー判定に関わるコードパス自体が無い(診断用のベンダー名
+> 参照のみ)。詳細は[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Per user instruction to target 32GB-VRAM-class NVIDIA/AMD/
+> Intel GPUs and support F16/F32/F64/F128 going forward, fixed a real
+> bug where the DXIL (LLVM bitcode) type decoder failed to recognize
+> `TYPE_CODE_HALF` (LLVM code 10) — the type HLSL's `half`/`min16float`
+> (SM6.2+ native 16-bit types) compiles to — silently falling through to
+> an unknown-type bucket. **Honest scoping**: F128 has no HLSL/DXIL
+> construct at all (HLSL's numeric types stop at `double`), so it's out
+> of scope here — see `open-cuda/OmniGPU-Design.md` §13 for the actual
+> multi-precision compute work. This repo has no VRAM-size or vendor-ID
+> branching to begin with (only diagnostic vendor-name lookups). See
+> [CLAUDE.md](CLAUDE.md) for details.
+>
 > 📌 **最近の更新(2026-08-08、2Dスプライト描画プロトタイプ)**:
 > ユーザー提案「dream-os/Linux上でopen-directx経由でGT730のPCでGAME…の
 > 試作品を開発」を受け、まず2Dスプライト描画に絞って着手。テクスチャ
