@@ -963,6 +963,12 @@ pub struct ChainTranslatedKernel {
     /// `dcl_constantbuffer`(b0)+`ult`+`if`/`endif`による境界チェックが実際に
     /// このシェーダーに存在したかどうか(2026-08-06追加)。
     pub bounds_check: bool,
+    /// half精度(HLSL`half`、DXILの`dx.op.rawBufferLoad.f16`/
+    /// `dx.op.rawBufferStore.f16`)バッファだったかどうか(2026-09-05追加)。
+    /// DXBC側(`translate_chain_shader`)は`half`をこのパターンクラスの
+    /// 対象にしていないため常に`false`。DXIL側(`translate_dxil_chain_to_spirv`)
+    /// のみ`resolve_dxil_calls_and_chain`の実測値が入る。
+    pub is_half: bool,
 }
 
 /// DXBCバイト列を解析し、「N個の逐次2項演算(制御フロー無し)」パターンクラス
@@ -995,6 +1001,7 @@ pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, Spi
         read_uav_bind_points,
         write_uav_bind_point: shape.write_uav,
         bounds_check: shape.bounds_check,
+        is_half: false,
     })
 }
 
@@ -1003,7 +1010,7 @@ pub fn translate_chain_shader(bytes: &[u8]) -> Result<ChainTranslatedKernel, Spi
 /// `translate_dxil_chain_to_spirv`とも共有する、DXBC固有の`ChainShape`型に
 /// 依存しない部分を切り出したもの)。
 fn emit_chain_spirv(shape: &ChainShape) -> Vec<u32> {
-    emit_chain_spirv_for_kernel(shape.thread_group, &shape.root, shape.write_uav, shape.bounds_check)
+    emit_chain_spirv_for_kernel(shape.thread_group, &shape.root, shape.write_uav, shape.bounds_check, false)
 }
 
 /// [`emit_chain_spirv`]の本体。DXBC固有の[`ChainShape`]型に依存しない
@@ -1021,20 +1028,31 @@ pub(crate) fn emit_chain_spirv_for_kernel(
     root: &RegExpr,
     write_uav: u32,
     bounds_check: bool,
+    is_half: bool,
 ) -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);
+    if is_half {
+        // 2026-09-05新規: half精度(HLSL`half`)バッファ対応。`OpTypeFloat 16`
+        // 自体には`Float16`ケイパビリティ、`BufferBlock`装飾のUniformストレージ
+        // クラスで16bit型を使うには`StorageBuffer16BitAccess`ケイパビリティ+
+        // 拡張`SPV_KHR_16bit_storage`が必要(SPIR-V 1.0のため拡張の明示宣言が
+        // 要る、SPIR-V 1.3以降ならこの拡張は組み込み)。
+        b.extension("SPV_KHR_16bit_storage");
+        b.capability(spirv::Capability::Float16);
+        b.capability(spirv::Capability::StorageBuffer16BitAccess);
+    }
     b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
 
     let void_ty = b.type_void();
     let voidf_ty = b.type_function(void_ty, vec![]);
-    let float_ty = b.type_float(32, None);
+    let (float_ty, float_stride) = if is_half { (b.type_float(16, None), 2u32) } else { (b.type_float(32, None), 4u32) };
     let uint_ty = b.type_int(32, 0);
     let uvec3_ty = b.type_vector(uint_ty, 3);
 
     let rt_array_ty = b.type_runtime_array(float_ty);
-    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(4)]);
+    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(float_stride)]);
     let buf_struct_ty = b.type_struct(vec![rt_array_ty]);
     b.decorate(buf_struct_ty, spirv::Decoration::BufferBlock, vec![]);
     b.member_decorate(buf_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);

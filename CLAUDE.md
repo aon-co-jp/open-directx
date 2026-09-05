@@ -2879,3 +2879,172 @@ VRAM容量が問題になる規模のワークロードは無い)。3ベンダ�
   デコードのみ、実バイト列未取得)、(2) AMD/Intel実機でのベンダー
   診断・実描画検証(前回エントリから継続)、(3) 大容量VRAMを前提とした
   テクスチャ/バッファサイズ上限の設計判断(具体的な必要性が生じてから)。
+
+## HANDOFF追記(2026-09-05) 直前エントリ「次にすべきこと(1)」に対応:
+half精度DXILの実バイト列取得 + SPIR-V側のF16(`OpTypeFloat 16`)出力対応 +
+実Vulkan実機(GT 730)でのGPUディスパッチ検証まで完了
+
+直前エントリで未着手のまま残していた「実際に`dxc.exe -enable-16bit-types`で
+half精度シェーダーをコンパイルし、実バイト列でHalf型の現れ方を確認した上で
+SPIR-V生成側もF16出力に対応させる」に着手し、実機検証まで到達した。
+
+### 1. dxc.exeの所在確認・実コンパイル
+
+`tools/compile-dxbc-shaders.ps1`の`DXC_BIN`/`VULKAN_SDK`探索ロジックと
+同じ手順で、このマシンの`dxc.exe`が`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`
+(dxcompiler 1.10、DXC 1.9.0.5347)にあることを確認。新規
+`crates/directx-shader-translate/shaders/vector_add_half_dxil.hlsl`
+(既存`vector_add_dxil.hlsl`と同一契約、要素型のみ`float`→`half`)を
+`dxc.exe -enable-16bit-types -T cs_6_2 -E main`で実際にコンパイルし
+`vector_add_half.dxil`を得た(SM6.2が16-bit types有効化の最低要件、
+実際にexit code 0で成功)。
+
+### 2. `examples/dump_dxil`で実バイト列を確認(推測ではない)
+
+同一のdxc.exeで既存`vector_add.dxil`(f32版)もダンプし直し、以下を
+実際に比較確認した:
+- **f32版はVALUE_SYMTABに`dx.op.bufferLoad.f32`/`dx.op.bufferStore.f32`**
+  (引数4個/9個、opcode 68/69)。
+- **half版は別のDXIL命令`dx.op.rawBufferLoad.f16`/
+  `dx.op.rawBufferStore.f16`が使われる**(引数6個/10個、opcode
+  **139**/**140**)——単純な「.f32→.f16」というサフィックス置換ではなく、
+  RawBufferLoad/Store系という別の命令ファミリに切り替わることが実バイト列
+  で判明した。引数形状は`[opcode, handle, index, elementOffset, mask,
+  alignment]`(Load、6個)/`[opcode, handle, index, elementOffset, value0..3,
+  mask, alignment]`(Store、10個、value0のみ実際の格納値でvalue1〜3は
+  未使用チャンネル用undef)——Microsoft DXIL仕様のRawBufferLoad/Storeの
+  引数形状と一致することを確認。
+- TYPE_BLOCKでは`type[6] = Half`(既存2026-09-03エントリのデコード済み
+  `DxilType::Half`が実際に出現)、`type[19] = StructNamed { name:
+  "class.RWStructuredBuffer<half>" }`も確認。
+
+### 3. `resolve_dxil_calls_and_chain`をrawBufferLoad/Store.f16対応へ拡張
+
+`crates/directx-shader-translate/src/dxil.rs`: 上記で確認した実引数形状・
+opcode(139/140)をそのまま検証条件として`"dx.op.rawBufferLoad.f16"`/
+`"dx.op.rawBufferStore.f16"`のmatch armを追加(elementOffsetが実測で
+常に定数0だったこと、value0がBinOp結果であることも明示的に検証、
+それ以外の形は正直にエラー)。呼び出し1回ごとに`saw_f16_ops`フラグを
+立て、戻り値タプルへ`is_half: bool`を追加(3-tuple→4-tuple、
+既存呼び出し元10箇所を`_is_half`で更新、破壊的変更だが影響範囲は
+このクレート内に閉じる)。
+
+### 4. SPIR-V生成側をF16対応へ拡張
+
+`crates/directx-shader-translate/src/spirv_gen.rs::emit_chain_spirv_for_kernel`
+に`is_half: bool`引数を追加。`is_half`が真の場合のみ:
+- `OpTypeFloat 16`(既存は32固定)。
+- `ArrayStride`を2バイトへ(既存は4バイト固定)。
+- `OpCapability Float16`+`OpCapability StorageBuffer16BitAccess`+
+  `OpExtension "SPV_KHR_16bit_storage"`を追加(SPIR-V 1.0のため
+  Uniform/BufferBlockストレージクラスでの16bit型使用に拡張宣言が必要、
+  1.3以降なら組み込みだがこのプロジェクトは既存のまま`set_version(1,0)`)。
+add/mul/sub/div自体(`f_add`/`f_mul`等)はrspirv側が型幅非依存のため無改修。
+DXBC側呼び出し元(`emit_chain_spirv`)は`is_half=false`固定で後方互換維持。
+`ChainTranslatedKernel`に`is_half: bool`フィールドを追加
+(DXBC経路は常に`false`、DXIL経路は`resolve_dxil_calls_and_chain`の実測値)。
+
+### 5. 実Vulkan実機(NVIDIA GT 730、Kepler世代)でのGPUディスパッチ検証
+
+新規`tests/vector_add_half_dxil_real_vulkan.rs`。**正直な開示・途中で
+実際に踏んだブロッカー**: `opencuda-vulkan::real::VulkanDevice::
+ensure_vector_add_args`(`open-cuda`側、本タスクでは変更しない方針)が
+カーネル名`"vector_add"`の全ケースでバッファサイズを`n * size_of::<f32>()`
+(4バイト/要素)固定で検証するため、half(2バイト/要素)の実データバッファを
+そのまま渡すと`"vector_add buffer too small: need 1024 bytes"`で実際に
+失敗した。`open-cuda`側は変更禁止のため、**テスト側で確保サイズを
+`n*4`バイトへ合わせ、実データはその先頭`n*2`バイトのみへ書き込む/
+読み出す**という、このクレート側だけで完結する回避策を取った(シェーダ
+自体は`ArrayStride=2`のhalfバッファとしてのみアクセスするため計算結果に
+影響しない)。
+
+**実行結果(実際に実行、`--nocapture`)**:
+```
+device: OpenCUDA Vulkan Device (NVIDIA GeForce GT 730)
+OK: half精度DXIL(dxc.exe実コンパイル、SM6.2 -enable-16bit-types)->SPIR-V
+(OpTypeFloat 16、自前生成)->実Vulkan(OpenCUDA Vulkan Device (NVIDIA
+GeForce GT 730))経路が、CPU参照実装(f16の a[i]+b[i])と256要素すべてで
+数値一致した
+c[0]=128, c[255]=255.5
+```
+**GT 730(Kepler、Compute Capability 3.5、FP16 Tensor Core非搭載)でも、
+Vulkanドライバレベルでは`Float16`/`StorageBuffer16BitAccess`ケイパビリティ+
+`SPV_KHR_16bit_storage`拡張が実際にサポートされており、`OpTypeFloat 16`
+ベースのSPIR-Vが正しくディスパッチ・実行できることを実機で確認した**
+(Tensor Core非搭載=F16の高速なネイティブ演算〈2要素同時処理等〉が無い
+ことと、F16という「型」自体をシェーダーが読み書きできることは別軸——
+今回確認したのは後者のみで、速度面の優位性は主張しない)。
+
+### 検証結果
+
+- `cargo build --workspace --release`: 警告0件・成功。
+- `cargo test -p directx-shader-translate --release --lib`: **59件全green**
+  (既存57件+新規2件: `resolves_real_dxc_compiled_half_precision_dxil_
+  and_detects_f16`・`translate_dxil_chain_to_spirv_handles_half_
+  precision_and_emits_f16_type`)。
+- `cargo test -p directx-shader-translate --release`(実機テスト含む
+  全テストバイナリ): **既存の全実Vulkan/実D3D12テストに回帰なし**、
+  新規`vector_add_half_dxil_real_vulkan`も実機で`ok`。
+- `cargo clippy --workspace --all-targets --release -- -D warnings`:
+  警告0件。
+
+### 正直な残課題
+
+- 速度計測は行っていない(「正しく動く」ことのみ実証、F16がF32より
+  速いという主張はしない——GT 730にFP16 Tensor Coreは無いため、
+  仮に計測しても優位性は出ない可能性が高い)。
+- `resolve_dxil_calls_and_chain`のrawBufferLoad/Store.f16対応は、今回
+  実際に確認した「加算1回・境界チェック無し・1コンポーネント(x)」の形
+  のみを検証条件としている——2コンポーネント以上(`half2`/`half4`)の
+  mask値・チェーン(2回以上の演算)・境界チェック付きhalfシェーダーは
+  未検証(既存のf32チェーン検出パターンを踏襲すれば拡張できる見込みだが
+  今回はスコープ外)。
+- `open-cuda`側の`ensure_vector_add_args`が要素サイズをf32固定で検証する
+  制約自体は残ったまま(本タスクの指示により`open-cuda`は変更していない、
+  テスト側での回避策で実機検証は達成したが、恒久的には`open-cuda`側で
+  カーネル契約にサイズ情報を持たせる設計変更が必要)。
+
+**English summary**: Followed up on the previous entry's open item —
+actually compiled a half-precision compute shader
+(`shaders/vector_add_half_dxil.hlsl`) with the real `dxc.exe` on this
+machine (`C:\VulkanSDK\1.4.350.0\Bin\dxc.exe`, `-enable-16bit-types -T
+cs_6_2`), and inspected the real byte stream via `examples/dump_dxil`.
+Found that half-precision buffers use a genuinely different DXIL
+intrinsic family — `dx.op.rawBufferLoad.f16`/`dx.op.rawBufferStore.f16`
+(opcodes 139/140, 6/10 args) — not just an "f32→f16" suffix swap on the
+existing `dx.op.bufferLoad.f32`/`bufferStore.f32` (4/9 args, opcodes
+68/69). Extended `resolve_dxil_calls_and_chain` in `dxil.rs` to
+recognize these exact argument shapes (verified from the real dump, not
+guessed) and added an `is_half` flag to its return tuple (updated at all
+10 existing call sites). Extended `emit_chain_spirv_for_kernel` in
+`spirv_gen.rs` to emit `OpTypeFloat 16` (2-byte `ArrayStride`) plus the
+required `Float16`/`StorageBuffer16BitAccess` capabilities and the
+`SPV_KHR_16bit_storage` extension when `is_half` is set; arithmetic ops
+were already type-width-agnostic in rspirv. Added a real Vulkan dispatch
+test (`tests/vector_add_half_dxil_real_vulkan.rs`). Hit and honestly
+worked around a real blocker: `opencuda-vulkan`'s `ensure_vector_add_args`
+(in `open-cuda`, which this task was told not to modify) hardcodes a
+4-bytes-per-element (`f32`) size check for the `"vector_add"` kernel
+name regardless of the actual SPIR-V, so half buffers (2 bytes/element)
+failed that check — worked around entirely on this crate's side by
+over-allocating device buffers to `n*4` bytes and only reading/writing
+the first `n*2` bytes of real half data. With that workaround, the test
+**actually dispatched and ran on this machine's real GPU (NVIDIA GT
+730, Kepler)** and matched the CPU `f16` reference exactly across all
+256 elements — confirming this old, Tensor-Core-less GPU's Vulkan driver
+does support the `Float16`/`StorageBuffer16BitAccess` capabilities and
+`SPV_KHR_16bit_storage` extension needed to read/write F16 storage
+buffers (this says nothing about F16 compute *speed*, which was not
+measured and is not claimed to be better). Verification: `cargo build
+--workspace --release` clean; `cargo test -p directx-shader-translate
+--release --lib` 59/59 green (57 existing + 2 new); full test binary
+suite (including all existing real-Vulkan/real-D3D12 tests) green, new
+real-Vulkan half test passes on real hardware; `cargo clippy --workspace
+--all-targets --release -- -D warnings` clean. Honest gaps: no speed
+benchmarking; the new rawBufferLoad/Store.f16 decoding only covers the
+single-add, no-bounds-check, single-component shape actually verified
+(multi-component `half2`/`half4`, chains, and bounds-checked half
+shaders are unverified); `open-cuda`'s f32-hardcoded buffer-size check
+for the `"vector_add"` kernel name remains as-is per this task's
+instruction not to touch `open-cuda` — a permanent fix would need a
+size-aware kernel contract there.

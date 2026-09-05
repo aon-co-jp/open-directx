@@ -28,3 +28,6 @@ thiserror = "1"
 # 依存しない、ライブラリ本体はDXBC->SPIR-V翻訳のみを提供する)。
 opencuda-core = { path = "../../../open-cuda/crates/opencuda-core" }
 opencuda-vulkan = { path = "../../../open-cuda/crates/opencuda-vulkan", features = ["real-vulkan"] }
+# half精度(f16)実Vulkanテスト用のホスト側f32<->f16変換のみに使う
+# (このクレート本体はhalf精度をu16のビット列としてしか扱わず依存しない)。
+half = "2"

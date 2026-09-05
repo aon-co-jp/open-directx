@@ -962,7 +962,7 @@ type DxilRegExpr = crate::spirv_gen::RegExpr;
 /// が1段だけの木として正しく解決できる(排他的である必要はない、DXBC側の
 /// `chain_translator_also_accepts_the_pre_existing_single_op_vector_add_shader`
 /// と同じ設計)。
-pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, DxilRegExpr, bool), DxilCallResolutionError> {
+pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<ResolvedDxilCall>, DxilRegExpr, bool, bool), DxilCallResolutionError> {
     let containers = dxbc::scan_dxbc(bytes);
     let container = containers.into_iter().next().ok_or_else(|| DxilCallResolutionError::MissingBlock("DXBC container".to_string()))?;
     let dxil_chunk = container
@@ -1003,6 +1003,9 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
     let mut saw_ult_cmp = false;
     let mut saw_conditional_br = false;
     let mut saw_unconditional_br = false;
+    // 2026-09-05新規: `dx.op.rawBufferLoad.f16`/`dx.op.rawBufferStore.f16`
+    // (half精度バッファ)を1回でも見た場合に真になるフラグ。
+    let mut saw_f16_ops = false;
 
     for el in &function_block.elements {
         if let Some(sub) = el.as_block() {
@@ -1117,6 +1120,77 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
                         if !matches!(resolved_args[4], DxilValue::BinOpResult) {
                             return Err(DxilCallResolutionError::StoredValueNotBinOpResult);
                         }
+                        resolved_calls.push(ResolvedDxilCall::BufferStore { handle_range_id: range_id });
+                    }
+                    "dx.op.rawBufferLoad.f16" => {
+                        // 2026-09-05新規: half精度(HLSL`half`、SM6.2+
+                        // `-enable-16bit-types`)版バッファ読み込み。実際に
+                        // `dxc.exe -enable-16bit-types -T cs_6_2`で
+                        // `vector_add_half_dxil.hlsl`をコンパイルし
+                        // `examples/dump_dxil.rs`でダンプして確認したところ
+                        // (推測ではなく実バイト列): f32版の`dx.op.bufferLoad.f32`
+                        // (引数4個、opcode=68)とは**別のDXIL命令**
+                        // `dx.op.rawBufferLoad.f16`(引数6個、opcode=139)が
+                        // 使われていた。引数形状は
+                        // `[opcode, handle, index, elementOffset, mask, alignment]`
+                        // (Microsoft DXIL仕様の`RawBufferLoad`と一致)。
+                        // `elementOffset`(引数3)は今回確認した実バイト列では
+                        // 常に定数0だったため、それ以外は未検証として拒否する。
+                        if resolved_args.len() != 6 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(139) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 139, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("RawBufferLoad(f16)の座標がThreadIdの結果ではない".to_string()));
+                        }
+                        if expect_int(&resolved_args[3]) != Some(0) {
+                            return Err(DxilCallResolutionError::UnexpectedShape(
+                                "RawBufferLoad(f16)のelementOffsetが実測(常に0)と異なる、未検証のためスコープ外".to_string(),
+                            ));
+                        }
+                        saw_f16_ops = true;
+                        resolved_calls.push(ResolvedDxilCall::BufferLoad { handle_range_id: range_id });
+                        values.push(DxilValue::BufferLoadAggregate { source_range_id: range_id });
+                    }
+                    "dx.op.rawBufferStore.f16" => {
+                        // 2026-09-05新規: half精度版バッファ書き込み。実バイト列で
+                        // 確認した引数形状(引数10個、opcode=140):
+                        // `[opcode, handle, index, elementOffset, value0, value1,
+                        //   value2, value3, mask, alignment]`(Microsoft DXIL仕様の
+                        // `RawBufferStore`と一致)。`value0`(引数4)だけが実際の
+                        // 格納値(BinOp結果)で、`value1`〜`value3`は未使用
+                        // (今回の1コンポーネントhalfバッファでは`undef`)——
+                        // それ以外の並びは未検証として拒否する。
+                        if resolved_args.len() != 10 {
+                            return Err(DxilCallResolutionError::UnexpectedArgCount(callee_name, resolved_args.len()));
+                        }
+                        let opcode = expect_int(&resolved_args[0]);
+                        if opcode != Some(140) {
+                            return Err(DxilCallResolutionError::OpcodeMismatch(callee_name, 140, opcode));
+                        }
+                        let range_id = match &resolved_args[1] {
+                            DxilValue::CreateHandleResult { range_id } => *range_id,
+                            _ => return Err(DxilCallResolutionError::HandleNotFromCreateHandle),
+                        };
+                        if !matches!(resolved_args[2], DxilValue::ThreadIdResult) {
+                            return Err(DxilCallResolutionError::UnexpectedShape("RawBufferStore(f16)の座標がThreadIdの結果ではない".to_string()));
+                        }
+                        if expect_int(&resolved_args[3]) != Some(0) {
+                            return Err(DxilCallResolutionError::UnexpectedShape(
+                                "RawBufferStore(f16)のelementOffsetが実測(常に0)と異なる、未検証のためスコープ外".to_string(),
+                            ));
+                        }
+                        if !matches!(resolved_args[4], DxilValue::BinOpResult) {
+                            return Err(DxilCallResolutionError::StoredValueNotBinOpResult);
+                        }
+                        saw_f16_ops = true;
                         resolved_calls.push(ResolvedDxilCall::BufferStore { handle_range_id: range_id });
                     }
                     "dx.op.cbufferLoadLegacy.i32" => {
@@ -1287,7 +1361,7 @@ pub(crate) fn resolve_dxil_calls_and_chain(bytes: &[u8]) -> Result<(Vec<Resolved
         }
     };
     let root = last_chain_expr.ok_or(DxilCallResolutionError::MissingBinOp)?;
-    Ok((resolved_calls, root, bounds_check))
+    Ok((resolved_calls, root, bounds_check, saw_f16_ops))
 }
 
 /// [`resolve_dxil_calls_and_chain`]が組み立てた式木から、DXBC側の
@@ -1307,7 +1381,7 @@ pub enum DxilChainSpirvError {
 /// [`crate::spirv_gen::ChainTranslatedKernel`]のDXIL版。読み込みUAVが
 /// N本(N>=1)になり得るため、DXBC側と同じ形の型をそのまま使う。
 pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::ChainTranslatedKernel, DxilChainSpirvError> {
-    let (calls, root, bounds_check) = resolve_dxil_calls_and_chain(bytes)?;
+    let (calls, root, bounds_check, is_half) = resolve_dxil_calls_and_chain(bytes)?;
 
     let mut buffer_store: Option<i64> = None;
     for call in &calls {
@@ -1325,7 +1399,7 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
     // 無条件分岐)を実際に検出できるようになったため、DXBC側と同様
     // `resolve_dxil_calls_and_chain`が返す実測値をそのまま渡す
     // (以前は常に`false`固定だった)。
-    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav, bounds_check);
+    let spirv_words = crate::spirv_gen::emit_chain_spirv_for_kernel(local_size, &root, write_uav, bounds_check, is_half);
 
     Ok(crate::spirv_gen::ChainTranslatedKernel {
         spirv_words,
@@ -1334,6 +1408,7 @@ pub fn translate_dxil_chain_to_spirv(bytes: &[u8]) -> Result<crate::spirv_gen::C
         read_uav_bind_points,
         write_uav_bind_point: write_uav,
         bounds_check,
+        is_half,
     })
 }
 
@@ -2028,7 +2103,7 @@ mod tests {
     /// (add, u1+u0)、BinOp2=`fields=[1,4,2,31]`(mul, 直前の結果*u0)と一致)。
     #[test]
     fn resolves_real_dxc_compiled_add_mul_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_DXIL)
+        let (calls, root, _bounds_check, _is_half) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_DXIL)
             .expect("real dxc-compiled vector_add_mul_chain.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, same call count as the single-op shape");
         match &root {
@@ -2043,7 +2118,7 @@ mod tests {
     /// 同上、sub/divチェーン(`(a-b)/a`)版。
     #[test]
     fn resolves_real_dxc_compiled_sub_div_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_CHAIN_DXIL)
+        let (calls, root, _bounds_check, _is_half) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_CHAIN_DXIL)
             .expect("real dxc-compiled vector_sub_div_chain.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7);
         match &root {
@@ -2086,7 +2161,7 @@ mod tests {
 
     #[test]
     fn resolves_real_dxc_compiled_3op_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
+        let (calls, root, _bounds_check, _is_half) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_DIV_CHAIN3_DXIL)
             .expect("real dxc-compiled vector_add_mul_div_chain3.dxil must resolve into a chain RegExpr");
         assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore x1, unchanged by adding a 3rd op");
         // 期待する木: Div(Mul(Add(Load,Load), Load), Load) == (a+b)*a/b
@@ -2144,7 +2219,7 @@ mod tests {
 
     #[test]
     fn resolves_real_dxc_compiled_4op_chain_dxil_into_matching_regexpr_tree() {
-        let (calls, root, _bounds_check) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
+        let (calls, root, _bounds_check, _is_half) = resolve_dxil_calls_and_chain(VECTOR_SUB_DIV_ADD_MUL_CHAIN4_DXIL)
             .expect("real dxc-compiled vector_sub_div_add_mul_chain4.dxil must resolve into a chain RegExpr");
         assert_eq!(
             calls.len(),
@@ -2224,7 +2299,7 @@ mod tests {
     /// CreateHandle+cbufferLoadLegacy)。
     #[test]
     fn resolves_real_dxc_compiled_bounded_chain_dxil_and_detects_bounds_check() {
-        let (calls, root, bounds_check) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_BOUNDED_DXIL)
+        let (calls, root, bounds_check, _is_half) = resolve_dxil_calls_and_chain(VECTOR_ADD_MUL_CHAIN_BOUNDED_DXIL)
             .expect("real dxc-compiled vector_add_mul_chain_bounded.dxil must resolve");
         assert_eq!(calls.len(), 9, "CreateHandle x4(3 UAV + cbuffer) + ThreadId + cbufferLoadLegacy + BufferLoad x2 + BufferStore");
         assert!(bounds_check, "cbuffer+icmp ult+条件分岐+無条件分岐が実際に揃っているシェーダーなのでtrueのはず");
@@ -2252,6 +2327,46 @@ mod tests {
         let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_MUL_CHAIN_DXIL)
             .expect("vector_add_mul_chain.dxil (no bounds check) must still translate to SPIR-V");
         assert!(!kernel.bounds_check, "vector_add_mul_chain.dxilには境界チェックが無い");
+    }
+
+    const VECTOR_ADD_HALF_DXIL: &[u8] = include_bytes!("../shaders/vector_add_half.dxil");
+
+    /// 2026-09-05新規: 実際に`dxc.exe -enable-16bit-types -T cs_6_2`で
+    /// `vector_add_half_dxil.hlsl`をコンパイルした`vector_add_half.dxil`を
+    /// `resolve_dxil_calls_and_chain`へ通す(推測ではなく実バイト列での検証)。
+    /// `examples/dump_dxil`の実ダンプで確認した通り、f32版とは異なる
+    /// `dx.op.rawBufferLoad.f16`/`dx.op.rawBufferStore.f16`(opcode 139/140、
+    /// 引数6個/10個)が使われるが、Call個数(7個)・式木の形は
+    /// f32版のvector_add.dxilと同じになるはず——`is_half`フラグだけが
+    /// 真になることを確認する。
+    #[test]
+    fn resolves_real_dxc_compiled_half_precision_dxil_and_detects_f16() {
+        let (calls, root, bounds_check, is_half) = resolve_dxil_calls_and_chain(VECTOR_ADD_HALF_DXIL)
+            .expect("real dxc-compiled vector_add_half.dxil (rawBufferLoad/Store.f16) must resolve");
+        assert_eq!(calls.len(), 7, "CreateHandle x3 + ThreadId + BufferLoad x2 + BufferStore(全てraw f16版)");
+        assert!(!bounds_check, "half版vector_addには境界チェックが無い");
+        assert!(is_half, "rawBufferLoad.f16/rawBufferStore.f16を検出したのでtrueのはず");
+        assert!(matches!(&root, DxilRegExpr::BinOp(crate::BinaryOp::Add, _, _)), "outermost op must be add, got {root:?}");
+    }
+
+    /// `translate_dxil_chain_to_spirv`がhalf精度DXILから実際に
+    /// `OpTypeFloat 16`ベースのSPIR-Vを生成し、`ChainTranslatedKernel::
+    /// is_half`が伝播することを確認する。
+    #[test]
+    fn translate_dxil_chain_to_spirv_handles_half_precision_and_emits_f16_type() {
+        let kernel = translate_dxil_chain_to_spirv(VECTOR_ADD_HALF_DXIL)
+            .expect("vector_add_half.dxil must translate to SPIR-V");
+        assert!(kernel.is_half, "half精度DXILなのでis_halfはtrueのはず");
+        assert!(!kernel.bounds_check);
+        assert_eq!(kernel.spirv_words[0], 0x0723_0203, "SPIR-V magic");
+        // 生成したSPIR-VワードにOpTypeFloat(opcode=22)+16bit幅の命令が
+        // 実際に含まれることを確認する(OpTypeFloatは
+        // `[wordcount<<16 | 22, result_id, width]`の3ワード命令)。
+        let has_f16_type = kernel.spirv_words.windows(3).any(|w| {
+            let opcode = w[0] & 0xFFFF;
+            opcode == 22 && w[2] == 16
+        });
+        assert!(has_f16_type, "生成したSPIR-VにOpTypeFloat width=16が見つからない");
     }
 
     /// `decode_type_record`がLLVM `TYPE_CODE_HALF`(code=10、

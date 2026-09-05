@@ -134,3 +134,8 @@ Write-Host "OK: compiled vector_add_mul_div_sub_add_mul_div_sub_chain8_bounded_d
 Write-Host "OK: compiled vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded.hlsl -> vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded.dxbc (DXBC, SM5.0, cbuffer+bounds-checked 9-op chain, 2026-08-08)"
 & $dxc -T cs_6_0 -E main (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded_dxil.dxil")
 Write-Host "OK: compiled vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded_dxil.hlsl -> vector_add_mul_div_sub_add_mul_div_sub_add_chain9_bounded_dxil.dxil (DXIL, SM6.0, cbuffer+bounds-checked 9-op chain, 2026-08-08)"
+# 2026-09-05: half精度(HLSL`half`、SM6.2+ native 16-bit types)版
+# vector_add。`-enable-16bit-types`はSM6.2以降でのみ有効化できる
+# (fxc.exe/DXBCには対応する型自体が無いためDXBC版は存在しない)。
+& $dxc -enable-16bit-types -T cs_6_2 -E main (Join-Path $shaderDir "vector_add_half_dxil.hlsl") -Fo (Join-Path $shaderDir "vector_add_half.dxil")
+Write-Host "OK: compiled vector_add_half_dxil.hlsl -> vector_add_half.dxil (DXIL, SM6.2, -enable-16bit-types, half precision)"
