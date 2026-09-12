@@ -21,6 +21,7 @@ use dxbc::{scan_dxbc as dxbc_scan, ChunkData};
 use thiserror::Error;
 
 pub mod dxil;
+pub mod range_coder;
 pub mod spirv_gen;
 pub use dxil::{
     parse_dxil_container, translate_dxil_binary_op_to_spirv, translate_dxil_chain_to_spirv,

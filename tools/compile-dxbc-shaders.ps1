@@ -56,6 +56,8 @@ Write-Host "OK: compiled vector_max.hlsl -> vector_max.dxbc (DXBC, SM5.0, Output
 Write-Host "OK: compiled vector_min.hlsl -> vector_min.dxbc (DXBC, SM5.0, Output=min(A,B), MED predictor comparator prototype step 1, 2026-09-12)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "med_predictor.hlsl") /Fo (Join-Path $shaderDir "med_predictor.dxbc") /nologo
 Write-Host "OK: compiled med_predictor.hlsl -> med_predictor.dxbc (DXBC, SM5.0, FFv1 MED predictor comparator+select, ge+movc no-branch decoding, 2026-09-12)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "med_predictor_2d.hlsl") /Fo (Join-Path $shaderDir "med_predictor_2d.dxbc") /nologo
+Write-Host "OK: compiled med_predictor_2d.hlsl -> med_predictor_2d.dxbc (DXBC, SM5.0, real 2D x-1/y-1 image indexing -- NOT YET DECODED by spirv_gen.rs, real-opcode-shape research artifact only, 2026-09-12)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_chain3.hlsl -> vector_add_mul_div_chain3.dxbc (DXBC, SM5.0, 3 sequential ops / 3 UAVs, reg-expr chain decoder)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.hlsl") /Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxbc") /nologo

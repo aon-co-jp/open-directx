@@ -7,44 +7,45 @@
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
 > 📌 **最近の更新(2026-09-12)**: H.264/H.265/HEVCの自前シェーダー実装は
-> 再調査の上で非推奨・クローズを再確認し、代わりに**FFv1**(GPU/SIMD向け
-> 設計の可逆コーデック、FFmpeg本家がVulkanコンピュートで実装・動作
-> 実績あり)を現実的な次の目標として特定、同日中に4つの実装を完成させた:
-> (1) MED予測器の比較器(`max`/`min`)を追加、(2) `open-cuda`に汎用N
-> バッファディスパッチ(`chain_n_buffer`)を追加し以前ブロックされていた
-> Gチャンネル(4バッファ)を構造検証止まりから**実GT730ハードウェアでの
-> 数値検証へ格上げ**、(3) MED予測器本体を完成——`fxc.exe`が3分岐if/else
-> if/elseを分岐命令無しで`ge`+`movc`だけに平坦化することを発見し
-> `RegExpr::Ge`/`RegExpr::Select`(SPIR-Vの`OpSelect`)を追加、3分岐全て
-> を実際に踏んだ上で実機検証、(4) レンジコーダー最難関部分の32レーン
-> subgroup shuffleを`rspirv`で直接SPIR-V化し(`OpGroupNonUniformShuffle`)、
-> `vulkaninfo`の申告を鵜呑みにせずこのプロジェクト自身の翻訳・
-> ディスパッチ経路で実際に動くことを実GT730ハードウェアで確認した。
-> ワークスペース全体で回帰無し。次にすべきことは、MEDの2次元近傍参照
-> (実画像への`x-1`/`y-1`インデックス)と、レンジコーダーの状態遷移
-> テーブル・適応ロジック本体(今回証明したのは土台のみ)。
+> 非推奨・クローズを再確認し、代わりに**FFv1**を現実的な次の目標として
+> 特定、同日中に5つの実装を完成させた: (1) MED予測器の比較器(`max`/
+> `min`)、(2) `open-cuda`への汎用Nバッファディスパッチ追加でGチャンネル
+> (4バッファ)を**実GT730ハードウェアでの数値検証へ格上げ**、(3) MED
+> 予測器本体完成(`fxc.exe`が3分岐if/else if/elseを分岐命令無しで
+> `ge`+`movc`だけに平坦化することを発見、`RegExpr::Ge`/`Select`で対応、
+> 3分岐全てを実機検証)、(4) レンジコーダーの前提条件である32レーン
+> subgroup shuffleを`OpGroupNonUniformShuffle`で実機実証、(5)
+> **レンジコーダーの状態遷移テーブル+`get_rac`本体を実装**——RFC 9043
+> から256要素の`default_state_transition`テーブルを実際に転記し、
+> `rspirv`で直接組み立てたSPIR-Vループとして実装したところ、**実GT730
+> ハードウェア上でCPU参照実装と32シンボル分ビット単位で完全一致**した。
+> MEDの2次元近傍参照(`x-1`/`y-1`)は実際にコンパイルして必要な命令
+> (`IMul`/`UDiv`/`IMad`/`Iadd`/`And`+実分岐)を調査したが、現在の
+> デコーダを大きく超える拡張が必要と判明したため実装は次回へ持ち越し。
+> ワークスペース全体で回帰無し。次: レンジコーダーの32レーン並列化
+> (土台2つは完成済み)、MEDの2次元化、`put_symbol`/`get_symbol`本体。
 > 詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
 >
 > *English*: Re-confirmed H.264/H.265/HEVC shader-codec work as not
-> recommended/closed on GT730, and identified **FFv1** (a GPU/SIMD-
-> friendly lossless codec, already working upstream in FFmpeg via Vulkan
-> compute) as the realistic next target — then completed four real
-> pieces of it the same day: (1) MED predictor comparator (`max`/`min`)
-> decoding; (2) added generic N-buffer dispatch (`chain_n_buffer`) to
-> `open-cuda`, upgrading the previously-blocked 4-buffer G-channel kernel
-> from structural-only to **real numeric verification on GT730
-> hardware**; (3) the MED predictor itself, completed — discovered `fxc`
-> flattens the 3-way if/else-if/else into branch-free `ge`+`movc`, added
-> `RegExpr::Ge`/`RegExpr::Select` (SPIR-V's `OpSelect`), verified on real
-> hardware with test data that exercises all three branches; (4) proved
-> the range coder's hardest prerequisite — 32-lane subgroup shuffle —
-> actually works, by hand-building SPIR-V with `OpGroupNonUniformShuffle`
-> and dispatching it through this project's own pipeline on real GT730
-> hardware, rather than trusting `vulkaninfo`'s capability bits alone.
-> Zero regressions across the workspace. Next: MED's 2D neighbor
-> addressing (`x-1`/`y-1` indexing into an actual image buffer), and the
-> range coder's state-transition-table/adaptation logic itself (today's
-> work proved only the underlying mechanism). See
+> recommended/closed on GT730, identified **FFv1** as the realistic next
+> target, and completed five real pieces the same day: (1) MED predictor
+> comparator (`max`/`min`); (2) generic N-buffer dispatch added to
+> `open-cuda`, upgrading the G-channel kernel to **real numeric
+> verification on GT730 hardware**; (3) the MED predictor itself,
+> completed (`fxc` flattens the 3-way branch into branch-free `ge`+
+> `movc`, handled via `RegExpr::Ge`/`Select`, verified on hardware
+> exercising all three branches); (4) the range coder's 32-lane subgroup
+> shuffle prerequisite, proven with `OpGroupNonUniformShuffle` on real
+> hardware; (5) **the range coder's state-transition table and `get_rac`
+> itself, implemented** — transcribed RFC 9043's 256-entry
+> `default_state_transition` table and hand-built a SPIR-V loop that
+> **matched the CPU reference bit-for-bit across 32 symbols on real
+> GT730 hardware**. MED's 2D neighbor addressing (`x-1`/`y-1`) was
+> compiled and researched (`IMul`/`UDiv`/`IMad`/`Iadd`/`And` plus real
+> branching) but found to need a materially larger decoder extension, so
+> implementation is deferred to next session. Zero regressions. Next:
+> parallelize the range coder across 32 lanes (both prerequisites now
+> done), MED's 2D indexing, and `put_symbol`/`get_symbol` itself. See
 > [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md) for details.
 
 > 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/

@@ -3172,3 +3172,49 @@ directx-shader-translate --all-targets -- -D warnings`: 既存の無関係な
 が値を交換できる」という土台のみで、FFv1の実際の適応型エントロピー
 符号化アルゴリズムはまだ手つかず——これが本当の意味での最難関であり、
 次回セッションの主題として残す)。
+
+## HANDOFF追記(2026-09-12続き3) レンジコーダー本体(状態遷移テーブル+get_rac)を実装・実機bit完全一致検証、MED2次元化は調査のみで次回へ
+
+直前のHANDOFF(subgroup shuffle実証)からさらにユーザー指示で、
+レンジコーダーの状態遷移テーブル・適応ロジック本体の実装に着手した。
+詳細は`PORTING.md`の該当節に英語(+日本語要約)で記録済み。要点:
+
+- RFC 9043を直接取得し、Section 3.8.1.5の`default_state_transition`
+  256要素テーブルとSection 3.8.1.1の`get_rac`擬似コードを実際に転記・
+  実装(`crates/directx-shader-translate/src/range_coder.rs`新設)。
+- `zero_state[i]=256-one_state[256-i]`の計算で`one_state[256-i]==0`の
+  ケースがu8オーバーフロー(256→0へラップ)することを最初は単体テストの
+  誤りとして検出し、これがFFmpeg本家の`uint8_t[256]`配列と同じ正しい
+  意味論であることを確認した上でテストを修正(バグではなく正しい挙動
+  だったことを実際に検証した上での判断)。
+- `build_range_decoder_kernel`: `get_rac`+`refill`ロジックを`rspirv`で
+  直接組み立てたSPIR-Vの`OpLoopMerge`ループ(単一invocation、状態を
+  `Function`ストレージクラスの変数でLoad/Store経由で逐次持ち回る、
+  OpPhi不要の設計)として実装。`initial_state`/`num_symbols`は
+  push constantではなくビルド時`OpConstant`(`chain_n_buffer`の
+  4バイトpush constant契約とのレイアウト不整合を実際に発見し、
+  実行前に設計変更で回避)。
+- 新規テスト`tests/range_decoder_real_vulkan.rs`: 32シンボル分の
+  復号結果が**実GT730ハードウェア上でCPU参照実装とビット単位で完全
+  一致**。`cargo test --workspace`: 全緑(63件、以前は61件)。
+  `cargo clippy`: 既存の無関係な`dxil.rs`1件を除きクリーン。
+
+**未実装として正直に開示**: 32レーン並列化(FFmpeg本家の設計、32個の
+異なるコンテキストが並列に`rangeoff`を計算し1レーンだけが逐次コミット
+する構造)自体はまだ手つかず——今回証明したのはあくまで状態遷移
+テーブル駆動の`get_rac`という最小単位。`put_symbol`/`get_symbol`
+(実際のピクセル差分値をどのコンテキストへ振り分けるかというFFv1
+本体のビットストリーム層)も未実装。
+
+- MEDの2次元近傍参照(`med_predictor_2d.hlsl`)も実際にコンパイルし
+  実SHEX形状を調査した——`IMul`(Nullレジスタ)/`UDiv`/`IMad`/`Iadd`
+  (即値-1)/`And`、さらに実際の`If`/`EndIf`分岐が存在するという、
+  現在のデコーダの「制御フロー無しの式木」を大きく超える形状と判明。
+  中途半端な拡張を急いで報告しないため、今回は調査結果の記録のみとし
+  実装は次回へ持ち越す(`.hlsl`/`.dxbc`は調査資料として保持)。
+
+**次回セッションへの引き継ぎ(優先順位)**: (1) レンジコーダーの
+32レーン並列化(今回のsubgroup shuffle実証+get_rac実装という2つの
+土台を組み合わせる本番の設計・実装)、(2) MEDの2次元近傍参照
+(整数演算+実分岐を扱う新しいデコーダサブシステムが必要、実SHEX形状は
+調査済み)、(3) `put_symbol`/`get_symbol`(FFv1ビットストリーム層本体)。

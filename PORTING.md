@@ -889,3 +889,131 @@ if/elseを**分岐命令を一切使わず**`ge`(比較)+`movc`(条件付き代�
 `x-1`/`y-1`インデックス計算)、(b) レンジコーダーの状態遷移テーブル・
 適応ロジック本体(今回証明したのはあくまで「32レーンが値を交換できる」
 という土台のみ、実際の適応型エントロピー符号化はまだ手つかず)。
+
+## Range coder state-transition-table + get_rac implemented and GPU-verified bit-exact against CPU reference (2026-09-12, same day continued)
+
+Directly continuing the subgroup-shuffle proof above, implemented the
+actual piece the user asked for next: FFv1's adaptive range-coder
+**state-transition table and `get_rac` adaptation logic itself** (not
+just the 32-lane shuffle mechanism it will eventually run on top of).
+
+**Research**: fetched RFC 9043 ("FFV1 Video Coding Format Versions 0,
+1, and 3") directly — Section 3.8.1.5's `default_state_transition`
+table (all 256 values, transcribed verbatim into
+`range_coder::DEFAULT_STATE_TRANSITION`) and Section 3.8.1.1's `get_rac`
+pseudocode:
+```
+get_rac(state) {
+    rangeoff = (range * state) / 256; range -= rangeoff
+    if (low < range) { state = zero_state[state]; refill(); return 0 }
+    else { low -= range; state = one_state[state]; range = rangeoff; refill(); return 1 }
+}
+refill() { if (range < 256) { range *= 256; low *= 256; low += next_byte() } }
+```
+`one_state[i] = default_state_transition[i]` (no custom delta),
+`zero_state[i] = 256 - one_state[256-i]` (RFC's own relation; verified
+this actually means **u8-wrapping** arithmetic — `256 - 0` truncates to
+`0` in an 8-bit table, matching how FFmpeg's own C `uint8_t[256]` array
+behaves — confirmed by writing a unit test against the naive
+non-wrapping formula first, watching it fail, and then understanding
+why the wrapped version is the *correct* one, not a bug to route
+around).
+
+**New module `crates/directx-shader-translate/src/range_coder.rs`**:
+- `DEFAULT_STATE_TRANSITION: [u8; 256]`, `one_state()`, `zero_state()`.
+- `RangeDecoderCpu` — a straightforward Rust port of the RFC pseudocode
+  above, used purely as the reference implementation to check the GPU
+  kernel against (not itself part of what's being "proven" — Rust
+  executing Rust proves nothing about the GPU path).
+- `build_range_decoder_kernel(initial_state, num_symbols)` — hand-built
+  SPIR-V (again, no DXBC/SM5.0 source: this needs a real loop, and
+  loops are outside this crate's DXBC chain-decoder scope, same
+  reasoning as the subgroup-shuffle kernel above) implementing the
+  exact same `get_rac`/`refill` logic as a `OpLoopMerge`-based loop
+  running in a **single invocation** (state is carried sequentially
+  across iterations — this is intentionally not yet the 32-lane
+  parallel design). Uses `OpVariable`s with `Function` storage class
+  (mutated via `OpLoad`/`OpStore` each iteration, entirely avoiding
+  needing to hand-construct `OpPhi` nodes — each `if`/`else` branch of
+  the inner bit-decision stores its own outcome directly into the
+  shared `Function` variables before falling through to the merge
+  block, which is the standard trick for hand-rolled CFG-heavy SPIR-V).
+  `initial_state`/`num_symbols` are baked in as `OpConstant`s at build
+  time rather than passed as push constants, specifically to avoid a
+  layout mismatch with `chain_n_buffer`'s fixed 4-byte push constant
+  (a real problem caught while writing the test, before it could cause
+  a runtime validation failure — documented in the function's own doc
+  comment as a design decision, not left as a landmine).
+- New test `tests/range_decoder_real_vulkan.rs`: runs 32 sequential
+  `get_rac` calls against a synthetic byte stream, on both the CPU
+  reference and the real-GPU kernel, and asserts **bit-for-bit
+  equality** — **passed on real GT730 hardware**, the GPU producing the
+  exact same 32-bit decoded sequence as the CPU reference.
+- `cargo test --workspace`: full suite green (63 total,
+  up from 61). `cargo clippy -p directx-shader-translate --all-targets
+  -- -D warnings`: clean except the same pre-existing unrelated
+  `dxil.rs` lint noted in earlier entries.
+
+**Honest scope**: this proves the state-transition-table-driven
+adaptation logic is correct and runs on real GPU hardware — it is
+still a single serial invocation, not the 32-lane-parallel design
+FFmpeg's real encoder uses (that requires restructuring so 32 lanes can
+each independently compute `rangeoff` for 32 *different* contexts in
+parallel while only the lane whose turn it is commits the serial
+low/range/state update and byte output — a real architectural next
+step, not yet attempted). It also does not yet implement `put_symbol`/
+`get_symbol` (the actual FFv1 bitstream layer that picks *which*
+context index to use for which coefficient) — only the underlying
+per-bit `get_rac` primitive.
+
+## MED predictor 2D neighbor addressing: real DXBC shape researched, decoding deferred (2026-09-12, same day)
+
+Also compiled `shaders/med_predictor_2d.hlsl` — the same MED predictor
+as before, but reading `left`/`top`/`topleft` via real `x-1`/`y-1`
+indexing into a single 2D image buffer (`Width`/`Height` from a
+constant buffer), with border handling via `? :` (compiles to `movc`,
+consistent with the branch-free pattern already seen) — to see
+honestly how much bigger a real decoder extension this would require
+before attempting it.
+
+**Real SHEX shape observed** (via `examples/dump_shex`): significantly
+more than the flat comparator chain this decoder currently handles —
+`IMul` (with a `Null`-typed destination operand for the discarded
+high-multiplication-result half, an HLSL/DXBC idiom this decoder has
+never needed to handle), `UDiv`, `IMad` (integer multiply-add, for the
+`y*Width+x` row-major index arithmetic), `Iadd` with immediate
+`0xFFFFFFFF` (i.e. `x-1`/`y-1` compiled as `+(-1)` rather than a
+dedicated subtract), `And` (for the HLSL `&&` in `x>0 && y>0`), and —
+unlike the flat MED prototype — a real `If`/`EndIf` **is** present
+(for the outer `i < Width*Height` dispatch-overhang guard), so this is
+not a fully branch-free shape this time.
+
+**Decision: not implemented this session.** This would require a
+materially larger decoder subsystem (an integer-expression side of the
+`RegExpr` tree, or a second parallel tree type, plus real branching
+support beyond the current `ult`+`if`+`endif`-only bounds-check
+convention) — rushing this in the time remaining risked exactly the
+kind of shaky, undertested addition this project's own conventions
+warn against. The `.hlsl`/`.dxbc` pair is kept in the repo as a
+research artifact (real opcode shapes now known and documented above)
+for whoever picks this up next, rather than deleted or half-wired.
+
+**日本語(要約)**: レンジコーダーの状態遷移テーブルと`get_rac`本体を
+実装した。RFC 9043から256要素の`default_state_transition`テーブルを
+実際に書き写し、`get_rac`/`refill`のアルゴリズムをCPU参照実装
+(`RangeDecoderCpu`)と、`rspirv`で直接組み立てたSPIR-Vループ
+(`build_range_decoder_kernel`、単一invocationによる逐次実行)の
+両方で実装。新規テストが32シンボル分の復号結果を**実GT730ハードウェア
+上でCPU参照実装とビット単位で完全一致**することを確認した。
+未実装として正直に開示: 32レーン並列化(FFmpeg本家の設計)自体は
+まだ手つかず、`put_symbol`/`get_symbol`(実際のピクセル差分値の
+シンボル化)も未実装——今回証明したのはあくまで`get_rac`という
+最小単位の適応ロジックのみ。
+
+MEDの2次元近傍参照(`med_predictor_2d.hlsl`)も実際にコンパイルして
+実SHEX形状を調査した——`IMul`(Nullレジスタ)/`UDiv`/`IMad`/`Iadd`
+(即値`-1`)/`And`(`&&`)、さらに(比較器プロトタイプとは異なり)実際の
+`If`/`EndIf`が存在するという、現在のデコーダが対応する「制御フロー
+無しの式木」を大きく超える形状であることが判明した。中途半端な
+デコーダ拡張を急いで報告しないため、今回はこの調査結果の記録までとし、
+実装は次回セッションへ持ち越す(`.hlsl`/`.dxbc`は調査資料として保持)。
