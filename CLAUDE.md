@@ -3091,3 +3091,43 @@ target (2026-09-12)」節に英語で記録済み(既存`PORTING.md`の言語慣
 残す(本セッションでは中途半端な足場を「完成」として報告しない方針
 のため、着手するなら比較器命令のデコード追加から実GPU検証まで
 一気通貫で行う)。
+
+## HANDOFF追記(2026-09-12続き) FFv1第一歩(max/min比較器)を実装+レンジコーダー前提条件をGT730で実確認(前向きな結果)
+
+直前のHANDOFF(H.264/HEVC再調査+FFv1特定)を受け、ユーザー指示により
+実際に開発・TEST・実GPU検証まで一気通貫で着手した。詳細は
+`PORTING.md`の「FFv1 step 1 implemented」「Range coder prerequisite
+check」の2節に英語(+日本語要約)で記録済み。要点:
+
+- **実装した**: `vector_max.hlsl`/`vector_min.hlsl`を実際に`fxc.exe`で
+  コンパイルし、`Opcode::Max`/`Opcode::Min`がadd/mul/divと同じ命令形状の
+  ネイティブ単一命令であることを確認。`spirv_gen.rs`に`BinaryOp::Max`/
+  `BinaryOp::Min`を追加し、SPIR-V側はGLSL.std.450拡張命令`FMax`/`FMin`
+  として翻訳。新規テスト`tests/vector_max_min_real_vulkan.rs`が
+  **実GT730ハードウェアで256/256要素一致でpassした**。
+  `cargo test --workspace`は全緑、既存テストへの回帰無し。
+- **未実装として正直に開示**: MEDの3分岐構造(if/else if/else)自体と、
+  2次元近傍参照(left/top/top-left、`x-1`/`y-1`のインデックス計算)は
+  まだ手つかず。中途半端な足場を「MED予測器完成」として報告しない
+  ため、今回はこの比較器プリミティブ単体の完成・実機検証までとした。
+- **レンジコーダー前提条件を`vulkaninfo`で実確認(重要な前向き発見)**:
+  世界中の言語でのGoogle/GitHub追加調査で、FFmpeg本家の実ソース
+  (`vulkan/common.comp`、`vulkan/ffv1_enc_ac.comp`、`cyanreg/FFmpeg`の
+  `vulkan`ブランチ)を発見。FFmpegのVulkan FFv1エンコーダーは
+  `VK_KHR_buffer_device_address`拡張+32レーンsubgroup shuffle操作を
+  要求するとの記載があったため、推測で終わらせず実機で確認したところ、
+  **この開発機のGT730は両方とも実際にサポートしていた**
+  (`VK_KHR_buffer_device_address` revision 1あり、`subgroupSize=32`+
+  `SUBGROUP_FEATURE_SHUFFLE_BIT`あり——FFmpegの設計サイズと一致)。
+  コアAPIバージョンは1.2.175(1.3ではない)だが、必要な機能は拡張として
+  揃っている。**これはH.264/H.265/HEVCの時のような恒久的なハードウェア/
+  ドライバの壁ではない**——実装すれば動く可能性がある、という
+  クローズしていない前向きな結論。
+
+**次回セッションへの引き継ぎ**: (1) MEDの3分岐構造+2次元近傍参照の
+実装(既存の1次元フラットバッファ・チェーンデコーダの拡張が必要)、
+(2) レンジコーダーのsubgroupカーネル設計への着手(`opencuda-vulkan`側
+が現状`VK_KHR_buffer_device_address`を要求するデバイス/インスタンス
+セットアップを行っているか未確認、および既存のSPIR-V生成手法で
+subgroup shuffle命令を表現できるかの検証が必要)。両方とも実装未着手の
+純粋な次段階として記録する。

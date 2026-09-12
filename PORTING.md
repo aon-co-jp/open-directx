@@ -677,6 +677,104 @@ last, as its own dedicated research-plus-implementation pass, since it
 is the one piece with no existing precedent in this repo's codebase to
 generalize from.
 
+## FFv1 step 1 implemented: MED-predictor comparator (max/min) decoding, real-GPU-verified (2026-09-12, same day)
+
+Following the research entry above, actually started on the honestly-
+scoped first step ("MED predictor kernel first ... verified on real
+GT730 hardware"): the comparator primitive MED's `min`/`max` calls need.
+
+- Compiled two new minimal shaders with real `fxc.exe`:
+  `shaders/vector_max.hlsl` (`Output[i] = max(A[i], B[i])`) and
+  `shaders/vector_min.hlsl` (the `min` counterpart). Dumped their real
+  SHEX instruction streams with `examples/dump_shex` — confirmed HLSL's
+  `max`/`min` compile to a single native `Opcode::Max`/`Opcode::Min`
+  instruction with the exact same operand shape as `add`/`mul`/`div`
+  (`dest, src1, src2`), **not** a compare-then-branch decomposition.
+- Added `BinaryOp::Max`/`BinaryOp::Min` to `spirv_gen.rs`'s `RegExpr`
+  chain decoder (`decode_chain_shape`, alongside the existing
+  `Add|Mul|Div` arm — same negate-rejection convention: any negate flag
+  on either source is rejected as unverified, matching existing
+  practice for this decoder).
+- Added real SPIR-V emission for both: rather than inventing a manual
+  compare+select sequence, translated them to the **GLSL.std.450**
+  extended-instruction-set `FMax`/`FMin` ops (`OpExtInst` via
+  `Builder::ext_inst`, importing `"GLSL.std.450"` once per module) —
+  this is the standard SPIR-V idiom for `max`/`min` (matches how GLSL's
+  own `max`/`min` builtins lower) and mirrors the native-single-
+  instruction shape actually observed in the DXBC.
+- New real-hardware test `tests/vector_max_min_real_vulkan.rs`: both
+  `dxbc_vector_max_matches_reference_on_real_vulkan_hardware` and
+  `dxbc_vector_min_matches_reference_on_real_vulkan_hardware` **passed
+  on this machine's real NVIDIA GT 730**, 256/256 elements exactly
+  matching `f32::max`/`f32::min` CPU reference.
+- `cargo test --workspace`: full suite green, zero regressions (all
+  pre-existing real-Vulkan/real-D3D12 tests still pass).
+- Added both compile steps to `tools/compile-dxbc-shaders.ps1`.
+
+**Honest scope of what this does NOT yet cover**: this is the isolated
+comparator primitive only, on the existing flat 1D-buffer chain
+decoder. MED's actual `if/else if/else` 3-way branch structure, and its
+2D neighbor addressing (left/top/top-left pixels, i.e. `x-1`/`y-1`
+index arithmetic rather than a single `id.x`), are not implemented —
+those are the next real sub-steps toward an actual MED kernel, not yet
+attempted.
+
+## Range coder prerequisite check: GT730 confirmed capable, not a hardware wall (2026-09-12, same day)
+
+Continuing the world-language research pass on the range coder (the
+piece FFmpeg's own developers call the hardest part, using a 32-wide
+subgroup where 31 lanes do adaptation lookup in parallel and 1 lane
+serializes the actual bit output — see the research entry above), a
+further Google/GitHub search turned up the actual FFmpeg source: real
+`.comp` GLSL files (`vulkan/common.comp`, `vulkan/ffv1_enc_ac.comp`) in
+the `cyanreg/FFmpeg` `vulkan` branch, confirming this is real, shipped
+GLSL, not merely a blog-post description. FFmpeg's own encoder patch
+notes state the Vulkan FFv1 encoder "requires a Vulkan 1.3 supporting
+GPU with the BDA (Buffer Device Address) extension" and uses subgroup
+shuffle operations to distribute the adaptation work.
+
+**Checked directly on this machine with `vulkaninfo`, rather than
+assuming**: GT730 reports Vulkan API version **1.2.175** (not 1.3
+core), but it does expose the two specific features FFmpeg's design
+actually needs as extensions/properties:
+- `VK_KHR_buffer_device_address` (revision 1) — present.
+- `subgroupSize = 32` with `SUBGROUP_FEATURE_SHUFFLE_BIT` and
+  `SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT` set — present, and the
+  subgroup size **exactly matches** the 32-wide design FFmpeg's own
+  implementation uses (not a coincidence to rely on, but a good sign
+  this GPU generation's SIMD width is the one this algorithm was
+  designed around).
+
+**This is the opposite finding from the H.264/H.265/HEVC research**:
+that was a genuine, permanent hardware/driver ceiling (no
+`VK_KHR_video_*` extensions exist on this chip, full stop). The range
+coder's prerequisites are, by contrast, actually present on this GPU.
+Whether `opencuda-vulkan`'s current device/instance setup already
+requests the needed extension (it targets a narrower baseline today)
+and whether a subgroup-shuffle-based kernel can be expressed through
+this project's existing SPIR-V-emission approach are real open
+implementation questions — but they are engineering work, not a closed
+research question the way CABAC was. This is recorded as the concrete
+starting point for the next work session on FFv1's hardest remaining
+piece.
+
+**日本語(要約)**: FFv1の第一歩として、MED予測器が使う比較器
+(`max`/`min`)命令のDXBC→SPIR-Vデコードを実装した。`vector_max.hlsl`/
+`vector_min.hlsl`を実際に`fxc.exe`でコンパイルし、SHEXダンプで
+`max`/`min`が比較+分岐への分解ではなくネイティブ単一命令であることを
+確認、`BinaryOp::Max`/`BinaryOp::Min`をチェーンデコーダに追加し、
+SPIR-V生成側はGLSL.std.450拡張命令`FMax`/`FMin`として翻訳した。実GT730
+ハードウェアで256要素すべて数値一致を確認、ワークスペース全体の既存
+テストに回帰なし。**未実装(正直な開示)**: MEDの3分岐構造そのものと、
+2次元近傍参照(left/top/top-left、`x-1`/`y-1`のインデックス計算)は
+まだ手つかず。また、最難関のレンジコーダーについて、FFmpeg本家が
+要求する`VK_KHR_buffer_device_address`拡張と32レーンsubgroup shuffle
+(`SUBGROUP_FEATURE_SHUFFLE_BIT`)の両方を、この開発機のGT730が
+`vulkaninfo`で実際にサポートしていることを確認した(`subgroupSize=32`、
+FFmpegの設計と一致)。H.264/H.265/HEVCのような恒久的なハードウェアの
+壁ではなく、実装すれば動く可能性がある前向きな発見であり、次回
+セッションの具体的な着手点として記録する。
+
 **Scope note for anyone porting this project into a "run real Windows
 games on Linux" context**: kernel-level anti-cheat (Riot Vanguard,
 kernel-mode BattlEye, etc.) blocks Linux/Proton-style environments by

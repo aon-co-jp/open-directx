@@ -6,6 +6,49 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-12)**: H.264/H.265/HEVCの自前シェーダー実装
+> 可否をKhronos公式ブログとFFmpegのVulkanコンピュートシェーダー実装
+> (`cyanreg/FFmpeg` `vulkan`ブランチ)を精読して再調査し、GT730での
+> 非推奨・クローズという結論を再確認。代わりに**FFv1**(GPU/SIMD向け
+> 設計の可逆コーデック、FFmpeg本家が既にVulkanコンピュートで実装・
+> 動作実績あり)を現実的な次の目標として特定し、その第一歩として
+> MED予測器で使う比較器(`max`/`min`)命令のDXBC→SPIR-Vデコードを
+> 新規追加した(`BinaryOp::Max`/`BinaryOp::Min`、GLSL.std.450拡張命令
+> `FMax`/`FMin`として翻訳、`vector_max.hlsl`/`vector_min.hlsl`を実際に
+> `fxc.exe`でコンパイルし実GT730ハードウェアで数値検証済み)。
+> レンジコーダー(最難関)についても追加調査し、FFmpeg本家の実装が
+> 要求するBuffer Device Address(`VK_KHR_buffer_device_address`)拡張と
+> 32レーンsubgroup shuffle操作(`SUBGROUP_FEATURE_SHUFFLE_BIT`)の両方を、
+> `vulkaninfo`でこの開発機のGT730が実際にサポートしていることを確認した
+> (`subgroupSize=32`——FFmpegの設計とサイズが一致)。コアAPIバージョンは
+> 1.2.175(1.3ではない)だが、必要な機能は拡張として揃っている。**これは
+> H.264/H.265/HEVCの時のような「ハードウェアの壁」ではなく、実装すれば
+> 動く可能性がある**という前向きな発見であり、次回セッションはこの
+> subgroupカーネル自体の設計から着手できる状態にある。
+> 詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Re-investigated H.264/H.265/HEVC shader-codec feasibility
+> by reading the Khronos blog and FFmpeg's real Vulkan compute
+> implementation (`cyanreg/FFmpeg` `vulkan` branch); re-confirmed: not
+> recommended on GT730, closed. Identified **FFv1** (a GPU/SIMD-friendly
+> lossless codec, already implemented and working upstream in FFmpeg via
+> Vulkan compute) as the realistic next target, and took its first real
+> step: added DXBC→SPIR-V decoding for the comparator instructions
+> (`max`/`min`) FFv1's MED predictor needs (`BinaryOp::Max`/`BinaryOp::Min`,
+> translated to the GLSL.std.450 `FMax`/`FMin` extended instructions,
+> verified numerically on real GT730 hardware via `fxc.exe`-compiled
+> `vector_max.hlsl`/`vector_min.hlsl`). Also researched the hardest
+> remaining piece, the range coder, and confirmed via `vulkaninfo` that
+> this machine's GT730 actually supports both prerequisites FFmpeg's
+> real implementation needs: the `VK_KHR_buffer_device_address` extension
+> and 32-lane subgroup shuffle (`SUBGROUP_FEATURE_SHUFFLE_BIT`,
+> `subgroupSize=32` — matching FFmpeg's own design size). Core API
+> version is 1.2.175 (not 1.3), but the required features are present as
+> extensions. **Unlike the H.264/H.265/HEVC hardware ceiling, this is a
+> genuinely open, hopeful finding** — a working implementation may be
+> possible, and the next session can start directly on subgroup-kernel
+> design. See [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md) for details.
+
 > 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
 > aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、
 > F16/F32/F64、さらにF128まで見据えて開発する」への対応として、

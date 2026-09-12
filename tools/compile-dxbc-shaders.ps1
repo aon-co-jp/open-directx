@@ -50,6 +50,10 @@ Write-Host "OK: compiled yuv444_to_r.hlsl -> yuv444_to_r.dxbc (DXBC, SM5.0, BT.6
 Write-Host "OK: compiled yuv444_to_g.hlsl -> yuv444_to_g.dxbc (DXBC, SM5.0, BT.601 G=Y-0.344136*(U-128)-0.714136*(V-128), mad negate-operand support, 2026-09-12)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "yuv444_to_b.hlsl") /Fo (Join-Path $shaderDir "yuv444_to_b.dxbc") /nologo
 Write-Host "OK: compiled yuv444_to_b.hlsl -> yuv444_to_b.dxbc (DXBC, SM5.0, BT.601 B=Y+1.772*(U-128), 2026-09-12)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_max.hlsl") /Fo (Join-Path $shaderDir "vector_max.dxbc") /nologo
+Write-Host "OK: compiled vector_max.hlsl -> vector_max.dxbc (DXBC, SM5.0, Output=max(A,B), MED predictor comparator prototype step 1, 2026-09-12)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_min.hlsl") /Fo (Join-Path $shaderDir "vector_min.dxbc") /nologo
+Write-Host "OK: compiled vector_min.hlsl -> vector_min.dxbc (DXBC, SM5.0, Output=min(A,B), MED predictor comparator prototype step 1, 2026-09-12)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_chain3.hlsl -> vector_add_mul_div_chain3.dxbc (DXBC, SM5.0, 3 sequential ops / 3 UAVs, reg-expr chain decoder)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.hlsl") /Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxbc") /nologo

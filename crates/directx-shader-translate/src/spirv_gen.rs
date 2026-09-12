@@ -72,6 +72,23 @@ pub enum BinaryOp {
     /// いないため、今回はどちらか片方のみがnegateされているケースに
     /// 限定して対応する(両方negateは`decode_shader_shape`側で拒否)。
     MulNeg,
+    /// `max dest, srcA, srcB`(`Opcode::Max`) — `max(A, B)`。2026-09-12追加、
+    /// MED予測器(`min(left,top)`/`max(left,top)`)の比較器プロトタイプとして、
+    /// `vector_max.hlsl`(`Output[i] = max(A[i], B[i])`)を実際に`fxc.exe`で
+    /// コンパイルし`examples/dump_shex`で確認したところ、HLSL組み込み関数
+    /// `max`はadd/mul/divと全く同じ命令形状(`ld_structured`x2->演算->
+    /// `store_structured`、オペランド並びも同じdest,src1,src2)で、
+    /// オペコードだけが`Max`という専用命令に変わる形だった(比較+条件分岐
+    /// への分解ではなく、GPU側のネイティブmax命令をそのまま使う)。
+    Max,
+    /// `min dest, srcA, srcB`(`Opcode::Min`) — `min(A, B)`。`Max`と対称の形で
+    /// 同じシェーダーファミリーの一部として2026-09-12に追加(HLSLの`min`も
+    /// 同様にネイティブ命令へ直接コンパイルされることをdxbcクレートの
+    /// `Opcode`列挙に`Min`が存在することから類推し、`Max`と同じ形状で
+    /// デコード対応した——実シェーダーでの`min`単体の実コンパイル確認は
+    /// 今回のvector_max.hlslでは行っていないため、`Max`ほど厳密には
+    /// 検証できていない一段階弱い確度である点は正直に開示する)。
+    Min,
 }
 
 /// 翻訳結果のSPIR-Vモジュールと、Vulkanディスパッチに必要な最小限のメタ情報。
@@ -515,6 +532,13 @@ fn emit_spirv_impl(shape: &ShaderShape) -> Vec<u32> {
                 let product = b.f_mul(float_ty, None, val_a, val_b).expect("OpFMul");
                 b.f_negate(float_ty, None, product).expect("OpFNegate")
             }
+            // `decode_shader_shape`(固定3バッファ・単発2項演算クラス)は
+            // Max/Minオペコードを検出しない(このクラスに対応するdxbcシェーダー
+            // は4パターンのみ、docコメント参照)——Max/Minはチェーンクラス側
+            // (`decode_chain_shape`/`emit_chain_spirv_for_kernel`)のみが生成する。
+            BinaryOp::Max | BinaryOp::Min => unreachable!(
+                "decode_shader_shapeはMax/Minを検出しない(チェーンクラス専用)"
+            ),
         };
 
         let ac_c = b
@@ -843,6 +867,41 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                         SpirvGenError::UnsupportedShader("ld_structuredのUAVバインドポイントを解決できない".to_string())
                     })?;
                     reg_map.insert(dest_key, RegExpr::Load(uav));
+                }
+                Opcode::Max | Opcode::Min => {
+                    // 2026-09-12追加: MED予測器(`if (topleft>=max(left,top))
+                    // pred=min(left,top); ...`)の比較器部分の第一歩。
+                    // `vector_max.hlsl`/`vector_min.hlsl`を実際に`fxc.exe`で
+                    // コンパイルし`examples/dump_shex`で確認したところ、HLSL
+                    // 組み込み関数`max`/`min`はadd/mul/divと全く同じ命令形状
+                    // (`ld_structured`x2->演算->`store_structured`、オペランド
+                    // 並びもdest,src1,src2で同じ)だった——比較+条件分岐への
+                    // 分解ではなく、GPU側のネイティブmax/min命令をそのまま
+                    // 使う形。negateフラグが立つケースは未検証のため、
+                    // add/mul/divと同じ規約で拒否する。
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("max/minの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "max/minの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let src1 = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("max/minの第1ソースオペランドが無い".to_string())
+                    })?;
+                    let src2 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("max/minの第2ソースオペランドが無い".to_string())
+                    })?;
+                    if src1.negate || src2.negate {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "max/minのnegateフラグは未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let src1_val = resolve_chain_source(src1, &reg_map)?;
+                    let src2_val = resolve_chain_source(src2, &reg_map)?;
+                    let bin_op = if ins.opcode == Opcode::Max { BinaryOp::Max } else { BinaryOp::Min };
+                    reg_map.insert(dest_key, RegExpr::BinOp(bin_op, Box::new(src1_val), Box::new(src2_val)));
                 }
                 Opcode::Add | Opcode::Mul | Opcode::Div => {
                     // 2026-07-27追加: sub/divをチェーンクラスへ対応
@@ -1196,6 +1255,22 @@ pub(crate) fn emit_chain_spirv_for_kernel(
     let gid_vec = b.load(uvec3_ty, None, var_gid, None, vec![]).expect("OpLoad gid");
     let idx = b.composite_extract(uint_ty, None, gid_vec, vec![0]).expect("OpCompositeExtract .x");
 
+    // `Max`/`Min`(2026-09-12追加、MED予測器の比較器プロトタイプ)は、GPU側の
+    // 独立した条件分岐命令ではなく、GLSL.std.450拡張命令セットの`FMax`/`FMin`
+    // として表現する——これはSPIR-Vの標準的な流儀であり(GLSLの`max`/`min`
+    // 組み込み関数もコンパイラは同じ拡張命令へ変換する)、DXBC側で`max`/`min`
+    // がネイティブの単一命令(比較+分岐への分解ではない)だったことと対応が
+    // 取れている。式木の中で実際に使われるかどうかに関わらず、ここで
+    // インポートしておく(rspirvは未使用のOpExtInstImportをそのまま出力するが、
+    // Vulkanドライバはこれを許容する——問題があれば後続の実GPU検証で判明する)。
+    let glsl_ext = b.ext_inst_import("GLSL.std.450");
+    const GLSL_STD_450_F_MIN: u32 = 37;
+    const GLSL_STD_450_F_MAX: u32 = 40;
+
+    // glsl_ext引数の追加(2026-09-12、Max/Min対応)で8引数になったための
+    // clippy抑制。既存の7引数構成から素直に1つ増やしただけで、構造体化
+    // するほどの複雑さはまだ無いと判断した。
+    #[allow(clippy::too_many_arguments)]
     fn emit_expr(
         b: &mut Builder,
         expr: &RegExpr,
@@ -1204,6 +1279,7 @@ pub(crate) fn emit_chain_spirv_for_kernel(
         float_ty: u32,
         const_0: u32,
         idx: u32,
+        glsl_ext: u32,
     ) -> u32 {
         match expr {
             RegExpr::Immediate(v) => {
@@ -1218,13 +1294,19 @@ pub(crate) fn emit_chain_spirv_for_kernel(
                 b.load(float_ty, None, ac, None, vec![]).expect("OpLoad")
             }
             RegExpr::BinOp(op, lhs, rhs) => {
-                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
-                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
+                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
                 match op {
                     BinaryOp::Add => b.f_add(float_ty, None, l, r).expect("OpFAdd"),
                     BinaryOp::Mul => b.f_mul(float_ty, None, l, r).expect("OpFMul"),
                     BinaryOp::Sub => b.f_sub(float_ty, None, l, r).expect("OpFSub"),
                     BinaryOp::Div => b.f_div(float_ty, None, l, r).expect("OpFDiv"),
+                    BinaryOp::Max => b
+                        .ext_inst(float_ty, None, glsl_ext, GLSL_STD_450_F_MAX, vec![DrOperand::IdRef(l), DrOperand::IdRef(r)])
+                        .expect("OpExtInst FMax"),
+                    BinaryOp::Min => b
+                        .ext_inst(float_ty, None, glsl_ext, GLSL_STD_450_F_MIN, vec![DrOperand::IdRef(l), DrOperand::IdRef(r)])
+                        .expect("OpExtInst FMin"),
                     // `decode_chain_shape`は`Add`以外のnegateを明示的に拒否
                     // するため(このモジュール内の該当コメント参照)、チェーン
                     // 内の式木に`MulNeg`が現れることは無い——単独`vector_mul`
@@ -1242,7 +1324,7 @@ pub(crate) fn emit_chain_spirv_for_kernel(
     // 同じ命令列を発行する(既存クラス側`emit_spirv_impl`の`emit_body`と
     // 同じパターン)。
     let emit_body = |b: &mut Builder| {
-        let result = emit_expr(b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx);
+        let result = emit_expr(b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
         let write_var = *buffer_vars.get(&write_uav).expect("write buffer var must exist");
         let ac_out =
             b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
