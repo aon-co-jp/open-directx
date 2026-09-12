@@ -624,11 +624,19 @@ pub(crate) enum RegExpr {
     Load(u32),
     /// 2つの部分式に対する2項演算の結果。
     BinOp(BinaryOp, Box<RegExpr>, Box<RegExpr>),
+    /// シェーダー内に埋め込まれた即値定数(`l(1.402)`等、`RegisterType::
+    /// Immediate32`)。2026-09-12追加: make-diskのyuv_to_rgb変換係数
+    /// (1.402等)のような定数を式に含めるため。dxbcクレート自体は
+    /// Immediate32オペランドを既に汎用的にパース済み(`immediate_values`)
+    /// なので、ここではチェーンクラスのパターンマッチャー側に「即値も
+    /// 有効な葉ノードである」という認識を追加するだけで済む。
+    Immediate(f32),
 }
 
 /// [`RegExpr`]の木を実際に辿り、含まれる`Load`(読み込み元UAV)を出現順に集める。
 pub(crate) fn collect_loads(expr: &RegExpr, out: &mut Vec<u32>) {
     match expr {
+        RegExpr::Immediate(_) => {}
         RegExpr::Load(uav) => out.push(*uav),
         RegExpr::BinOp(_, lhs, rhs) => {
             collect_loads(lhs, out);
@@ -673,6 +681,45 @@ fn temp_key(op: &Operand, want_write: bool) -> Option<(u32, u32)> {
         }
     };
     Some((temp_index, component))
+}
+
+/// `l(1.402)`のような即値float32オペランドから、その値を取り出す。
+/// `num_components`が1の場合は`immediate_values[0]`をそのまま使い、4の場合は
+/// `components`の`Scalar(c)`選択に従う(dxbcクレートの`decode.rs`のデコード
+/// 規約: num_components==1なら1dword、それ以外〈スウィズル付き〉なら4dword
+/// 埋め込まれる)。どちらにも一致しなければ未対応として`None`を返す。
+fn immediate_scalar_value(op: &Operand) -> Option<f32> {
+    if op.reg_type != RegisterType::Immediate32 {
+        return None;
+    }
+    let raw = match (op.immediate_values.len(), op.components.clone()) {
+        (1, _) => *op.immediate_values.first()?,
+        (4, ComponentSelect::Scalar(c)) => *op.immediate_values.get(c as usize)?,
+        _ => return None,
+    };
+    Some(f32::from_bits(raw))
+}
+
+/// チェーンクラスの2項演算(add/mul/div)のソースオペランド1つを
+/// [`RegExpr`]へ解決する。一時レジスタ(既存の式)か即値定数
+/// (2026-09-12追加)のいずれかを受け付ける。
+fn resolve_chain_source(
+    op: &Operand,
+    reg_map: &HashMap<(u32, u32), RegExpr>,
+) -> Result<RegExpr, SpirvGenError> {
+    if let Some(v) = immediate_scalar_value(op) {
+        return Ok(RegExpr::Immediate(v));
+    }
+    let key = temp_key(op, false).ok_or_else(|| {
+        SpirvGenError::UnsupportedShader(
+            "add/mul/divのソースが一時レジスタのスカラー選択・対応形式の即値のいずれでもない".to_string(),
+        )
+    })?;
+    reg_map.get(&key).cloned().ok_or_else(|| {
+        SpirvGenError::UnsupportedShader(
+            "add/mul/divのソースがまだ定義されていない一時レジスタを参照している".to_string(),
+        )
+    })
 }
 
 /// 実際のSHEX命令列を、「N個の逐次2項演算(制御フロー無し)」パターンクラスと
@@ -836,22 +883,11 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                             "チェーン内でのnegateフラグはAdd(sub最適化)以外では未検証のため対応スコープ外".to_string(),
                         ));
                     }
-                    let src1_key = temp_key(src1, false).ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader(
-                            "add/mul/divの第1ソースが一時レジスタのスカラー選択ではない".to_string(),
-                        )
-                    })?;
-                    let src2_key = temp_key(src2, false).ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader(
-                            "add/mul/divの第2ソースが一時レジスタのスカラー選択ではない".to_string(),
-                        )
-                    })?;
-                    let src1_val = reg_map.get(&src1_key).cloned().ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mul/divの第1ソースがまだ定義されていない一時レジスタを参照している".to_string())
-                    })?;
-                    let src2_val = reg_map.get(&src2_key).cloned().ok_or_else(|| {
-                        SpirvGenError::UnsupportedShader("add/mul/divの第2ソースがまだ定義されていない一時レジスタを参照している".to_string())
-                    })?;
+                    // 2026-09-12: 各ソースは一時レジスタ(既存の式)か、
+                    // `l(1.402)`のような即値定数のいずれかを受け付ける
+                    // (make-diskのyuv_to_rgb変換係数対応)。
+                    let src1_val = resolve_chain_source(src1, &reg_map)?;
+                    let src2_val = resolve_chain_source(src2, &reg_map)?;
                     let expr = match ins.opcode {
                         Opcode::Add if src1.negate => RegExpr::BinOp(BinaryOp::Sub, Box::new(src2_val), Box::new(src1_val)),
                         Opcode::Add => RegExpr::BinOp(BinaryOp::Add, Box::new(src2_val), Box::new(src1_val)),
@@ -859,6 +895,47 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                         Opcode::Div => RegExpr::BinOp(BinaryOp::Div, Box::new(src1_val), Box::new(src2_val)),
                         _ => unreachable!("match arm limited to Add|Mul|Div above"),
                     };
+                    reg_map.insert(dest_key, expr);
+                }
+                Opcode::Mad => {
+                    // 2026-09-12追加: fxc.exeは`A[i] * <定数> + B[i]`のような
+                    // 掛け算+足し算をmul/add2命令ではなく単一の積和融合命令
+                    // `mad dest, src0, src1, src2`(`dest = src0*src1+src2`)へ
+                    // 最適化することを実際のコンパイル結果(vector_mul_const_add.hlsl
+                    // → vector_mul_const_add.dxbc)で確認した。これをそのまま
+                    // `Add(Mul(src0,src1), src2)`として式木に展開する
+                    // (SPIR-V生成側は既存のMul/Add処理を再利用でき、
+                    // 追加のemit_expr対応は不要)。
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("madの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "madの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let src0 = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("madの第1ソースオペランドが無い".to_string())
+                    })?;
+                    let src1 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("madの第2ソースオペランドが無い".to_string())
+                    })?;
+                    let src2 = operands.get(3).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("madの第3ソースオペランドが無い".to_string())
+                    })?;
+                    if src0.negate || src1.negate || src2.negate {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "madのnegateフラグは未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let src0_val = resolve_chain_source(src0, &reg_map)?;
+                    let src1_val = resolve_chain_source(src1, &reg_map)?;
+                    let src2_val = resolve_chain_source(src2, &reg_map)?;
+                    let expr = RegExpr::BinOp(
+                        BinaryOp::Add,
+                        Box::new(RegExpr::BinOp(BinaryOp::Mul, Box::new(src0_val), Box::new(src1_val))),
+                        Box::new(src2_val),
+                    );
                     reg_map.insert(dest_key, expr);
                 }
                 Opcode::StoreStructured => {
@@ -1111,6 +1188,12 @@ pub(crate) fn emit_chain_spirv_for_kernel(
         idx: u32,
     ) -> u32 {
         match expr {
+            RegExpr::Immediate(v) => {
+                // OpConstantを都度発行する(重複排除はrspirvのBuilderが内部で
+                // 面倒を見る前提だが、していなくても同じ定数が複数命令に
+                // 現れるだけで実行結果には影響しない)。
+                b.constant_bit32(float_ty, v.to_bits())
+            }
             RegExpr::Load(uav) => {
                 let var = *buffer_vars.get(uav).expect("buffer var must exist for every referenced UAV");
                 let ac = b.access_chain(float_ptr_uniform_ty, None, var, vec![const_0, idx]).expect("OpAccessChain");

@@ -42,6 +42,8 @@ Write-Host "OK: compiled vector_sub_bounded.hlsl -> vector_sub_bounded.dxbc (DXB
 Write-Host "OK: compiled vector_div.hlsl -> vector_div.dxbc (DXBC, SM5.0)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_chain.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_chain.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_chain.hlsl -> vector_add_mul_chain.dxbc (DXBC, SM5.0, 2 sequential ops / 3 UAVs, reg-expr chain decoder)"
+& $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_mul_const_add.hlsl") /Fo (Join-Path $shaderDir "vector_mul_const_add.dxbc") /nologo
+Write-Host "OK: compiled vector_mul_const_add.hlsl -> vector_mul_const_add.dxbc (DXBC, SM5.0, A[i]*1.402+B[i], fxc fuses this into a single `mad` instruction, RegExpr::Immediate + Opcode::Mad support, 2026-09-12)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_add_mul_div_chain3.hlsl") /Fo (Join-Path $shaderDir "vector_add_mul_div_chain3.dxbc") /nologo
 Write-Host "OK: compiled vector_add_mul_div_chain3.hlsl -> vector_add_mul_div_chain3.dxbc (DXBC, SM5.0, 3 sequential ops / 3 UAVs, reg-expr chain decoder)"
 & $fxc /T cs_5_0 /E main (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.hlsl") /Fo (Join-Path $shaderDir "vector_sub_div_add_mul_chain4.dxbc") /nologo
