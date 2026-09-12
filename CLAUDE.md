@@ -3048,3 +3048,46 @@ shaders are unverified); `open-cuda`'s f32-hardcoded buffer-size check
 for the `"vector_add"` kernel name remains as-is per this task's
 instruction not to touch `open-cuda` — a permanent fix would need a
 size-aware kernel contract there.
+
+## HANDOFF追記(2026-09-12) H.264/H.265/HEVCシェーダー実装の再調査(結論変わらず)+FFv1を現実的な次の目標として特定
+
+ユーザー指示により、Khronos公式ブログ
+(https://www.khronos.org/blog/video-encoding-and-decoding-with-vulkan-compute-shaders-in-ffmpeg)
+を精読し、世界中の言語でGoogle検索・GitHub検索・実装方法/開発方法の
+追加調査を実施した。詳細は`PORTING.md`の「H.264/H.265/HEVC shader
+feasibility research, closed; FFv1 identified as the realistic next
+target (2026-09-12)」節に英語で記録済み(既存`PORTING.md`の言語慣行に
+合わせた)。要点:
+
+- Vulkan Videoハードウェア拡張経路とVulkanコンピュートシェーダー経路は
+  別物。GT730は前者を持たない(確認済み・変更不可)が、後者は
+  Vulkan 1.3対応GPUなら専用ハードウェア無しで動く。FFmpeg 8.1の
+  FFv1/ProRes(両方向)・ProRes RAWデコード・DPXアンパックは、まさに
+  この後者のコンピュートシェーダー方式(`cyanreg/FFmpeg`の`vulkan`
+  ブランチが実物)。
+- H.264/H.265/HEVCのCABACは本質的に逐次処理であり、FFmpeg自身の
+  開発者もこの方式では手を出していない(VC-2/APVは作業中止段階)。
+  これで前回の結論(GT730でのH.264/H.265/HEVC自前シェーダー実装は
+  非推奨)が、academic研究に加えFFmpeg実装者自身の選択によっても
+  裏付けられた。**この論点はこれで完全にクローズ。**
+- 一方FFv1は、GPU/SIMD的並列性を最初から意識した設計(最大1024スライス
+  独立並列、ライン単位予測)であり、実際に上流のFFmpegが実装・動作
+  済み。**「現実的な次の目標」として特定した。**
+- 最難関はレンジコーダー(適応型エントロピー符号化)で、Khronosブログ
+  によれば32レーンの内31レーンがルックアップ/適応を並列実行し、
+  1レーンが実際のビット出力を直列に行うsubgroupトリックが必要——
+  これは既存の`yuv444_to_rgb`系カーネルとは全く異なる、新規のシェーダー
+  アーキテクチャ作業になる。
+- 現実的な段階的実装案(未着手・調査結果として記録のみ):
+  (1) MED予測器カーネル(エントロピー符号化無し、`yuv444_to_rgb`と
+  同様の単純ピクセル毎計算)、(2) RCT(可逆カラー変換)カーネル、
+  (3) レンジコーダーのsubgroupカーネル(最難関、既存コードから汎化
+  できる前例が無いため単独の調査+実装フェーズが必要)。
+
+**今回のセッションではここまで**: 調査完了・結論確定・次段階の
+スコープ設計まで。(1)のMED予測器カーネル実装自体は、比較器
+(min/max/select相当のSPIR-V命令)を`spirv_gen.rs`のデコーダに新規
+追加する必要があり、これは次回セッションで着手する実装タスクとして
+残す(本セッションでは中途半端な足場を「完成」として報告しない方針
+のため、着手するなら比較器命令のデコード追加から実GPU検証まで
+一気通貫で行う)。

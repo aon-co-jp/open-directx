@@ -600,6 +600,83 @@ was added — only new compiled shaders + real-hardware tests. This is
 strong evidence the generalized instruction-walking approach (not
 per-shape hardcoding) was the right call from the start.
 
+## H.264/H.265/HEVC shader feasibility research, closed; FFv1 identified as the realistic next target (2026-09-12)
+
+Following up on the yuv444_to_rgb prototype (see the entry above dated
+2026-09-12 in `make-disk/PORTING.md` — R/B verified on real GT730
+hardware, G verified structurally only), the user asked for a further,
+world-language (Google + GitHub, multiple languages) research pass on
+whether H.264/H.265/HEVC encoder/decoder/shader work is feasible for
+this project's target GPU (GT730), and specifically to read and follow
+up on Khronos's own blog post about FFmpeg's Vulkan compute video work.
+
+**Two distinct GPU-video mechanisms, not to be confused**:
+1. **Vulkan Video extension** (`VK_KHR_video_*`) — calls into the GPU
+   vendor's dedicated fixed-function video ASIC. No shader code runs the
+   actual codec; the chip's hardware block does it. Confirmed via
+   `vulkaninfo` earlier in this project that GT730 exposes **zero**
+   `VK_KHR_video_*` extensions — this path is closed for this GPU,
+   permanently (a driver update cannot add hardware that isn't there).
+2. **Generic Vulkan **compute shaders*** — an ordinary compute
+   dispatch, like every other kernel in this repo, implementing the
+   codec's math in GLSL/SPIR-V. This is the path Khronos's blog post
+   and FFmpeg's `cyanreg/FFmpeg` `vulkan` branch actually use, and it
+   works on any Vulkan 1.3-capable GPU including old ones like GT730 —
+   **no vendor video ASIC required**.
+
+**What the Khronos blog (["Video Encoding and Decoding with Vulkan
+Compute Shaders in FFmpeg"](https://www.khronos.org/blog/video-encoding-and-decoding-with-vulkan-compute-shaders-in-ffmpeg))
+actually says**: FFmpeg 8.1 shipped pure-compute-shader Vulkan
+encode/decode for **FFv1** (both directions), **ProRes** (both
+directions), **ProRes RAW** decode, and DPX unpacking. VC-2 and APV are
+still in progress. Crucially, the article explains *why these formats
+specifically*: they either have no entropy coder at all (ProRes, DPX)
+or an entropy coder that is line/slice-parallel by design (FFv1's range
+coder, workable via a 32-wide subgroup where 32 lanes do lookup+adapt in
+parallel while one lane serializes the actual bit output). This is the
+opposite structural shape from H.264/H.265/HEVC's CABAC, which is
+inherently one-bit-at-a-time serial with no such parallel decomposition
+— exactly the academic conclusion already recorded in this repo's
+2026-09-12 (H.264/HEVC) research entry, now independently confirmed by
+FFmpeg's own maintainers choosing not to attempt CABAC this way.
+
+**Conclusion on H.264/H.265/HEVC**: unchanged, and now doubly
+confirmed — not recommended for this project, on this GPU, via either
+mechanism. This is a closed research question.
+
+**FFv1 identified as the realistic next target, if one is wanted**:
+FFv1 is a real IETF-standardized (RFC 9043), open, royalty-free,
+mathematically lossless codec used heavily in the archival/preservation
+community (its designers explicitly optimized for GPU/SIMD-style
+parallelism from the start: up to 1024 independent slices per frame,
+line-parallel prediction). FFmpeg's `cyanreg/FFmpeg` `vulkan` branch
+(mailing-list patch series, `ffv1dec_vulkan`/`ffv1_vulkan`, landed
+2025) is real, working, upstream-track proof this is achievable on
+ordinary Vulkan 1.3 compute, no special hardware required — matching
+exactly the kind of "small kernel, grown incrementally" approach this
+repo already uses for the yuv444_to_rgb prototype.
+
+**Honest scoping of what a first step here would look like** (not yet
+started — this entry records research only, per this task's own
+instruction to research before committing to an implementation plan):
+FFv1's median/gradient (MED) spatial predictor and its RGB reversible
+color transform (RCT, `G, B-G, R-G` plus a wraparound mod so the
+transform is exactly invertible in integer arithmetic) are ordinary
+per-pixel compute-shader work, structurally similar to the
+`yuv444_to_rgb` kernels already proven here. The genuinely hard part —
+and the part FFmpeg's own developers call out as the biggest challenge
+— is the **adaptive range coder**: each symbol's each bit carries its
+own running 8-bit adaptation state, so a naive per-pixel-independent
+shader does not work; it needs the 32-wide "31 lanes help, 1 lane
+serializes" subgroup trick described above, which is real shader
+architecture work, not a simple kernel port. The realistic incremental
+path, if this is picked up: (1) MED predictor kernel first (no entropy
+coding, straightforward per-pixel like yuv444_to_rgb), verified on real
+GT730 hardware; (2) RCT kernel next; (3) the range-coder subgroup kernel
+last, as its own dedicated research-plus-implementation pass, since it
+is the one piece with no existing precedent in this repo's codebase to
+generalize from.
+
 **Scope note for anyone porting this project into a "run real Windows
 games on Linux" context**: kernel-level anti-cheat (Riot Vanguard,
 kernel-mode BattlEye, etc.) blocks Linux/Proton-style environments by
