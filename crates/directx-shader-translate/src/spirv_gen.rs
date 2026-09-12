@@ -923,13 +923,31 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                     let src2 = operands.get(3).ok_or_else(|| {
                         SpirvGenError::UnsupportedShader("madの第3ソースオペランドが無い".to_string())
                     })?;
-                    if src0.negate || src1.negate || src2.negate {
+                    // 2026-09-12追加(yuv444_to_g.hlsl実コンパイル結果で発見):
+                    // `Y - 0.344136*(U-128) - 0.714136*(V-128)`のような
+                    // 「乗算する片方のオペランドを引く」パターンでは、fxc.exeは
+                    // 別途sub命令を出さず、madの乗算オペランド(src0またはsrc1)
+                    // 自体に`negate`フラグを立てて`-(x)*y+z`として融合する。
+                    // src2(加算される側)のnegateは未確認のため引き続き拒否する。
+                    if src2.negate {
                         return Err(SpirvGenError::UnsupportedShader(
-                            "madのnegateフラグは未検証のため対応スコープ外".to_string(),
+                            "madのsrc2(加算項)のnegateフラグは未検証のため対応スコープ外".to_string(),
                         ));
                     }
-                    let src0_val = resolve_chain_source(src0, &reg_map)?;
-                    let src1_val = resolve_chain_source(src1, &reg_map)?;
+                    if src0.negate && src1.negate {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "madの乗算オペランド両方のnegateは未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let negate_expr = |e: RegExpr| RegExpr::BinOp(BinaryOp::Sub, Box::new(RegExpr::Immediate(0.0)), Box::new(e));
+                    let mut src0_val = resolve_chain_source(src0, &reg_map)?;
+                    if src0.negate {
+                        src0_val = negate_expr(src0_val);
+                    }
+                    let mut src1_val = resolve_chain_source(src1, &reg_map)?;
+                    if src1.negate {
+                        src1_val = negate_expr(src1_val);
+                    }
                     let src2_val = resolve_chain_source(src2, &reg_map)?;
                     let expr = RegExpr::BinOp(
                         BinaryOp::Add,
