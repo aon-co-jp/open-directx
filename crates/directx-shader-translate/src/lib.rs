@@ -52,6 +52,26 @@ pub use spirv_gen::{
 /// 齟齬そのものの解消ではない。
 pub const OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME: &str = "vector_add";
 
+/// 2026-09-12追加: `chain_n_buffer`/`chain_n_buffer_f32`用のカーネル名。
+///
+/// 上記`OPENCUDA_VULKAN_DISPATCH_KERNEL_NAME`(`"vector_add"`)は3バッファ
+/// 固定のカーネルにのみ使える。`yuv444_to_g`(4バッファ)や、今後のMED予測器
+/// (left/top/topleft/output、4バッファ)のような、固定本数ではない
+/// バッファ数を持つRegExprチェーンカーネルを実Vulkanで検証するために、
+/// `open-cuda`側に汎用Nバッファディスパッチの公開エントリポイント
+/// (`VulkanDevice::launch_kernel`が受理する`"chain_n_buffer"`/
+/// `"chain_n_buffer_f32"`、`opencuda-vulkan/src/real.rs`の
+/// `run_chain_n_buffer_spirv`/`ensure_chain_n_buffer_args`)を実際に追加した
+/// (本セッションで対応、以前のHANDOFFで「最優先」と記録していた課題)。
+/// 内部で使う`dispatch_spirv`自体は元々バッファ本数に汎用対応済みだった
+/// ため、追加したのはその汎用性を引き出す薄い公開関数のみ——`vector_add`/
+/// `matmul`等の既存カーネル名の挙動は一切変更していない。
+///
+/// 引数の並び: `KernelArg::Ptr`をSPIR-Vの`binding`順に並べたもの(本数は
+/// 呼び出し側が式木から実際に集めたUAVバインドポイント数)+最後に1個
+/// `KernelArg::Usize(n)`(要素数)。
+pub const OPENCUDA_VULKAN_CHAIN_KERNEL_NAME: &str = "chain_n_buffer";
+
 #[derive(Debug, Error)]
 pub enum TranslateError {
     #[error("DXBCコンテナの解析に失敗した: {0}")]

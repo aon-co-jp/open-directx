@@ -655,6 +655,27 @@ pub(crate) enum RegExpr {
     /// なので、ここではチェーンクラスのパターンマッチャー側に「即値も
     /// 有効な葉ノードである」という認識を追加するだけで済む。
     Immediate(f32),
+    /// `ge dest, srcA, srcB`(`Opcode::Ge`) — `srcA >= srcB`という**bool値**を
+    /// 生成する式。2026-09-12追加、MED予測器(`if (topleft>=max(left,top))`
+    /// 等)対応のため。`med_predictor.hlsl`を実際に`fxc.exe`でコンパイルし
+    /// `examples/dump_shex`で確認したところ、fxcはif/else if/elseの3分岐
+    /// 全体を**制御フロー(分岐)無しで**`ge`(比較)+`movc`(条件付き代入)
+    /// だけに平坦化していた——このモジュールの「制御フローを含まない
+    /// 評価式の木」という前提に、偶然にも完全に合致する形だった。
+    /// **正直な開示**: このRegExprはfloat値の式木の中に混ざるが、実際に
+    /// SPIR-Vへ翻訳できるのは`Select`の`cond`位置に直接現れる場合のみ
+    /// (`emit_expr`参照)——独立した式としてfloatの演算に混ぜて使うことは
+    /// 想定していない(そのような形は実シェーダーで確認していない)。
+    Ge(Box<RegExpr>, Box<RegExpr>),
+    /// `movc dest, cond, then, else`(`Opcode::Movc`) — `cond ? then : else`。
+    /// 2026-09-12追加。`cond`は必ず直前の`Ge`の結果を指すことを
+    /// `decode_chain_shape`側で検証済み(`Ge`以外がcondに来るケースは
+    /// 実シェーダーで確認していないため未対応として拒否する)。
+    Select {
+        cond: Box<RegExpr>,
+        then_expr: Box<RegExpr>,
+        else_expr: Box<RegExpr>,
+    },
 }
 
 /// [`RegExpr`]の木を実際に辿り、含まれる`Load`(読み込み元UAV)を出現順に集める。
@@ -665,6 +686,15 @@ pub(crate) fn collect_loads(expr: &RegExpr, out: &mut Vec<u32>) {
         RegExpr::BinOp(_, lhs, rhs) => {
             collect_loads(lhs, out);
             collect_loads(rhs, out);
+        }
+        RegExpr::Ge(lhs, rhs) => {
+            collect_loads(lhs, out);
+            collect_loads(rhs, out);
+        }
+        RegExpr::Select { cond, then_expr, else_expr } => {
+            collect_loads(cond, out);
+            collect_loads(then_expr, out);
+            collect_loads(else_expr, out);
         }
     }
 }
@@ -867,6 +897,85 @@ fn decode_chain_shape(instructions: &[Instruction]) -> Result<ChainShape, SpirvG
                         SpirvGenError::UnsupportedShader("ld_structuredのUAVバインドポイントを解決できない".to_string())
                     })?;
                     reg_map.insert(dest_key, RegExpr::Load(uav));
+                }
+                Opcode::Ge => {
+                    // 2026-09-12追加: MED予測器の比較部分。`med_predictor.hlsl`
+                    // の実SHEXダンプで確認した規約: `dest = (src1 >= src2)`
+                    // (add/mul/divの「src2 OP src1」という反転規約とは異なり、
+                    // ここはoperands[1]>=operands[2]をそのままの順で表す——
+                    // 実際に2箇所の`ge`〈`topleft>=max(left,top)`と
+                    // `min(left,top)>=topleft`〉の両方でこの順で一致することを
+                    // 確認済み)。negateフラグは未検証のため拒否する。
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("geの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "geの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let src1 = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("geの第1ソースオペランドが無い".to_string())
+                    })?;
+                    let src2 = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("geの第2ソースオペランドが無い".to_string())
+                    })?;
+                    if src1.negate || src2.negate {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "geのnegateフラグは未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let src1_val = resolve_chain_source(src1, &reg_map)?;
+                    let src2_val = resolve_chain_source(src2, &reg_map)?;
+                    reg_map.insert(dest_key, RegExpr::Ge(Box::new(src1_val), Box::new(src2_val)));
+                }
+                Opcode::Movc => {
+                    // 2026-09-12追加: MED予測器の3分岐(if/else if/else)は
+                    // fxcによって制御フロー無しの`ge`+`movc`の組み合わせへ
+                    // 平坦化される(2回のmovcが入れ子になり3方向の分岐を表現)。
+                    // オペランド並びは`movc dest, cond, then, else`
+                    // (実SHEXダンプで確認済み)。condは必ず直前に格納した
+                    // `Ge`の結果を参照する形のみ対応する(それ以外〈他の
+                    // 比較演算子や、Geを経由しない生のbool値〉は実シェーダーで
+                    // 確認していないため明示的に拒否する)。
+                    let dest = operands.first().ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("movcの書き込み先オペランドが無い".to_string())
+                    })?;
+                    let dest_key = temp_key(dest, true).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader(
+                            "movcの書き込み先が単一コンポーネントの一時レジスタではない".to_string(),
+                        )
+                    })?;
+                    let cond_op = operands.get(1).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("movcのcondオペランドが無い".to_string())
+                    })?;
+                    let then_op = operands.get(2).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("movcのthenオペランドが無い".to_string())
+                    })?;
+                    let else_op = operands.get(3).ok_or_else(|| {
+                        SpirvGenError::UnsupportedShader("movcのelseオペランドが無い".to_string())
+                    })?;
+                    if cond_op.negate || then_op.negate || else_op.negate {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "movcのnegateフラグは未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let cond_val = resolve_chain_source(cond_op, &reg_map)?;
+                    if !matches!(cond_val, RegExpr::Ge(_, _)) {
+                        return Err(SpirvGenError::UnsupportedShader(
+                            "movcのcondがGe(比較)以外の形は未検証のため対応スコープ外".to_string(),
+                        ));
+                    }
+                    let then_val = resolve_chain_source(then_op, &reg_map)?;
+                    let else_val = resolve_chain_source(else_op, &reg_map)?;
+                    reg_map.insert(
+                        dest_key,
+                        RegExpr::Select {
+                            cond: Box::new(cond_val),
+                            then_expr: Box::new(then_val),
+                            else_expr: Box::new(else_val),
+                        },
+                    );
                 }
                 Opcode::Max | Opcode::Min => {
                     // 2026-09-12追加: MED予測器(`if (topleft>=max(left,top))
@@ -1280,6 +1389,7 @@ pub(crate) fn emit_chain_spirv_for_kernel(
         const_0: u32,
         idx: u32,
         glsl_ext: u32,
+        bool_ty: u32,
     ) -> u32 {
         match expr {
             RegExpr::Immediate(v) => {
@@ -1294,8 +1404,8 @@ pub(crate) fn emit_chain_spirv_for_kernel(
                 b.load(float_ty, None, ac, None, vec![]).expect("OpLoad")
             }
             RegExpr::BinOp(op, lhs, rhs) => {
-                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
-                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
+                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
                 match op {
                     BinaryOp::Add => b.f_add(float_ty, None, l, r).expect("OpFAdd"),
                     BinaryOp::Mul => b.f_mul(float_ty, None, l, r).expect("OpFMul"),
@@ -1316,6 +1426,30 @@ pub(crate) fn emit_chain_spirv_for_kernel(
                     ),
                 }
             }
+            // `Ge`は`Select`の`cond`位置以外には現れない前提
+            // (`decode_chain_shape`のMovc処理がそう検証済み)なので、単独で
+            // ここへ来ることは無いはずだが、万一来た場合も素直にbool値を
+            // 生成する(将来Select以外の用途が実シェーダーで見つかった時に
+            // 備え、あえてunreachable!にはしない)。
+            RegExpr::Ge(lhs, rhs) => {
+                let l = emit_expr(b, lhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                let r = emit_expr(b, rhs, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                b.f_ord_greater_than_equal(bool_ty, None, l, r).expect("OpFOrdGreaterThanEqual")
+            }
+            RegExpr::Select { cond, then_expr, else_expr } => {
+                // DXBCの`movc`(分岐を伴わない条件付き代入)は、SPIR-Vの
+                // `OpSelect`(スカラー値に対する分岐無し選択)へそのまま
+                // 対応する——MEDの3分岐if/else if/elseがfxcによって制御
+                // フロー無しの形へ平坦化されていた(実SHEXダンプで確認済み)
+                // ことと表裏一体で、ここでも実際のSPIR-V分岐命令
+                // (OpBranchConditional等)は一切不要。
+                let cond_id = emit_expr(b, cond, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                let then_id =
+                    emit_expr(b, then_expr, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                let else_id =
+                    emit_expr(b, else_expr, buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
+                b.select(float_ty, None, cond_id, then_id, else_id).expect("OpSelect")
+            }
         }
     }
 
@@ -1324,7 +1458,7 @@ pub(crate) fn emit_chain_spirv_for_kernel(
     // 同じ命令列を発行する(既存クラス側`emit_spirv_impl`の`emit_body`と
     // 同じパターン)。
     let emit_body = |b: &mut Builder| {
-        let result = emit_expr(b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext);
+        let result = emit_expr(b, root, &buffer_vars, float_ptr_uniform_ty, float_ty, const_0, idx, glsl_ext, bool_ty);
         let write_var = *buffer_vars.get(&write_uav).expect("write buffer var must exist");
         let ac_out =
             b.access_chain(float_ptr_uniform_ty, None, write_var, vec![const_0, idx]).expect("OpAccessChain out");
@@ -2419,6 +2553,122 @@ fn emit_gemm2x2_spirv(uav_a: u32, uav_b: u32, uav_c: u32) -> Vec<u32> {
 
     let module = b.module();
     module.assemble()
+}
+
+// ---------------------------------------------------------------------
+// ここから先(subgroup shuffleプロトタイプ)は、DXBC翻訳とは別系統。
+// ---------------------------------------------------------------------
+//
+// **正直な開示(なぜDXBC翻訳ではないか)**: これまでのこのファイルの
+// カーネルは全て「実際にfxc.exeでコンパイルしたDXBC」から出発している。
+// しかしsubgroup操作(`OpGroupNonUniformShuffle`)には、D3D11 Compute
+// Shader(SM5.0、DXBC)側に対応する概念が無い(D3D12/SM6.0の`WaveReadLaneAt`
+// 相当がDXIL側にはあるが、本プロジェクトが対応するDXBC/SM5.0には無い)。
+// そのため、これはVulkan/SPIR-V側の概念を直接rspirvで組み立てる
+// プロトタイプであり、翻訳元DXBCは存在しない——PORTING.mdに記録した
+// 「FFv1のレンジコーダーが要求する32レーンsubgroup shuffleを、この
+// GPU(GT730)が実際にサポートしているか」を`vulkaninfo`の申告だけでなく、
+// 実際にこのプロジェクトの翻訳・ディスパッチ経路(rspirv生成+
+// `open-cuda`の`chain_n_buffer`)を通して実行できるかを検証する、第一歩。
+
+/// subgroup shuffleプロトタイプカーネル1本の情報(DXBC由来の
+/// `ChainTranslatedKernel`とは別の、専用の最小構造体)。
+#[derive(Debug, Clone)]
+pub struct SubgroupShuffleKernel {
+    pub spirv_words: Vec<u32>,
+    pub entry_point: &'static str,
+    /// 32(subgroupSize)固定。この本数を仮定しないとシャッフル先の計算が
+    /// 意味を持たない(呼び出し側は必ずこのサイズの倍数でディスパッチする
+    /// 責任を負う)。
+    pub local_size: (u32, u32, u32),
+}
+
+/// `Output[i] = Input[(i XOR 1) 内でのsubgroupシャッフル]`という最小の
+/// subgroup shuffleカーネルを直接組み立てる(GLSLで言えば
+/// `subgroupShuffle(v, gl_SubgroupInvocationID ^ 1u)`相当)。
+///
+/// レーン0とレーン1、レーン2とレーン3、…をペアにして値を交換する——
+/// FFv1のレンジコーダーが行う「32レーンの一部が並列にlookup/adaptを
+/// 行い、結果を他レーンと共有する」という操作の最小の雛形。実際の
+/// レンジコーダーの状態遷移テーブル・適応ロジックはまだ一切含まない
+/// (正直な開示: これは「subgroup shuffleがこのGPU/このプロジェクトの
+/// 翻訳経路で実際に動くか」を検証する土台であり、レンジコーダー本体の
+/// 実装ではない)。
+pub fn build_subgroup_shuffle_xor1_kernel() -> SubgroupShuffleKernel {
+    let mut b = Builder::new();
+    // `OpGroupNonUniformShuffle`はSPIR-V 1.3以降が要求する
+    // (SPIR-V仕様: group non-uniform命令群はバージョン1.3で追加)。
+    // これまでのDXBC翻訳カーネルは`set_version(1, 0)`だったため、この
+    // プロトタイプが本ファイル内で初めて1.3を要求するカーネルになる。
+    b.set_version(1, 3);
+    b.capability(spirv::Capability::Shader);
+    b.capability(spirv::Capability::GroupNonUniform);
+    b.capability(spirv::Capability::GroupNonUniformShuffle);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let float_ty = b.type_float(32, None);
+    let uint_ty = b.type_int(32, 0);
+    let uvec3_ty = b.type_vector(uint_ty, 3);
+
+    let rt_array_ty = b.type_runtime_array(float_ty);
+    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(4)]);
+    let buf_struct_ty = b.type_struct(vec![rt_array_ty]);
+    b.decorate(buf_struct_ty, spirv::Decoration::BufferBlock, vec![]);
+    b.member_decorate(buf_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let buf_ptr_ty = b.type_pointer(None, spirv::StorageClass::Uniform, buf_struct_ty);
+
+    let make_buffer_var = |b: &mut Builder, binding: u32| -> u32 {
+        let var = b.variable(buf_ptr_ty, None, spirv::StorageClass::Uniform, None);
+        b.decorate(var, spirv::Decoration::DescriptorSet, vec![DrOperand::LiteralBit32(0)]);
+        b.decorate(var, spirv::Decoration::Binding, vec![DrOperand::LiteralBit32(binding)]);
+        var
+    };
+    let var_in = make_buffer_var(&mut b, 0);
+    let var_out = make_buffer_var(&mut b, 1);
+
+    let gid_ptr_ty = b.type_pointer(None, spirv::StorageClass::Input, uvec3_ty);
+    let var_gid = b.variable(gid_ptr_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_gid, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::GlobalInvocationId)]);
+
+    let uint_ptr_input_ty = b.type_pointer(None, spirv::StorageClass::Input, uint_ty);
+    let var_lane = b.variable(uint_ptr_input_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_lane, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::SubgroupLocalInvocationId)]);
+
+    let float_ptr_uniform_ty = b.type_pointer(None, spirv::StorageClass::Uniform, float_ty);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel");
+
+    let const_0 = b.constant_bit32(uint_ty, 0);
+    let const_1 = b.constant_bit32(uint_ty, 1);
+    let scope_subgroup = b.constant_bit32(uint_ty, spirv::Scope::Subgroup as u32);
+
+    let gid_vec = b.load(uvec3_ty, None, var_gid, None, vec![]).expect("OpLoad gid");
+    let idx = b.composite_extract(uint_ty, None, gid_vec, vec![0]).expect("OpCompositeExtract .x");
+    let lane = b.load(uint_ty, None, var_lane, None, vec![]).expect("OpLoad SubgroupLocalInvocationId");
+    let partner_lane = b.bitwise_xor(uint_ty, None, lane, const_1).expect("OpBitwiseXor lane^1");
+
+    let ac_in = b.access_chain(float_ptr_uniform_ty, None, var_in, vec![const_0, idx]).expect("OpAccessChain in[idx]");
+    let value = b.load(float_ty, None, ac_in, None, vec![]).expect("OpLoad in[idx]");
+
+    let shuffled = b
+        .group_non_uniform_shuffle(float_ty, None, scope_subgroup, value, partner_lane)
+        .expect("OpGroupNonUniformShuffle");
+
+    let ac_out = b.access_chain(float_ptr_uniform_ty, None, var_out, vec![const_0, idx]).expect("OpAccessChain out[idx]");
+    b.store(ac_out, shuffled, None, vec![]).expect("OpStore out[idx]");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::GLCompute, main_fn, "main", vec![var_gid, var_lane]);
+    b.execution_mode(main_fn, spirv::ExecutionMode::LocalSize, [32, 1, 1]);
+
+    let module = b.module();
+    let spirv_words = module.assemble();
+    SubgroupShuffleKernel { spirv_words, entry_point: "main", local_size: (32, 1, 1) }
 }
 
 #[cfg(test)]

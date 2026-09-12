@@ -6,48 +6,46 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
-> 📌 **最近の更新(2026-09-12)**: H.264/H.265/HEVCの自前シェーダー実装
-> 可否をKhronos公式ブログとFFmpegのVulkanコンピュートシェーダー実装
-> (`cyanreg/FFmpeg` `vulkan`ブランチ)を精読して再調査し、GT730での
-> 非推奨・クローズという結論を再確認。代わりに**FFv1**(GPU/SIMD向け
-> 設計の可逆コーデック、FFmpeg本家が既にVulkanコンピュートで実装・
-> 動作実績あり)を現実的な次の目標として特定し、その第一歩として
-> MED予測器で使う比較器(`max`/`min`)命令のDXBC→SPIR-Vデコードを
-> 新規追加した(`BinaryOp::Max`/`BinaryOp::Min`、GLSL.std.450拡張命令
-> `FMax`/`FMin`として翻訳、`vector_max.hlsl`/`vector_min.hlsl`を実際に
-> `fxc.exe`でコンパイルし実GT730ハードウェアで数値検証済み)。
-> レンジコーダー(最難関)についても追加調査し、FFmpeg本家の実装が
-> 要求するBuffer Device Address(`VK_KHR_buffer_device_address`)拡張と
-> 32レーンsubgroup shuffle操作(`SUBGROUP_FEATURE_SHUFFLE_BIT`)の両方を、
-> `vulkaninfo`でこの開発機のGT730が実際にサポートしていることを確認した
-> (`subgroupSize=32`——FFmpegの設計とサイズが一致)。コアAPIバージョンは
-> 1.2.175(1.3ではない)だが、必要な機能は拡張として揃っている。**これは
-> H.264/H.265/HEVCの時のような「ハードウェアの壁」ではなく、実装すれば
-> 動く可能性がある**という前向きな発見であり、次回セッションはこの
-> subgroupカーネル自体の設計から着手できる状態にある。
+> 📌 **最近の更新(2026-09-12)**: H.264/H.265/HEVCの自前シェーダー実装は
+> 再調査の上で非推奨・クローズを再確認し、代わりに**FFv1**(GPU/SIMD向け
+> 設計の可逆コーデック、FFmpeg本家がVulkanコンピュートで実装・動作
+> 実績あり)を現実的な次の目標として特定、同日中に4つの実装を完成させた:
+> (1) MED予測器の比較器(`max`/`min`)を追加、(2) `open-cuda`に汎用N
+> バッファディスパッチ(`chain_n_buffer`)を追加し以前ブロックされていた
+> Gチャンネル(4バッファ)を構造検証止まりから**実GT730ハードウェアでの
+> 数値検証へ格上げ**、(3) MED予測器本体を完成——`fxc.exe`が3分岐if/else
+> if/elseを分岐命令無しで`ge`+`movc`だけに平坦化することを発見し
+> `RegExpr::Ge`/`RegExpr::Select`(SPIR-Vの`OpSelect`)を追加、3分岐全て
+> を実際に踏んだ上で実機検証、(4) レンジコーダー最難関部分の32レーン
+> subgroup shuffleを`rspirv`で直接SPIR-V化し(`OpGroupNonUniformShuffle`)、
+> `vulkaninfo`の申告を鵜呑みにせずこのプロジェクト自身の翻訳・
+> ディスパッチ経路で実際に動くことを実GT730ハードウェアで確認した。
+> ワークスペース全体で回帰無し。次にすべきことは、MEDの2次元近傍参照
+> (実画像への`x-1`/`y-1`インデックス)と、レンジコーダーの状態遷移
+> テーブル・適応ロジック本体(今回証明したのは土台のみ)。
 > 詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
 >
-> *English*: Re-investigated H.264/H.265/HEVC shader-codec feasibility
-> by reading the Khronos blog and FFmpeg's real Vulkan compute
-> implementation (`cyanreg/FFmpeg` `vulkan` branch); re-confirmed: not
-> recommended on GT730, closed. Identified **FFv1** (a GPU/SIMD-friendly
-> lossless codec, already implemented and working upstream in FFmpeg via
-> Vulkan compute) as the realistic next target, and took its first real
-> step: added DXBC→SPIR-V decoding for the comparator instructions
-> (`max`/`min`) FFv1's MED predictor needs (`BinaryOp::Max`/`BinaryOp::Min`,
-> translated to the GLSL.std.450 `FMax`/`FMin` extended instructions,
-> verified numerically on real GT730 hardware via `fxc.exe`-compiled
-> `vector_max.hlsl`/`vector_min.hlsl`). Also researched the hardest
-> remaining piece, the range coder, and confirmed via `vulkaninfo` that
-> this machine's GT730 actually supports both prerequisites FFmpeg's
-> real implementation needs: the `VK_KHR_buffer_device_address` extension
-> and 32-lane subgroup shuffle (`SUBGROUP_FEATURE_SHUFFLE_BIT`,
-> `subgroupSize=32` — matching FFmpeg's own design size). Core API
-> version is 1.2.175 (not 1.3), but the required features are present as
-> extensions. **Unlike the H.264/H.265/HEVC hardware ceiling, this is a
-> genuinely open, hopeful finding** — a working implementation may be
-> possible, and the next session can start directly on subgroup-kernel
-> design. See [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md) for details.
+> *English*: Re-confirmed H.264/H.265/HEVC shader-codec work as not
+> recommended/closed on GT730, and identified **FFv1** (a GPU/SIMD-
+> friendly lossless codec, already working upstream in FFmpeg via Vulkan
+> compute) as the realistic next target — then completed four real
+> pieces of it the same day: (1) MED predictor comparator (`max`/`min`)
+> decoding; (2) added generic N-buffer dispatch (`chain_n_buffer`) to
+> `open-cuda`, upgrading the previously-blocked 4-buffer G-channel kernel
+> from structural-only to **real numeric verification on GT730
+> hardware**; (3) the MED predictor itself, completed — discovered `fxc`
+> flattens the 3-way if/else-if/else into branch-free `ge`+`movc`, added
+> `RegExpr::Ge`/`RegExpr::Select` (SPIR-V's `OpSelect`), verified on real
+> hardware with test data that exercises all three branches; (4) proved
+> the range coder's hardest prerequisite — 32-lane subgroup shuffle —
+> actually works, by hand-building SPIR-V with `OpGroupNonUniformShuffle`
+> and dispatching it through this project's own pipeline on real GT730
+> hardware, rather than trusting `vulkaninfo`'s capability bits alone.
+> Zero regressions across the workspace. Next: MED's 2D neighbor
+> addressing (`x-1`/`y-1` indexing into an actual image buffer), and the
+> range coder's state-transition-table/adaptation logic itself (today's
+> work proved only the underlying mechanism). See
+> [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md) for details.
 
 > 📌 **最近の更新(2026-09-03)**: ユーザー指示「open-directx/open-cuda/
 > aruaru-llmで、今後32GB VRAM級のNVIDIA/AMD/Intel GPUを想定し、

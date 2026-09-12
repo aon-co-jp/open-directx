@@ -782,3 +782,110 @@ design, independent of how complete this shader-translation layer gets.
 This is not a defect to "fix" — see `CLAUDE.md`'s 2026-08-06 HANDOFF
 entry for the full honest disclosure. Titles using such anti-cheat are
 out of reach for this project regardless of translation completeness.
+
+## FFv1 progress (same day, continued): MED predictor completed end-to-end, G-channel real-GPU blocker resolved, subgroup shuffle proven on real hardware (2026-09-12)
+
+Continuing directly from the comparator (max/min) step above, three more
+real, tested pieces landed in the same session:
+
+**1. Generic N-buffer dispatch added to `open-cuda` (resolves a
+previously-recorded top-priority blocker)**. `opencuda-vulkan`'s
+internal `dispatch_spirv` was already buffer-count-generic
+(`buffers: &[vk::Buffer]`), but the only public entry points
+(`launch_kernel` dispatching by kernel name) hardcoded 3 buffers for
+`"vector_add"`. Added `"chain_n_buffer"`/`"chain_n_buffer_f32"`
+(`ensure_chain_n_buffer_args`/`run_chain_n_buffer_spirv` in
+`opencuda-vulkan/src/real.rs`) accepting any number of `KernelArg::Ptr`
+buffers followed by one `KernelArg::Usize(n)`. Purely additive — no
+existing kernel name's behavior changed. See `open-cuda/PORTING.md` for
+that repo's own record of this change.
+
+**2. `yuv444_to_g_real_vulkan.rs` upgraded from structural-only to a
+real numeric GPU test.** With the generic dispatch available, the
+4-buffer G-channel kernel (previously blocked, see the 2026-09-12
+"yuv444_to_g" entry above) now actually dispatches and **matches the
+BT.601 CPU reference across all 256 elements on real GT730 hardware**.
+This closes out the yuv444_to_rgb prototype fully — R, G, and B are now
+all real-GPU-verified, not just R and B.
+
+**3. MED predictor implemented end-to-end and real-GPU-verified.**
+Compiled `shaders/med_predictor.hlsl` (the textbook FFv1/JPEG-LS MED
+predictor: `if (topleft>=max(left,top)) pred=min(left,top); else if
+(topleft<=min(left,top)) pred=max(left,top); else pred=left+top-topleft;`)
+with real `fxc.exe` and dumped its SHEX with `examples/dump_shex`. The
+key discovery: **fxc flattens the entire 3-way if/else-if/else into
+branch-free `ge` (comparison) + `movc` (conditional move) instructions
+— there is no actual control flow in the compiled shader at all**. This
+happens to fit perfectly into this decoder's existing "control-flow-free
+expression tree" model, so no branching support was needed:
+- Added `RegExpr::Ge(lhs, rhs)` (bool-valued comparison node) and
+  `RegExpr::Select { cond, then_expr, else_expr }` (the `movc`
+  equivalent) to `spirv_gen.rs`.
+- Verified empirically (not assumed) that DXBC's `ge` instruction means
+  `dest = (src1 >= src2)` directly — the opposite convention from
+  `add`/`mul`/`div`'s "src2 OP src1" reversal — by checking both `ge`
+  instances against the known HLSL source.
+- `movc dest, cond, then, else` decodes directly to `RegExpr::Select`;
+  the decoder requires `cond` to resolve to exactly a prior `Ge` result
+  (rejects anything else as unverified, per this file's existing
+  scope-honesty convention).
+- SPIR-V emission: `Ge` → `OpFOrdGreaterThanEqual`, `Select` →
+  **`OpSelect`** (SPIR-V's own branch-free scalar select) — mirroring
+  the branch-free shape actually observed in the DXBC, not inventing an
+  `OpBranchConditional`-based decomposition.
+- New test `tests/med_predictor_real_vulkan.rs`: test data was chosen
+  to actually exercise **all three MED branches** (asserted via branch
+  counters in the test itself, not just "some passing case") — **passed
+  on real GT730 hardware**, all 256 elements matching the Rust
+  reference implementation of the MED predictor.
+- `cargo test --workspace`: full suite green, zero regressions.
+  `cargo clippy -p directx-shader-translate --all-targets -- -D
+  warnings`: clean except one pre-existing, unrelated lint in
+  `dxil.rs` (confirmed via a clean checkout diff that this session did
+  not touch that file or introduce that lint).
+
+**Honest scope still remaining for a "real" MED kernel**: this
+prototype takes left/top/topleft as three pre-sliced flat buffers (the
+same simplification `yuv444_to_rgb` used for Y/U/V) — actual 2D image
+neighbor addressing (`x-1`/`y-1` index arithmetic into a single 2D
+image bubuffer) is not implemented. That remains the next real step
+before this is a MED kernel usable on an actual image plane.
+
+**4. Range coder prerequisite proven on real hardware, not just
+`vulkaninfo`-confirmed.** Built a standalone SPIR-V kernel directly via
+`rspirv` (there is no DXBC/SM5.0 equivalent of subgroup operations to
+translate from — D3D12/SM6.0's `WaveReadLaneAt` is the closest DXIL
+analog, out of this crate's DXBC scope — so this is hand-built SPIR-V,
+not a DXBC translation) using `OpGroupNonUniformShuffle` (SPIR-V 1.3,
+`GroupNonUniform`+`GroupNonUniformShuffle` capabilities) to swap values
+between lane `2k` and lane `2k+1` within each 32-wide subgroup.
+`tests/subgroup_shuffle_real_vulkan.rs`: **passed on real GT730
+hardware**, all 64 test elements (2 workgroups of 32) showing exactly
+the expected lane-swap pattern, dispatched through the same
+`chain_n_buffer` generic path added in item 1. This directly confirms
+— through this project's own translation-and-dispatch pipeline, not
+merely a capability-bit query — that the core mechanism FFv1's range
+coder needs (32-lane subgroup shuffle) actually works on this GPU.
+
+**日本語(要約)**: 同日中にさらに3つの実装を完成させた。(1)
+`open-cuda`に汎用Nバッファディスパッチ(`chain_n_buffer`)を追加し、
+以前「最優先」と記録していたブロッカーを解消。(2)これによりGチャンネル
+(4バッファ)を構造検証止まりから**実GT730ハードウェアでの数値検証
+(256/256要素一致)へ格上げ**——yuv444_to_rgbプロトタイプがR/G/B全て
+実機検証済みになった。(3)MED予測器を実装——fxc.exeが3分岐if/else
+if/elseを**分岐命令を一切使わず**`ge`(比較)+`movc`(条件付き代入)へ
+平坦化することを実SHEXダンプで発見し、`RegExpr::Ge`/`RegExpr::Select`
+(SPIR-Vの`OpSelect`、分岐無し)を追加。新規テストは3分岐すべてを
+実際に踏んだ上で**実GT730ハードウェアで256要素すべて数値一致**。
+未実装として正直に開示: 実画像の2次元近傍参照(`x-1`/`y-1`)は今回も
+対象外(yuv444_to_rgbと同じ簡略化)。(4)レンジコーダーの核心である
+32レーンsubgroup shuffleを、`rspirv`で直接組み立てたSPIR-V
+(`OpGroupNonUniformShuffle`)として実装し、**実GT730ハードウェアで
+期待通りのレーン交換を確認**——`vulkaninfo`の申告を鵜呑みにせず、
+このプロジェクト自身の翻訳・ディスパッチ経路で裏付けた。
+ワークスペース全体で回帰無し。
+
+**次にすべきこと**: (a) MEDの2次元近傍参照(実画像バッファへの
+`x-1`/`y-1`インデックス計算)、(b) レンジコーダーの状態遷移テーブル・
+適応ロジック本体(今回証明したのはあくまで「32レーンが値を交換できる」
+という土台のみ、実際の適応型エントロピー符号化はまだ手つかず)。
