@@ -21,6 +21,12 @@ dxbc = "0.1.0"
 llvm-bitcode = "0.4.0"
 rspirv = "0.13.0"
 thiserror = "1"
+# 2026-09-13追加: `range_coder`モジュールのCPU側バッチlookup
+# (`gather_u8_avx2`)に使う。sibling-repo-under-`F:\runo`規約
+# (`aruaru-db`の`rust-json`/`aruaru-llm`の`open-cpu`と同じ)、この
+# クレートは`open-cuda`と違い2階層深い(`open-directx/crates/
+# directx-shader-translate/`)ため`../../../open-cpu`。
+open-cpu = { path = "../../../open-cpu" }
 
 [dev-dependencies]
 # open-cudaへのcross-repo path依存(aruaru-dbのopen_raid_z_coreパターンに準拠)。

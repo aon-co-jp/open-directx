@@ -6,6 +6,23 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き3)**: `open-cpu`のAVX2 gather
+> (`gather_u8_avx2`)を`range_coder.rs`本体へ実際に統合した——
+> `decode_context_batch_cpu_simd`が、複数コンテキストの状態遷移
+> テーブル引きをAVX2 gatherでバッチ化(並列lookup相当)した後、
+> 1本の共有レンジコーダーで逐次コミットする、GPU並列版と同じ構造の
+> CPU実装。新規テストが既存の逐次版と40コンテキストで完全一致。
+> 詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Actually integrated `open-cpu`'s AVX2 gather
+> (`gather_u8_avx2`) into `range_coder.rs` itself —
+> `decode_context_batch_cpu_simd` batches the state-transition-table
+> lookups for multiple contexts via AVX2 gather (the parallel-lookup
+> step), then commits them serially through one shared range coder —
+> the same structure as the GPU parallel kernel, on CPU SIMD. New test
+> matches the existing sequential path exactly across 40 contexts. See
+> [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き2)**: レンジコーダーの並列レーン数を
 > `vulkaninfo`が実際に申告するこのGPUの上限そのもの——**1536**——まで
 > 拡張し、実GT730ハードウェア上でCPU参照実装と完全一致することを

@@ -3307,3 +3307,15 @@ vulkan/rangecoder.glsl`)を実際にfetchして読んだ。詳細は`PORTING.md`
   詳細は`open-cpu`側のHANDOFF参照。`range_coder.rs`本体への統合は未実施。
 
 `cargo test --workspace`: 全緑。README/PORTINGに日英併記で記録。
+
+## HANDOFF追記(2026-09-13続き4) open-cpuのAVX2 gatherをrange_coder.rs本体へ統合
+
+前回「未実施」としていた統合作業を実施した。`directx-shader-translate/
+Cargo.toml`に`open-cpu`を通常依存として追加(`../../../open-cpu`)、
+`range_coder.rs`に`decode_context_batch_cpu_simd`(AVX2 gatherで
+複数コンテキストの状態遷移テーブル引きをバッチ化し、1本の共有
+`RangeDecoderCpu`で逐次コミットする、GPU並列版と同じ「並列lookup+
+逐次commit」構造のCPU実装)を追加。新規単体テストが既存の逐次版と
+40コンテキストで完全一致することを確認。詳細は`PORTING.md`参照。
+
+`cargo test --workspace`: 全緑(70件)。README/PORTINGに日英併記で記録。

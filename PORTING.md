@@ -1322,3 +1322,36 @@ the natural next integration step, not done this session.
 実行検証済み、256/512要素テーブルでスカラー参照実装と完全一致。
 `range_coder.rs`本体への統合(実際にCPUフォールバック経路として使う)は
 未実施——次の自然な統合ステップとして記録する。
+
+## `open-cpu`のAVX2 gatherをrange_coder.rs本体へ実際に統合(2026-09-13、続き)
+
+前回「`gather_u8_avx2`を`range_coder.rs`本体へ統合する作業は未実施」
+と記録した項目に対応した。`directx-shader-translate`の`Cargo.toml`に
+`open-cpu`を通常の依存として追加(`../../../open-cpu`、`open-cuda`と
+同じsibling-repo-under-`F:\runo`規約、2階層深い分パスが1段長い)。
+
+- `RangeDecoderCpu::get_rac_with_precomputed_next_states`: 既存の
+  `get_rac`と全く同じ算術だが、`zero[state]`/`one[state]`のテーブル
+  引きを外部から渡された値として受け取る(テーブル引きとレンジコーダー
+  算術を分離)。
+- `decode_context_batch_cpu_simd(bytes, states)`: 複数コンテキストの
+  現在状態から、`open_cpu::gather_u8`(AVX2 gather、この開発機で
+  実行される)で`zero_next`/`one_next`をまとめて事前計算し
+  (**並列lookup相当**)、その後1本の共有`RangeDecoderCpu`を
+  コンテキスト0から順に適用する(**逐次commit相当**)——GPU側の
+  `build_range_decoder_parallel_kernel`(ワークグループ共有メモリ+
+  バリア)と全く同じ「並列lookup+逐次commit」構造をCPU-SIMDで実装。
+- 新規単体テスト`decode_context_batch_cpu_simd_matches_sequential_get_rac_per_context`:
+  40コンテキストについて、AVX2 gatherバッチ版が既存の逐次版
+  (`get_rac`をコンテキストごとに順に呼ぶ)と復号ビット・最終状態の
+  両方で完全一致することを確認。
+
+`cargo test --workspace`: 全緑(70件、up from 69)。`cargo clippy -p
+directx-shader-translate --all-targets -- -D warnings`: 既存の無関係な
+`dxil.rs`1件を除きクリーン。
+
+**正直な開示**: このCPU実装はGPU版と同じアルゴリズム構造だが、実際に
+GPU版の結果と直接突き合わせるテストは無い(別クレート・別バイナリの
+実行環境をまたぐため)——両方とも同じ`one_state`/`zero_state`/
+`RangeDecoderCpu`という共通の正しさの基準(CPU参照実装)と個別に
+一致することを、それぞれ確認している。

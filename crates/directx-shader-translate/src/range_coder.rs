@@ -109,6 +109,75 @@ impl<'a> RangeDecoderCpu<'a> {
         self.refill();
         bit
     }
+
+    /// [`get_rac`]と全く同じ算術だが、`zero[*state]`/`one[*state]`の
+    /// テーブル引きを呼び出し側から**事前に計算済みの値**として受け取る
+    /// (2026-09-13追加)。[`decode_context_batch_cpu_simd`]がAVX2の
+    /// gather命令で複数コンテキスト分の`zero_next`/`one_next`をまとめて
+    /// 引いた上で、この関数で実際のレンジコーダー算術(逐次・状態依存)
+    /// だけを1コンテキストずつ適用するために使う——テーブル引きと
+    /// レンジコーダー算術を分離したのは、テーブル引きだけがAVX2
+    /// gatherでバッチ化できる部分だから。
+    fn get_rac_with_precomputed_next_states(&mut self, state: &mut u8, zero_next: u8, one_next: u8) -> u32 {
+        let rangeoff = (self.range * (*state as u32)) / 256;
+        let range_after = self.range - rangeoff;
+        let bit = if self.low < range_after {
+            self.range = range_after;
+            *state = zero_next;
+            0
+        } else {
+            self.low -= range_after;
+            self.range = rangeoff;
+            *state = one_next;
+            1
+        };
+        self.refill();
+        bit
+    }
+}
+
+/// [`RangeDecoderCpu::get_rac`]を`states.len()`個のコンテキストへ順に
+/// 適用する(共有の1本のバイトストリームを、コンテキスト0から順に
+/// 使う——`spirv_gen`側の`build_range_decoder_parallel_kernel`が
+/// ワークグループ共有メモリ+バリアで行うのと全く同じ意味論)を、
+/// **AVX2のgather命令でテーブル引きをバッチ化した**CPU実装で行う
+/// (2026-09-13追加、`open-cpu::gather_u8_avx2`との連携)。
+///
+/// GPU版が「Nレーンのinvocationが並列に自分のコンテキストの状態を
+/// テーブルから読み、1レーンだけが逐次のレンジコーダー算術を行う」
+/// のに対し、この関数は「AVX2のgatherが8個ずつまとめてテーブルを読み、
+/// 1個のスカラーループが逐次のレンジコーダー算術を行う」という、
+/// 同じ「並列lookup+逐次commit」構造をCPU-SIMDで実装したもの。
+///
+/// **正直な開示(この分離の限界)**: 各コンテキストの`state`が実際に
+/// 更新されるのは「そのコンテキストのビットが確定した後」なので、
+/// 次に必要になる`zero_next`/`one_next`(=`zero[state]`/`one[state]`)は
+/// **今回のビットが確定する前の`state`**に対して事前に計算できる
+/// (このバッチでは各コンテキストを1回しか処理しないため、次回の
+/// ループのためのgatherは無い——`decode_context_batch_cpu_simd`は
+/// 1回のバッチ〈全コンテキストを1回ずつ〉のみを実装しており、複数
+/// バッチにまたがる継続的なストリーム処理は呼び出し側の責任とする)。
+pub fn decode_context_batch_cpu_simd(bytes: &[u8], states: &mut [u8]) -> Vec<u32> {
+    let one = one_state();
+    let zero = zero_state();
+
+    // 並列lookup相当: 全コンテキストの「現在の」状態から、bit=0/1
+    // それぞれの場合の次状態をAVX2 gatherでまとめて引いておく
+    // (実際にどちらを使うかは、各コンテキストのビットが逐次確定した
+    // 後にしか分からないため、両方を先読みする)。
+    let indices: Vec<u32> = states.iter().map(|&s| s as u32).collect();
+    let zero_next_batch = open_cpu::gather_u8(&zero, &indices);
+    let one_next_batch = open_cpu::gather_u8(&one, &indices);
+
+    // 逐次commit相当: 1本の共有RangeDecoderCpuを、コンテキスト0から
+    // 順に適用する。
+    let mut dec = RangeDecoderCpu::new(bytes);
+    let mut bits = Vec::with_capacity(states.len());
+    for i in 0..states.len() {
+        let bit = dec.get_rac_with_precomputed_next_states(&mut states[i], zero_next_batch[i], one_next_batch[i]);
+        bits.push(bit);
+    }
+    bits
 }
 
 // ---------------------------------------------------------------------
@@ -682,5 +751,30 @@ mod tests {
             bits2.push(dec2.get_rac(&mut state2, &one, &zero));
         }
         assert_eq!(bits, bits2, "get_racは同じ入力に対して決定的であるべき");
+    }
+
+    #[test]
+    fn decode_context_batch_cpu_simd_matches_sequential_get_rac_per_context() {
+        // decode_context_batch_cpu_simd(AVX2 gatherでテーブル引きを
+        // バッチ化した経路)が、既存のget_rac(状態遷移テーブルを毎回
+        // スカラーで引く経路)をコンテキスト0から順に適用した結果と
+        // 完全に一致することを確認する——`open-directx`のGPU並列版
+        // テスト(`range_decoder_parallel_real_vulkan.rs`)と全く同じ
+        // 検証パターンをCPU側で行うもの。
+        let bytes: Vec<u8> = (0..64u32).map(|i| ((i * 29 + 7) % 256) as u8).collect();
+        let initial_states: Vec<u8> = (0..40usize).map(|i| (15 + (i * 61) % 226) as u8).collect();
+
+        let one = one_state();
+        let zero = zero_state();
+        let mut sequential_states = initial_states.clone();
+        let mut sequential_dec = RangeDecoderCpu::new(&bytes);
+        let sequential_bits: Vec<u32> =
+            sequential_states.iter_mut().map(|s| sequential_dec.get_rac(s, &one, &zero)).collect();
+
+        let mut simd_states = initial_states.clone();
+        let simd_bits = decode_context_batch_cpu_simd(&bytes, &mut simd_states);
+
+        assert_eq!(simd_bits, sequential_bits, "AVX2 gatherバッチ版は逐次版と同じビット列を生成するべき");
+        assert_eq!(simd_states, sequential_states, "AVX2 gatherバッチ版は逐次版と同じ最終状態になるべき");
     }
 }
