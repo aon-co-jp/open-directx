@@ -3218,3 +3218,43 @@ directx-shader-translate --all-targets -- -D warnings`: 既存の無関係な
 土台を組み合わせる本番の設計・実装)、(2) MEDの2次元近傍参照
 (整数演算+実分岐を扱う新しいデコーダサブシステムが必要、実SHEX形状は
 調査済み)、(3) `put_symbol`/`get_symbol`(FFv1ビットストリーム層本体)。
+
+## HANDOFF追記(2026-09-13) レンジコーダー32レーン並列化を実装(前回のsubgroup shuffle前提は誤りと判明・訂正)+64レーンへ拡張成功
+
+前回HANDOFF(get_rac本体の1invocation逐次実装)からの続き。ユーザー
+指示により、世界中の言語でのGoogle/GitHub追加調査でFFmpeg本家の実
+ソース(`https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/
+vulkan/rangecoder.glsl`)を実際にfetchして読んだ。詳細は`PORTING.md`
+の該当節参照。要点:
+
+- **重要な訂正**: 前回「32レーンsubgroup shuffleで並列化される」と
+  記録したが誤りだった。実際の機構は**ワークグループ共有メモリ
+  (`shared`)+`barrier()`**であり、`OpGroupNonUniformShuffle`は
+  FFv1のレンジコーダーでは使われていない。前回の`subgroup_shuffle_
+  real_vulkan.rs`(GT730が`OpGroupNonUniformShuffle`をサポートする
+  ことの実証)自体は無駄ではないが、FFv1の実際の機構ではなかったと
+  正直に訂正する。
+- 実際の機構(共有メモリ+バリア)に忠実な
+  `range_coder::build_range_decoder_parallel_kernel(context_size)`を
+  新規実装: 全invocationが並列に自分のコンテキスト状態を共有メモリへ
+  書く→バリア→lane0だけが逐次`get_rac`を実行(共有メモリを読み書き)
+  →バリア→全invocationが並列に結果を書き戻す。
+- 新規テスト`tests/range_decoder_parallel_real_vulkan.rs`: 32個の
+  異なる初期状態を持つコンテキストが、**実GT730ハードウェア上で
+  CPU参照実装と復号ビット・最終状態の両方で完全一致**。
+- **ユーザーのロードマップ指示(「32レーン成功後は64レーンに挑戦」)
+  に対応**: `context_size`をパラメータ化し、64レーン版のテスト
+  (`tests/range_decoder_parallel_64_real_vulkan.rs`)を追加。この
+  カーネルはワークグループバリアのみに依存しsubgroup幅固有の命令を
+  使わないため、GT730のsubgroup幅(32)を超えるワークグループサイズ
+  でも理論上動くはずという仮説を実際に検証し、**64レーンでも実GT730
+  ハードウェア上で完全一致**することを確認した。
+
+`cargo test --workspace`: 全緑、回帰無し。`cargo clippy`: 既存の
+無関係な`dxil.rs`1件を除きクリーン。README/PORTINGにも日英併記で記録。
+
+**未実装として正直に開示**: `put_symbol`/`get_symbol`(FFv1本体の
+コンテキスト選択ポリシー)は未実装。速度計測(共有メモリ+バリア方式が
+このGPUで実際に逐次版より速いかどうか)も未実施——今回の目標は
+正しさの検証のみ。MEDの2次元近傍参照は引き続き次回持ち越し
+(前々回のHANDOFFで調査結果を記録済み)。

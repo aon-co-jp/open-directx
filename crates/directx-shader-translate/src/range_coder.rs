@@ -339,6 +339,310 @@ pub fn build_range_decoder_kernel(initial_state: u32, num_symbols: u32) -> Range
     RangeDecoderKernel { spirv_words, entry_point: "main", local_size: (1, 1, 1) }
 }
 
+// ---------------------------------------------------------------------
+// ここから先: 32レーン並列化版。FFmpeg本家の実ソース
+// (`https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/vulkan/
+// rangecoder.glsl`、2026-09-13に実際にfetchして読んだ)を確認したところ、
+// **当初の想定(subgroup shuffle)は誤りだった**——実際の機構は
+// `shared`(GLSLのworkgroup共有メモリ、SPIR-Vの`Workgroup`ストレージ
+// クラス)+`barrier()`(`OpControlBarrier`)であり、`subgroupShuffle`
+// (`OpGroupNonUniformShuffle`)は一切使われていない。
+//
+// 実際のFFmpegソースの構造(`rangecoder.glsl`より):
+// ```glsl
+// shared RangeCoder rc;                       // ワークグループ共有、単一
+// shared uint8_t rc_state[NB_CONTEXTS*32];     // ワークグループ共有、32要素
+// bool get_rac_state(uint idx) {               // 呼び出し側(1invocation)が
+//     return rc_data[idx] = get_rac_internal(rc.range * rc_state[idx] >> 8);
+// }
+// ```
+// つまり「32個のコンテキストのlookup/adapt」は、32本のinvocationが
+// `rc_state[gl_LocalInvocationIndex] = ...`という形で**それぞれ自分の
+// 担当インデックスへ並列に書き込み**、`barrier()`で同期した後、
+// 1本のinvocation(通常invocation 0)だけが`rc_state[]`を順番に読んで
+// 実際のレンジコーダー逐次更新(`rc.low`/`rc.range`)を行う、という
+// **共有メモリ+バリア**方式だった——`subgroupShuffle`のような
+// レーン間直接データ交換命令は不要だった。
+//
+// 前回実装した`subgroup_shuffle_real_vulkan.rs`のsubgroup shuffle検証
+// 自体は無駄ではない(GT730が`OpGroupNonUniformShuffle`を実際にサポート
+// することを実証した、独立して価値のある結果)が、**FFv1のレンジ
+// コーダーが実際に使う機構ではなかった**、という正直な訂正を
+// `PORTING.md`/`CLAUDE.md`にも記録する。
+//
+// 以下は、この実際の機構(共有メモリ+バリア)に忠実な32レーン並列化
+// カーネル。`build_range_decoder_kernel`(1invocation逐次版)と
+// `build_subgroup_shuffle_xor1_kernel`で検証済みの個別要素を、実際の
+// FFmpeg設計に合わせて組み合わせ直したもの。
+
+/// [`build_range_decoder_parallel_kernel`]が返すカーネル情報。
+#[derive(Debug, Clone)]
+pub struct ParallelRangeDecoderKernel {
+    pub spirv_words: Vec<u32>,
+    pub entry_point: &'static str,
+    /// `(context_size, 1, 1)`——呼び出し側が指定した`context_size`
+    /// (FFmpeg実装での定数名`CONTEXT_SIZE`、本家は32固定)をそのまま
+    /// 使う。ワークグループ共有メモリ+バリアのみに依存する設計のため、
+    /// GPUのsubgroup幅(GT730では32)を超える値でも正しく動く
+    /// (2026-09-13、64での実機検証済み)。
+    pub local_size: (u32, u32, u32),
+}
+
+/// FFmpeg本家`rangecoder.glsl`の`shared`+`barrier()`方式に倣った、
+/// `context_size`個のコンテキスト分の`get_rac`を1回のディスパッチで
+/// 処理するカーネル。
+///
+/// バッファ配線(いずれも`u32`配列):
+/// - binding 0: `bytestream`(先頭2要素が初期`low`)
+/// - binding 1: `zero_one_state`(512要素——`[0..256)`が`zero_state`、
+///   `[256..512)`が`one_state`、FFmpeg実ソースと同じ1本化レイアウト)
+/// - binding 2: `context_states`(`context_size`要素、各コンテキストの
+///   現在状態。読み込み+このディスパッチ後の状態で上書き)
+/// - binding 3: `output`(`context_size`要素、復号されたビット列)
+///
+/// アルゴリズム(`context_size`個のinvocationで1ワークグループ、
+/// `local_size=(context_size,1,1)`):
+/// 1. 各invocationが自分の`gl_LocalInvocationIndex`に対応する
+///    `context_states[lane]`を読み、`shared`配列の同じインデックスへ
+///    書く(**並列のlookup**、FFmpegの`rc_state[idx]=...`相当)。
+/// 2. `OpControlBarrier`(Workgroupスコープ)で同期。
+/// 3. `lane==0`のinvocationだけが、`shared`配列を`i=0..context_size-1`
+///    の順で読み、実際の`get_rac`逐次更新(`low`/`range`/`pos`、
+///    `RangeDecoderCpu`と全く同じ式)を行い、更新後の状態を同じ
+///    `shared`配列へ書き戻し、復号ビットを`output[i]`へ書く
+///    (**1レーンだけが実際の直列処理**、FFmpegの「1invocationが実
+///    エンコード/デコードを行う」設計と対応)。
+/// 4. 再度`OpControlBarrier`。
+/// 5. 各invocationが`shared`配列の自分のインデックスを読み、
+///    `context_states[lane]`へ書き戻す(**並列の書き戻し**)。
+///
+/// **2026-09-13追加(64コンテキスト版の検証)**: FFmpeg本家の
+/// `CONTEXT_SIZE`は32(GT730のsubgroupSizeと同じ)固定だが、この
+/// カーネルが実際に使っているのは`Workgroup`共有メモリ+
+/// `OpControlBarrier`のみで、subgroup幅に依存する命令
+/// (`OpGroupNonUniformShuffle`等)は一切使っていない——ワークグループ
+/// バリアはワークグループ内の全invocationを対象にでき、GPUのsubgroup幅
+/// (32)を超えるワークグループサイズ(例: 64、内部的に2 subgroup分)でも
+/// 正しく機能する。そのため`context_size`を32以外(64等)にしても
+/// アルゴリズム上の変更は不要で、`local_size`と`shared`配列長・
+/// ループ回数を`context_size`に合わせるだけで良いことを、実際に
+/// `context_size=64`の実GPUテストで検証した(下記テスト参照)。
+pub fn build_range_decoder_parallel_kernel(context_size: u32) -> ParallelRangeDecoderKernel {
+    let mut b = Builder::new();
+    b.set_version(1, 0);
+    b.capability(spirv::Capability::Shader);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+
+    let void_ty = b.type_void();
+    let voidf_ty = b.type_function(void_ty, vec![]);
+    let uint_ty = b.type_int(32, 0);
+    let bool_ty = b.type_bool();
+
+    // storage buffer群(vector_add系と同じBufferBlock+runtime array)。
+    let rt_array_ty = b.type_runtime_array(uint_ty);
+    b.decorate(rt_array_ty, spirv::Decoration::ArrayStride, vec![DrOperand::LiteralBit32(4)]);
+    let buf_struct_ty = b.type_struct(vec![rt_array_ty]);
+    b.decorate(buf_struct_ty, spirv::Decoration::BufferBlock, vec![]);
+    b.member_decorate(buf_struct_ty, 0, spirv::Decoration::Offset, vec![DrOperand::LiteralBit32(0)]);
+    let buf_ptr_ty = b.type_pointer(None, spirv::StorageClass::Uniform, buf_struct_ty);
+    let uint_ptr_uniform_ty = b.type_pointer(None, spirv::StorageClass::Uniform, uint_ty);
+
+    let make_buffer_var = |b: &mut Builder, binding: u32| -> u32 {
+        let var = b.variable(buf_ptr_ty, None, spirv::StorageClass::Uniform, None);
+        b.decorate(var, spirv::Decoration::DescriptorSet, vec![DrOperand::LiteralBit32(0)]);
+        b.decorate(var, spirv::Decoration::Binding, vec![DrOperand::LiteralBit32(binding)]);
+        var
+    };
+    let var_bytestream = make_buffer_var(&mut b, 0);
+    let var_zero_one_state = make_buffer_var(&mut b, 1);
+    let var_context_states = make_buffer_var(&mut b, 2);
+    let var_output = make_buffer_var(&mut b, 3);
+
+    // ワークグループ共有メモリ(GLSLの`shared`、SPIR-Vの`Workgroup`
+    // ストレージクラス)。固定長32要素の`OpTypeArray`(runtime arrayでは
+    // 使えない——Workgroupストレージクラスは固定長配列のみ許可)。
+    let const_32_len = b.constant_bit32(uint_ty, context_size);
+    let shared_array_ty = b.type_array(uint_ty, const_32_len);
+    let shared_ptr_ty = b.type_pointer(None, spirv::StorageClass::Workgroup, shared_array_ty);
+    let var_shared_state = b.variable(shared_ptr_ty, None, spirv::StorageClass::Workgroup, None);
+    let uint_ptr_workgroup_ty = b.type_pointer(None, spirv::StorageClass::Workgroup, uint_ty);
+
+    // gl_LocalInvocationIndex(ワークグループ内でのフラット化された
+    // invocation番号——`local_size=(32,1,1)`ならそのまま0..31)。
+    let uint_ptr_input_ty = b.type_pointer(None, spirv::StorageClass::Input, uint_ty);
+    let var_lane = b.variable(uint_ptr_input_ty, None, spirv::StorageClass::Input, None);
+    b.decorate(var_lane, spirv::Decoration::BuiltIn, vec![DrOperand::BuiltIn(spirv::BuiltIn::LocalInvocationIndex)]);
+
+    let uint_ptr_function_ty = b.type_pointer(None, spirv::StorageClass::Function, uint_ty);
+
+    let main_fn = b.begin_function(void_ty, None, spirv::FunctionControl::NONE, voidf_ty).expect("OpFunction");
+    b.begin_block(None).expect("OpLabel entry");
+
+    let const_0 = b.constant_bit32(uint_ty, 0);
+    let const_1 = b.constant_bit32(uint_ty, 1);
+    let const_2 = b.constant_bit32(uint_ty, 2);
+    let const_8 = b.constant_bit32(uint_ty, 8);
+    let const_256 = b.constant_bit32(uint_ty, 256);
+    let const_0xff00 = b.constant_bit32(uint_ty, 0xFF00);
+    let const_32 = b.constant_bit32(uint_ty, context_size);
+    let scope_workgroup = b.constant_bit32(uint_ty, spirv::Scope::Workgroup as u32);
+    let semantics_release_workgroup =
+        b.constant_bit32(uint_ty, (spirv::MemorySemantics::ACQUIRE_RELEASE | spirv::MemorySemantics::WORKGROUP_MEMORY).bits());
+
+    // Function storage classのローカル変数(このinvocationがlane==0の
+    // 場合にのみ実際に使う逐次状態)は、規約通りエントリブロック先頭で
+    // まとめて宣言する。
+    let var_i = b.variable(uint_ptr_function_ty, None, spirv::StorageClass::Function, None);
+    let var_low = b.variable(uint_ptr_function_ty, None, spirv::StorageClass::Function, None);
+    let var_range = b.variable(uint_ptr_function_ty, None, spirv::StorageClass::Function, None);
+    let var_pos = b.variable(uint_ptr_function_ty, None, spirv::StorageClass::Function, None);
+
+    // --- ステップ1: 32レーン並列lookup(自分のcontext_statesを共有配列へ) ---
+    let lane = b.load(uint_ty, None, var_lane, None, vec![]).expect("load lane");
+    let ac_ctx_in = b.access_chain(uint_ptr_uniform_ty, None, var_context_states, vec![const_0, lane]).expect("context_states[lane]");
+    let my_initial_state = b.load(uint_ty, None, ac_ctx_in, None, vec![]).expect("load context_states[lane]");
+    let ac_shared_in = b.access_chain(uint_ptr_workgroup_ty, None, var_shared_state, vec![lane]).expect("shared_state[lane] (write)");
+    b.store(ac_shared_in, my_initial_state, None, vec![]).expect("store shared_state[lane]");
+
+    // --- ステップ2: バリア ---
+    b.control_barrier(scope_workgroup, scope_workgroup, semantics_release_workgroup).expect("OpControlBarrier #1");
+
+    // --- ステップ3: lane==0のみ、32回分を逐次処理 ---
+    let is_lane0 = b.i_equal(bool_ty, None, lane, const_0).expect("lane == 0");
+    let then_label = b.id();
+    let after_serial_label = b.id();
+    b.selection_merge(after_serial_label, spirv::SelectionControl::NONE).expect("OpSelectionMerge lane0");
+    b.branch_conditional(is_lane0, then_label, after_serial_label, vec![]).expect("OpBranchConditional lane0");
+
+    b.begin_block(Some(then_label)).expect("OpLabel then (lane0)");
+    // low = (byte[0]<<8)|byte[1]; range=0xFF00; pos=2; i=0;
+    let ac_b0 = b.access_chain(uint_ptr_uniform_ty, None, var_bytestream, vec![const_0, const_0]).expect("byte[0]");
+    let b0 = b.load(uint_ty, None, ac_b0, None, vec![]).expect("load byte[0]");
+    let ac_b1 = b.access_chain(uint_ptr_uniform_ty, None, var_bytestream, vec![const_0, const_1]).expect("byte[1]");
+    let b1 = b.load(uint_ty, None, ac_b1, None, vec![]).expect("load byte[1]");
+    let b0_shifted = b.shift_left_logical(uint_ty, None, b0, const_8).expect("byte[0]<<8");
+    let low_init = b.bitwise_or(uint_ty, None, b0_shifted, b1).expect("(byte[0]<<8)|byte[1]");
+    b.store(var_low, low_init, None, vec![]).expect("store low init");
+    b.store(var_range, const_0xff00, None, vec![]).expect("store range init");
+    b.store(var_pos, const_2, None, vec![]).expect("store pos init");
+    b.store(var_i, const_0, None, vec![]).expect("store i init");
+    let loop_header = b.id();
+    let loop_cond = b.id();
+    let loop_body = b.id();
+    let loop_continue = b.id();
+    let loop_merge = b.id();
+    b.branch(loop_header).expect("branch to loop header");
+
+    b.begin_block(Some(loop_header)).expect("OpLabel loop_header");
+    b.loop_merge(loop_merge, loop_continue, spirv::LoopControl::NONE, vec![]).expect("OpLoopMerge");
+    b.branch(loop_cond).expect("branch to loop cond");
+
+    b.begin_block(Some(loop_cond)).expect("OpLabel loop_cond");
+    let i_val = b.load(uint_ty, None, var_i, None, vec![]).expect("load i");
+    let cond = b.u_less_than(bool_ty, None, i_val, const_32).expect("i < context_size");
+    b.branch_conditional(cond, loop_body, loop_merge, vec![]).expect("OpBranchConditional loop");
+
+    b.begin_block(Some(loop_body)).expect("OpLabel loop_body");
+    let ac_shared_i = b.access_chain(uint_ptr_workgroup_ty, None, var_shared_state, vec![i_val]).expect("shared_state[i]");
+    let state_i = b.load(uint_ty, None, ac_shared_i, None, vec![]).expect("load shared_state[i]");
+    let range_val = b.load(uint_ty, None, var_range, None, vec![]).expect("load range");
+    let low_val = b.load(uint_ty, None, var_low, None, vec![]).expect("load low");
+    let range_times_state = b.i_mul(uint_ty, None, range_val, state_i).expect("range*state_i");
+    let rangeoff = b.u_div(uint_ty, None, range_times_state, const_256).expect("(range*state_i)/256");
+    let range_after = b.i_sub(uint_ty, None, range_val, rangeoff).expect("range-rangeoff");
+    let bit_is_zero = b.u_less_than(bool_ty, None, low_val, range_after).expect("low < range_after");
+
+    let branch_zero = b.id();
+    let branch_one = b.id();
+    let branch_merge = b.id();
+    b.selection_merge(branch_merge, spirv::SelectionControl::NONE).expect("OpSelectionMerge bit");
+    b.branch_conditional(bit_is_zero, branch_zero, branch_one, vec![]).expect("OpBranchConditional bit");
+
+    // bit==0: range=range_after; new_state=zero_one_state[state_i]; output[i]=0
+    b.begin_block(Some(branch_zero)).expect("OpLabel branch_zero");
+    b.store(var_range, range_after, None, vec![]).expect("store range (bit=0)");
+    let ac_zos0 =
+        b.access_chain(uint_ptr_uniform_ty, None, var_zero_one_state, vec![const_0, state_i]).expect("zero_one_state[state_i]");
+    let new_state0 = b.load(uint_ty, None, ac_zos0, None, vec![]).expect("load zero_one_state[state_i]");
+    let ac_shared_i0 = b.access_chain(uint_ptr_workgroup_ty, None, var_shared_state, vec![i_val]).expect("shared_state[i] (write, bit=0)");
+    b.store(ac_shared_i0, new_state0, None, vec![]).expect("store shared_state[i] (bit=0)");
+    let ac_out0 = b.access_chain(uint_ptr_uniform_ty, None, var_output, vec![const_0, i_val]).expect("output[i] (bit=0)");
+    b.store(ac_out0, const_0, None, vec![]).expect("store output[i]=0");
+    b.branch(branch_merge).expect("branch_zero -> branch_merge");
+
+    // bit==1: low-=range_after; range=rangeoff; new_state=zero_one_state[256+state_i]; output[i]=1
+    b.begin_block(Some(branch_one)).expect("OpLabel branch_one");
+    let low_after = b.i_sub(uint_ty, None, low_val, range_after).expect("low-range_after");
+    b.store(var_low, low_after, None, vec![]).expect("store low (bit=1)");
+    b.store(var_range, rangeoff, None, vec![]).expect("store range (bit=1)");
+    let state_i_plus_256 = b.i_add(uint_ty, None, state_i, const_256).expect("state_i+256");
+    let ac_zos1 = b
+        .access_chain(uint_ptr_uniform_ty, None, var_zero_one_state, vec![const_0, state_i_plus_256])
+        .expect("zero_one_state[256+state_i]");
+    let new_state1 = b.load(uint_ty, None, ac_zos1, None, vec![]).expect("load zero_one_state[256+state_i]");
+    let ac_shared_i1 = b.access_chain(uint_ptr_workgroup_ty, None, var_shared_state, vec![i_val]).expect("shared_state[i] (write, bit=1)");
+    b.store(ac_shared_i1, new_state1, None, vec![]).expect("store shared_state[i] (bit=1)");
+    let ac_out1 = b.access_chain(uint_ptr_uniform_ty, None, var_output, vec![const_0, i_val]).expect("output[i] (bit=1)");
+    b.store(ac_out1, const_1, None, vec![]).expect("store output[i]=1");
+    b.branch(branch_merge).expect("branch_one -> branch_merge");
+
+    b.begin_block(Some(branch_merge)).expect("OpLabel branch_merge");
+    // refill(): if (range < 256) { range*=256; low*=256; low+=bytestream[pos]; pos++; }
+    let range_val2 = b.load(uint_ty, None, var_range, None, vec![]).expect("load range (refill)");
+    let need_refill = b.u_less_than(bool_ty, None, range_val2, const_256).expect("range < 256");
+    let refill_then = b.id();
+    let refill_merge = b.id();
+    b.selection_merge(refill_merge, spirv::SelectionControl::NONE).expect("OpSelectionMerge refill");
+    b.branch_conditional(need_refill, refill_then, refill_merge, vec![]).expect("OpBranchConditional refill");
+
+    b.begin_block(Some(refill_then)).expect("OpLabel refill_then");
+    let range_val3 = b.i_mul(uint_ty, None, range_val2, const_256).expect("range*256");
+    b.store(var_range, range_val3, None, vec![]).expect("store range (refill)");
+    let low_val2 = b.load(uint_ty, None, var_low, None, vec![]).expect("load low (refill)");
+    let low_val3 = b.i_mul(uint_ty, None, low_val2, const_256).expect("low*256");
+    let pos_val = b.load(uint_ty, None, var_pos, None, vec![]).expect("load pos");
+    let ac_next_byte =
+        b.access_chain(uint_ptr_uniform_ty, None, var_bytestream, vec![const_0, pos_val]).expect("bytestream[pos]");
+    let next_byte = b.load(uint_ty, None, ac_next_byte, None, vec![]).expect("load bytestream[pos]");
+    let low_val4 = b.i_add(uint_ty, None, low_val3, next_byte).expect("low*256+byte");
+    b.store(var_low, low_val4, None, vec![]).expect("store low (refill)");
+    let pos_val2 = b.i_add(uint_ty, None, pos_val, const_1).expect("pos+1");
+    b.store(var_pos, pos_val2, None, vec![]).expect("store pos (refill)");
+    b.branch(refill_merge).expect("refill_then -> refill_merge");
+
+    b.begin_block(Some(refill_merge)).expect("OpLabel refill_merge");
+    b.branch(loop_continue).expect("branch to loop_continue");
+
+    b.begin_block(Some(loop_continue)).expect("OpLabel loop_continue");
+    let i_val2 = b.load(uint_ty, None, var_i, None, vec![]).expect("load i (continue)");
+    let i_val3 = b.i_add(uint_ty, None, i_val2, const_1).expect("i+1");
+    b.store(var_i, i_val3, None, vec![]).expect("store i (continue)");
+    b.branch(loop_header).expect("branch back to loop_header");
+
+    b.begin_block(Some(loop_merge)).expect("OpLabel loop_merge (end of lane0 serial work)");
+    b.branch(after_serial_label).expect("branch to after_serial_label");
+
+    // --- ステップ4: バリア ---
+    b.begin_block(Some(after_serial_label)).expect("OpLabel after_serial_label");
+    b.control_barrier(scope_workgroup, scope_workgroup, semantics_release_workgroup).expect("OpControlBarrier #2");
+
+    // --- ステップ5: 32レーン並列書き戻し ---
+    let ac_shared_out = b.access_chain(uint_ptr_workgroup_ty, None, var_shared_state, vec![lane]).expect("shared_state[lane] (read back)");
+    let final_state = b.load(uint_ty, None, ac_shared_out, None, vec![]).expect("load shared_state[lane] (final)");
+    let ac_ctx_out = b.access_chain(uint_ptr_uniform_ty, None, var_context_states, vec![const_0, lane]).expect("context_states[lane] (write back)");
+    b.store(ac_ctx_out, final_state, None, vec![]).expect("store context_states[lane] (final)");
+
+    b.ret().expect("OpReturn");
+    b.end_function().expect("OpFunctionEnd");
+
+    b.entry_point(spirv::ExecutionModel::GLCompute, main_fn, "main", vec![var_lane]);
+    b.execution_mode(main_fn, spirv::ExecutionMode::LocalSize, [context_size, 1, 1]);
+
+    let module = b.module();
+    let spirv_words = module.assemble();
+    ParallelRangeDecoderKernel { spirv_words, entry_point: "main", local_size: (context_size, 1, 1) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

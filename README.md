@@ -6,6 +6,43 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13)**: 前回「レンジコーダーは32レーン
+> subgroup shuffleで並列化される」と記録したが、**FFmpeg本家の実ソース
+> (`libavcodec/vulkan/rangecoder.glsl`)を実際にfetchして読んだところ
+> 誤りだったと判明**——実際の機構はワークグループ共有メモリ(`shared`)
+> +`barrier()`であり、subgroup shuffleは使われていなかった(前回の
+> shuffle実証自体は無駄ではないが、FFv1の実機構ではなかった)。この
+> 訂正の上で、実際の機構に忠実な`build_range_decoder_parallel_kernel`
+> を新規実装: 32本のinvocationが並列に自分のコンテキスト状態を共有
+> メモリへ書く→バリア→lane0だけが逐次`get_rac`を実行→バリア→32本が
+> 並列に書き戻す、という設計。**実GT730ハードウェア上でCPU参照実装と
+> 32コンテキスト分の復号ビット・最終状態の両方で完全一致**した。
+> さらにユーザーの指示(「32レーン成功後は64レーンに挑戦」)により
+> `context_size`をパラメータ化し、**64レーンでも実GT730ハードウェア上で
+> 完全一致**することを確認——ワークグループバリア方式がGT730の
+> subgroup幅(32)を超えても正しく機能することを実証した。ワークスペース
+> 全体で回帰無し。詳細は[PORTING.md](PORTING.md)・
+> [CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: The earlier note that the range coder parallelizes via
+> 32-lane subgroup shuffle was **wrong** — after actually fetching and
+> reading FFmpeg's real source
+> (`libavcodec/vulkan/rangecoder.glsl`), the real mechanism is
+> **workgroup shared memory (`shared`) + `barrier()`**, not subgroup
+> shuffle (the earlier shuffle proof remains a valid separate result,
+> just not FFv1's actual mechanism). Implemented
+> `build_range_decoder_parallel_kernel` faithfully to this real design:
+> all invocations write their own context state into shared memory in
+> parallel, a barrier, lane 0 alone runs the serial `get_rac` loop, a
+> barrier, then all invocations write results back in parallel —
+> **matched the CPU reference bit-for-bit and state-for-state across 32
+> contexts on real GT730 hardware**. Per the user's own roadmap
+> ("after 32 lanes succeed, try 64"), parameterized `context_size` and
+> confirmed **64 lanes also match exactly on real GT730 hardware** —
+> proving the barrier-based design scales past this GPU's native
+> 32-wide subgroup. Zero regressions. See [PORTING.md](PORTING.md) /
+> [CLAUDE.md](CLAUDE.md) for details.
+
 > 📌 **最近の更新(2026-09-12)**: H.264/H.265/HEVCの自前シェーダー実装は
 > 非推奨・クローズを再確認し、代わりに**FFv1**を現実的な次の目標として
 > 特定、同日中に5つの実装を完成させた: (1) MED予測器の比較器(`max`/

@@ -1017,3 +1017,108 @@ MEDの2次元近傍参照(`med_predictor_2d.hlsl`)も実際にコンパイルし
 無しの式木」を大きく超える形状であることが判明した。中途半端な
 デコーダ拡張を急いで報告しないため、今回はこの調査結果の記録までとし、
 実装は次回セッションへ持ち越す(`.hlsl`/`.dxbc`は調査資料として保持)。
+
+## Range coder 32-lane parallelization implemented, faithfully matching FFmpeg's real design — and scaled to 64 (2026-09-13)
+
+**Important correction first**: the earlier entry above (2026-09-12,
+"Range coder prerequisite check") assumed FFv1's real Vulkan
+implementation parallelizes context lookup via **subgroup shuffle**
+(`OpGroupNonUniformShuffle`). After actually fetching and reading
+FFmpeg's real source
+(`https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/vulkan/rangecoder.glsl`),
+this was wrong: the real mechanism is **workgroup shared memory
+(`shared` in GLSL, `Workgroup` storage class in SPIR-V) plus
+`barrier()`/`OpControlBarrier`** — not subgroup shuffle at all. Quoting
+the actual source:
+```glsl
+shared RangeCoder rc;                    // one shared instance
+shared uint8_t rc_state[NB_CONTEXTS*32]; // shared, one slot per context
+bool get_rac_state(uint idx) {
+    return rc_data[idx] = get_rac_internal(rc.range * rc_state[idx] >> 8);
+}
+```
+Each of 32 invocations writes its own context's state into shared
+memory in parallel (`rc_state[gl_LocalInvocationIndex] = ...`), a
+barrier synchronizes, and then one invocation sequentially calls
+`get_rac_state(idx)` for `idx = 0..31`, reading from shared memory
+instead of doing 32 sequential global-memory reads itself. The earlier
+`subgroup_shuffle_real_vulkan.rs` test remains a real, independently
+useful result (GT730 genuinely supports `OpGroupNonUniformShuffle`),
+but it is **not** the mechanism FFv1's range coder actually uses. This
+correction is recorded here rather than left standing silently.
+
+**Implemented, faithful to the real design**: added
+`range_coder::build_range_decoder_parallel_kernel(context_size)` —
+hand-built SPIR-V (again, no DXBC equivalent — this needs a barrier and
+workgroup-shared storage, well outside this crate's DXBC chain-decoder
+scope):
+1. All `context_size` invocations load their own
+   `context_states[lane]` and store it into a `Workgroup`-storage
+   shared array at the same index (parallel lookup).
+2. `OpControlBarrier` (Workgroup scope).
+3. Only `lane == 0` runs a serial loop over `i = 0..context_size-1`,
+   performing the exact same `get_rac`/`refill` arithmetic as
+   `build_range_decoder_kernel` above, but reading/writing the shared
+   array instead of a single scalar state — one invocation doing the
+   actual serial commit, matching FFmpeg's design.
+4. `OpControlBarrier` again.
+5. All invocations write their (now-updated) shared slot back to
+   `context_states[lane]` (parallel writeback).
+
+`zero_one_state` is a single 512-entry buffer (`[0..256)` = zero_state,
+`[256..512)` = one_state) — matching FFmpeg's own single-array layout
+(`zero_one_state[(uint(bit)<<8)+state]`) rather than the two separate
+arrays the single-lane kernel used.
+
+**Verified on real GT730 hardware**: new test
+`tests/range_decoder_parallel_real_vulkan.rs` — 32 independent
+contexts, each with a *different* initial state (not all 128, to
+actually exercise per-context divergence), decoded through one
+workgroup dispatch — **both the decoded bit sequence and all 32 final
+per-context states matched the CPU reference exactly**.
+
+**Scaled to 64 lanes, per explicit request, and it worked**: FFmpeg's
+own `CONTEXT_SIZE` is fixed at 32 (matching typical GPU subgroup
+width), but this kernel's design uses only workgroup-wide barriers and
+shared memory — no subgroup-width-dependent instruction — so nothing
+in principle should prevent a larger workgroup (internally spanning
+multiple 32-wide subgroups on GT730). Generalized the function to take
+`context_size` as a parameter and added
+`tests/range_decoder_parallel_64_real_vulkan.rs`: **64 contexts, real
+GT730 hardware, bit-for-bit and final-state match against the CPU
+reference** — confirming the barrier-based design does in fact scale
+past the native subgroup width on this hardware, not just in theory.
+
+`cargo test --workspace`: full suite green. `cargo clippy -p
+directx-shader-translate --all-targets -- -D warnings`: clean except
+the same pre-existing unrelated `dxil.rs` lint noted in every earlier
+entry.
+
+**Honest scope remaining**: this parallelizes the *lookup* step across
+independent contexts sharing one serial bitstream register — it does
+not yet implement `put_symbol`/`get_symbol` (FFv1's actual context
+*selection* policy per pixel/coefficient), nor has it been benchmarked
+for speed (correctness was the goal here; whether the barrier +
+single-lane-commit pattern is actually faster than serial on this old
+GPU is a separate, unmeasured question).
+
+**日本語(要約)**: 前回記録した「レンジコーダーはsubgroup shuffleで
+並列化される」という前提は誤りだったと判明した——FFmpeg本家の実ソース
+(`rangecoder.glsl`)を実際にfetchして読んだところ、実際の機構は
+**ワークグループ共有メモリ(`shared`)+バリア(`barrier()`)**であり、
+`OpGroupNonUniformShuffle`は一切使われていなかった。この訂正を正直に
+記録する(前回のsubgroup shuffle実証自体は独立した価値のある結果だが、
+FFv1の実際の機構ではなかった)。
+
+実際の機構に忠実な`build_range_decoder_parallel_kernel`を実装:
+32本のinvocationが並列に自分のコンテキスト状態を共有メモリへ書き込み、
+バリア後、lane0だけが逐次`get_rac`を実行して共有メモリへ書き戻し、
+再度バリア後、32本が並列に結果を書き戻す。新規テストが**実GT730
+ハードウェア上でCPU参照実装と32コンテキスト分の復号ビット・最終状態の
+両方で完全一致**。
+
+さらにユーザーの指示(「32レーンに成功したら64レーンに挑戦」)により
+`context_size`をパラメータ化し、**64レーンでも実GT730ハードウェア上で
+CPU参照実装と完全一致**することを確認した——この設計がsubgroup幅
+(GT730は32)を超えるワークグループサイズでも正しく機能することの実証。
+ワークスペース全体で回帰無し。
