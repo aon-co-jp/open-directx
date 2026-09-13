@@ -6,6 +6,41 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き6)**: 「今回は`.mkv`との互換性を
+> 対象とする」という指示を受け、FFmpeg実ソース
+> (`ffv1_template.c`の`predict`/`get_context`、`ffv1enc.c`の
+> `quant11`/`quant5`)を実際にfetchして読み、予測式・コンテキスト式・
+> 量子化テーブルを**本物へアップグレード**した——コンテキストの
+> 4/5番目の勾配について当初の推測(`tr-t2r`)が誤りだったと判明し
+> `LL-L`(2つ左)/`TT-T`(2つ上)へ修正。実際にこの開発機の`ffmpeg`で
+> 本物のFFv1-in-Matroskaファイルを作成・デコードし、比較対象が
+> 本物の動作するFFv1実装であることも確認した。**正直な開示**:
+> 予測式・コンテキスト式・量子化テーブルは実物になったが、`.mkv`との
+> バイト単位互換にはさらにMatroska/EBML処理・実スライスヘッダ・
+> RCT等が必要——具体的な次回作業リストとして記録した(未完了)。
+> DeepSeekのMLA実装(`aruaru-llm`)は、このセッションで一度もその
+> リポジトリを開いておらずコンテキストが無いため、正確性を優先し
+> 今回は着手しなかった。詳細は[PORTING.md](PORTING.md)・
+> [CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Per instruction to actually target real `.mkv`
+> compatibility this time, fetched and read FFmpeg's real source
+> (`ffv1_template.c`'s `predict`/`get_context`, `ffv1enc.c`'s
+> `quant11`/`quant5`) and **upgraded the prediction/context/
+> quantization to the real thing** — corrected an earlier wrong guess
+> about the 4th/5th context gradients (`LL-L`/`TT-T`, two-left/two-up,
+> not `tr-t2r`). Used this machine's real `ffmpeg` to create and decode
+> an actual FFv1-in-Matroska file, confirming the reference we compare
+> against is a genuine working FFv1 codec. **Honest scope**: prediction/
+> context/quantization are now real, but byte-level `.mkv`
+> compatibility still needs Matroska/EBML handling, real slice headers,
+> RCT, and more — recorded as a concrete punch list, not yet done.
+> DeepSeek's MLA implementation (in `aruaru-llm`) was not attempted
+> this session — that repository was never opened in this
+> conversation, and rushing an implementation with zero context there
+> risked getting it wrong. See [PORTING.md](PORTING.md) /
+> [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き5)**: FFv1の**ピクセル処理ループ**を
 > 実装した(`plane_codec.rs`)——これまで個別に検証してきたMED予測器・
 > レンジコーダー本体`get_rac`・シンボル符号化層`get_symbol`/

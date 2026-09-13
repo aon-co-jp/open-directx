@@ -3372,3 +3372,38 @@ Cargo.toml`に`open-cpu`を通常依存として追加(`../../../open-cpu`)、
 バイナリ互換性は無い——「予測→コンテキスト選択→シンボル符号化」
 という構造自体が正しく動くことの実証。DeepSeekのMLA実装は引き続き
 `aruaru-llm`側の別作業として範囲外。
+
+## HANDOFF追記(2026-09-13続き7) FFv1の予測式/コンテキスト式/量子化テーブルを実FFmpegソースへアップグレード、.mkv実ファイルで比較対象を検証
+
+ユーザー指示(「今回は.mkvファイルとの互換性を意図的に対象として」)
+を受け、`libavcodec/ffv1_template.c`(`predict`/`get_context`)と
+`libavcodec/ffv1enc.c`(`quant11`/`quant5`)を実際にfetchして読んだ。
+
+- `predict`=`mid_pred(L,L+T-LT,T)`——既存のMED実装と数式完全一致を確認。
+- `get_context`——**当初の推測(4/5番目の勾配が`tr-t2r`)は誤りと判明**、
+  実際は`LL-L`(2つ左)/`TT-T`(2つ上)。`plane_codec.rs`を修正。
+- `quant11`/`quant5`テーブルを実ソースからそのまま転記
+  (`CONTEXT_COUNT=16638`、RFC 9043の`ceil(scale/2)`と一致)。
+- 3本の往復テスト、新規テーブル固定値テストすべて成功。
+
+**実機検証**: この開発機の実`ffmpeg`/`ffprobe`で本物のFFv1-in-Matroska
+ファイル(`test_ffv1.mkv`)を作成し、`codec_name=ffv1`であることと
+ロスレス往復を確認——比較対象が本物の動作するFFv1実装であることを
+実証した。
+
+**正直な開示**: 予測式・コンテキスト式・量子化テーブルは実物になったが、
+`.mkv`とのバイト単位互換にはさらに(1)Matroska/EBMLコンテナ処理、
+(2)FFv1の実フレーム/スライスヘッダビットレイアウト、(3)カスタム
+量子化テーブルのビットストリーム格納、(4)RGB用JPEG2000-RCT、
+(5)非一様初期状態(`ver2_state`)が必要——具体的な次回作業リストとして
+`PORTING.md`に記録した(漠然とした「要調査」ではない)。
+
+`cargo test --workspace`: 全緑(68件)。`cargo clippy`: 既存の無関係な
+`dxil.rs`1件を除きクリーン。README/PORTINGに日英併記で記録。
+
+**DeepSeekのMLA実装について**: `aruaru-llm`はこのセッションで一度も
+開いていない別リポジトリであり、コンテキストゼロの状態で実装を
+急ぐと不正確・低品質になるリスクが高いため、今回は着手しなかった
+(正直な開示)。着手するなら`aruaru-llm`のCLAUDE.md/PORTING.mdを
+先に読み、既存のattention実装の構造を理解した上で行うべき、専用の
+セッションとして次回以降に持ち越す。

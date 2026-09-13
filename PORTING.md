@@ -1475,3 +1475,96 @@ quantization tables are not implemented; neither is real bitstream
 framing (slice headers, `state_transition_delta`, version fields) —
 this proves the *algorithmic structure* works end-to-end, not
 byte-for-byte compatibility with real `.mkv` FFv1 streams.
+
+## FFv1 prediction/context/quantization upgraded to the exact real FFmpeg formulas — real-`.mkv` interop scoped honestly (2026-09-13, continued)
+
+Per explicit instruction to target real `.mkv` compatibility this time
+(not just algorithmic-structure validation), fetched and read the
+actual FFmpeg source that was previously only described secondhand:
+- `libavcodec/ffv1_template.c`: `predict()` = `mid_pred(L, L+T-LT, T)`
+  — confirmed **byte-for-byte identical in meaning** to the MED
+  predictor already implemented here (median of left/top/left+top-topleft).
+- `libavcodec/ffv1_template.c`: `get_context()` — the real 5-gradient
+  formula (verbatim variable names `L`=left, `LT`=topleft, `T`=top,
+  `RT`=topright, `LL`=two-left, `TT`=two-up):
+  `quant_table[0][(L-LT)&255] + quant_table[1][(LT-T)&255] +
+  quant_table[2][(T-RT)&255] + quant_table[3][(LL-L)&255] +
+  quant_table[4][(TT-T)&255]`. **This corrected an earlier guess**: the
+  4th/5th gradients are `LL-L` (two pixels left) and `TT-T` (two rows
+  up), not `tr-t2r` as originally assumed before reading the real
+  source.
+- `libavcodec/ffv1enc.c`: the real default `quant11[256]`/`quant5[256]`
+  tables (8-bit variant) — transcribed verbatim into `plane_codec.rs`'s
+  `QUANT11`/`QUANT5` constants, replacing the earlier placeholder
+  `clamp(-5,5)`.
+
+`plane_codec.rs` was rewritten to use these real formulas/tables
+exactly, with `CONTEXT_COUNT = 16638` (`ceil(11*11*11*5*5/2)`, RFC
+9043's own `context_count` formula — the real array size FFv1 itself
+allocates). Added a regression test
+(`quant_tables_match_the_real_ffmpeg_source_at_key_sample_points`)
+pinning specific known values from the transcribed tables, so a future
+copy-paste error would be caught immediately. All three round-trip
+tests (300-pixel synthetic image, flat color, negative/large values)
+**still pass exactly** with the real formulas.
+
+**Real-hardware/real-software sanity check performed** (not just
+read the source): used this machine's actually-installed `ffmpeg`/
+`ffprobe` to encode a real 16×16 grayscale test pattern to genuine
+FFv1-in-Matroska (`ffmpeg -f lavfi -i testsrc=size=16x16 ... -c:v ffv1
+test_ffv1.mkv`), confirmed via `ffprobe` it reports `codec_name=ffv1`,
+and decoded it back to raw losslessly with `ffmpeg -i test_ffv1.mkv -f
+rawvideo out.raw` — confirming the reference implementation we're
+comparing our formulas against is a real, working FFv1 codec on this
+machine, not just documentation.
+
+**Honest scope on actual `.mkv` binary interoperability — not
+completed, and here is exactly what remains**: prediction, context
+selection, and quantization tables are now real FFv1, but genuine
+byte-level compatibility with a real `.mkv` file (reading `test_ffv1.mkv`
+directly, or producing a file real `ffmpeg` could open) additionally
+needs, none of which are implemented yet:
+1. **Matroska/EBML container parsing or muxing** — `test_ffv1.mkv` is a
+   real EBML document; extracting/embedding the raw FFv1 slice bytes
+   requires an EBML reader/writer, not present in this codebase.
+2. **FFv1's actual frame/slice header bit layout** — version field,
+   `coder_type`, `colorspace_type`, `bits_per_raw_sample`, slice
+   count/coordinates, and (for version ≥3) per-slice CRC32 — all
+   encoded via the same `put_symbol`/range-coder machinery already
+   built here, but with the exact real field order and semantics,
+   which has not been transcribed from `ffv1enc.c`/`ffv1dec.c` yet.
+3. **`quant_table_count`/custom quant table bitstream encoding**
+   (`ff_ffv1_write_quant_tables`) — this module hardcodes the 5-gradient
+   default tables rather than reading/writing them from the stream.
+4. **RGB's JPEG2000-RCT reversible color transform** — only a single
+   (grayscale-equivalent) plane is handled; real color FFv1 needs this
+   transform plus 3-4 plane handling.
+5. **Non-uniform initial states** (`ver2_state`, also verbatim in
+   `ffv1enc.c`, not yet transcribed) — this module still initializes
+   all contexts to a flat `128`.
+
+Each of these is independently implementable using patterns already
+established in this codebase (more `put_symbol` calls for header
+fields, a small EBML reader for container access) — this is a concrete
+punch list for the next session's actual `.mkv` interop work, not a
+vague "more research needed."
+
+**日本語(要約)**: 実際に`.mkv`との互換性を今回の目標にする、という
+指示を受け、FFmpeg実ソース(`ffv1_template.c`の`predict`/
+`get_context`、`ffv1enc.c`の`quant11`/`quant5`)を実際にfetchして
+読んだ。予測式は既存のMED実装と数式として完全一致することを確認、
+コンテキスト式は当初の推測(`tr-t2r`)が誤りで実際は`LL-L`(2つ左)/
+`TT-T`(2つ上)であったと判明・修正、量子化テーブルは実物をそのまま
+転記した。`plane_codec.rs`を実式・実テーブルへ書き換え、3本の往復
+テストすべて引き続き完全一致。実際にこの開発機の`ffmpeg`で本物の
+FFv1-in-Matroskaファイルを作成・デコードし、比較対象が本物の動作する
+FFv1実装であることも確認した。
+
+**正直な開示(`.mkv`バイナリ互換自体はまだ未完了)**: 予測式・
+コンテキスト式・量子化テーブルは実物になったが、実際の`.mkv`
+ファイルとバイト単位で相互運用するには、(1) Matroska/EBMLコンテナの
+パース/マキシング、(2) FFv1の実際のフレーム/スライスヘッダのビット
+レイアウト、(3) カスタム量子化テーブルのビットストリーム格納、
+(4) RGBのJPEG2000-RCT、(5) 非一様な初期状態(`ver2_state`)——の
+5点がまだ必要。これらは既存の`put_symbol`基盤で実装可能な、具体的な
+次回作業リストとして記録する(漠然とした「要調査」ではない)。
