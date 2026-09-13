@@ -6,6 +6,41 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き)**: MEDの2次元近傍参照(`x-1`/`y-1`)
+> を、`vector_add`等と同じ「1つの既知コンパイル結果専用」方式の新規
+> モジュール`med2d.rs`として実装した(実`fxc.exe`出力の29命令
+> オペコード列を検証した上でSPIR-Vを再構築)。8x9画像(境界含む全72
+> ピクセル)で**実GT730ハードウェア上でCPU参照実装と完全一致**。
+> レンジコーダーの並列レーン数も128→256→512→1024まで拡張し、
+> いずれも実機で完全一致(GT730の`maxComputeWorkGroupInvocations`
+> 1536に対し1024が実質的な上限と判断、ここで打ち止め)。速度計測も
+> 実施し、**逐次版≈2.06ms/回に対し並列版≈2.31ms/回**(並列版の方が
+> 遅い)という結果を正直に報告——パイプライン構築オーバーヘッドが
+> 支配的と考えられる。open-cpuのAVX2/AVX512 gather命令との関連、
+> 東芝SBM(`open-cuda`に既存の`sbm_ising`を確認)、DeepSeekのMLA
+> (低ランクKVキャッシュ圧縮)、複数GPUプーリング(aggregation/
+> partitioning)についても調査した(いずれも調査のみ、新規実装は
+> 今回無し)。詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)
+> 参照。
+>
+> *English*: Implemented MED's 2D neighbor addressing (`x-1`/`y-1`) as
+> a new dedicated module `med2d.rs` (same "one known-compiled-shader
+> shape" approach as `vector_add` etc. — verifies the real `fxc.exe`
+> output's 29-opcode sequence, then rebuilds the SPIR-V). An 8×9 image
+> (72 pixels, borders included) **matched the CPU reference exactly on
+> real GT730 hardware**. Also extended the range coder's parallel lane
+> count to 128/256/512/1024, all real-hardware-verified (GT730's
+> `maxComputeWorkGroupInvocations` of 1536 makes 1024 the practical
+> ceiling for this single-workgroup design). Performed the previously-
+> unmeasured speed comparison: **serial ≈2.06 ms/call vs. parallel
+> ≈2.31 ms/call — parallel was slower**, honestly reported (likely
+> dominated by per-dispatch Vulkan pipeline rebuild overhead, not the
+> actual computation). Also researched (no new implementation) the
+> connection to `open-cpu`'s AVX2/AVX512 gather instructions, Toshiba's
+> SBM (already implemented in `open-cuda` as `sbm_ising`), DeepSeek's
+> real low-rank compression technique (MLA), and multi-GPU pooling
+> terminology. See [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13)**: 前回「レンジコーダーは32レーン
 > subgroup shuffleで並列化される」と記録したが、**FFmpeg本家の実ソース
 > (`libavcodec/vulkan/rangecoder.glsl`)を実際にfetchして読んだところ
