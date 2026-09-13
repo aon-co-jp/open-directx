@@ -3293,3 +3293,17 @@ vulkan/rangecoder.glsl`)を実際にfetchして読んだ。詳細は`PORTING.md`
 
 `cargo test --workspace`: 全緑(69件)。`cargo clippy`: 既存の無関係な
 `dxil.rs`1件を除きクリーン。README/PORTINGに日英併記で記録。
+
+## HANDOFF追記(2026-09-13続き3) レンジコーダーを実ハードウェア上限1536レーンまで拡張、AVX2 gather連携をopen-cpuに実装
+
+- `parallel_range_decoder_reaches_the_real_hardware_ceiling_of_1536_contexts_on_real_vulkan_hardware`
+  を追加、**実GT730ハードウェア上でCPU参照実装と完全一致**。
+  `vulkaninfo`の`maxComputeWorkGroupInvocations`(1536)そのものを試し、
+  安全マージンを取った数字ではなく上限ちょうどで成功することを確認した。
+  32→64→128→256→512→1024→1536のスケーリング梯子が完成。単一
+  ワークグループでの拡張はここが限界。
+- ユーザー指示によりAVX2/AVX-512 gather命令との関連を実際のコードとして
+  `open-cpu`に実装(`gather_u8_avx2`、この開発機で実行検証済み)。
+  詳細は`open-cpu`側のHANDOFF参照。`range_coder.rs`本体への統合は未実施。
+
+`cargo test --workspace`: 全緑。README/PORTINGに日英併記で記録。

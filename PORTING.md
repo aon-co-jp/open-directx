@@ -1283,3 +1283,42 @@ aruaru-llm(LLM推論)の領域でありopen-directx(シェーダー翻訳/GPU
 「プーリング」——正しい用語はGPU aggregation(複数GPUを1つの論理
 リソースへ統合)/partitioning(1GPUを複数へ分割、NVIDIA MIG等)で
 あることを確認、この開発機はGPUが1枚のみのため実機検証不可能。
+
+## Lane count pushed to the actual hardware ceiling (1536), and the AVX2/AVX-512 gather idea turned into real code in `open-cpu` (2026-09-13, continued)
+
+**1536 contexts, the real `vulkaninfo`-reported ceiling, not a
+conservative round number below it**: added
+`parallel_range_decoder_reaches_the_real_hardware_ceiling_of_1536_contexts_on_real_vulkan_hardware`.
+**Passed on real GT730 hardware**, bit-for-bit and final-state exact
+against the CPU reference — confirming the design works right up to
+`maxComputeWorkGroupInvocations` itself, not just safely below it. This
+closes the 32→64→128→256→512→1024→1536 scaling ladder; a single
+workgroup on this GPU cannot go higher (1537+ would need a
+fundamentally different multi-workgroup design, out of scope).
+
+**The AVX2/AVX-512 gather connection, implemented as real code (not
+left as an idea)**: per explicit instruction, this was actually
+researched and built in `open-cpu` (see that repo's own
+`PORTING.md`/`CLAUDE.md` 2026-09-13 entries) — `gather_u8_avx2` uses
+`_mm256_i32gather_epi32` to batch-lookup 8 table entries per
+instruction, the direct CPU-SIMD analog of this repo's "N GPU lanes
+each look up one table entry in parallel" pattern. Verified on the
+`open-cpu` dev machine (AMD Ryzen 9 3950X) against a scalar reference,
+matching exactly for 256/512-entry tables (the same sizes as this
+repo's `one_state`/`zero_state`/`zero_one_state`). Not yet wired into
+`range_coder.rs` itself as an actual CPU fallback path — recorded as
+the natural next integration step, not done this session.
+
+**日本語(要約)**: レンジコーダーの並列レーン数を、`vulkaninfo`が
+実際に申告するこのGPUの上限そのもの——1536——まで実機で検証し、
+完全一致を確認した(安全マージンを取った下回る数字ではなく、上限
+ちょうどを実際に試した)。これで32→64→128→256→512→1024→1536という
+スケーリングの梯子が完成し、単一ワークグループでの拡張はここが
+限界(1537以上は複数ワークグループへの根本的な設計変更が必要)。
+
+またAVX2/AVX-512のgather命令との関連を、アイデアのままにせず
+`open-cpu`に実際のコード(`gather_u8_avx2`)として実装した(詳細は
+`open-cpu`側のPORTING.md/CLAUDE.md参照)。この開発機(Ryzen 9 3950X)で
+実行検証済み、256/512要素テーブルでスカラー参照実装と完全一致。
+`range_coder.rs`本体への統合(実際にCPUフォールバック経路として使う)は
+未実施——次の自然な統合ステップとして記録する。

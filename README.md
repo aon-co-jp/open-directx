@@ -6,6 +6,24 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き2)**: レンジコーダーの並列レーン数を
+> `vulkaninfo`が実際に申告するこのGPUの上限そのもの——**1536**——まで
+> 拡張し、実GT730ハードウェア上でCPU参照実装と完全一致することを
+> 確認した(32→64→128→256→512→1024→1536のスケーリング梯子が完成)。
+> またAVX2/AVX-512のgather命令(`vpgatherdd`)との技術的関連を、
+> アイデアのままにせず`open-cpu`に実際のコード(`gather_u8_avx2`)として
+> 実装し、この開発機(AMD Ryzen 9 3950X)で実行検証した。詳細は
+> [PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Extended the range coder's parallel lane count to
+> **1536** — the actual `vulkaninfo`-reported ceiling for this GPU, not
+> a conservative number below it — and confirmed an exact match against
+> the CPU reference on real GT730 hardware (completing the
+> 32→64→128→256→512→1024→1536 scaling ladder). Also turned the AVX2/
+> AVX-512 gather-instruction connection into real code in `open-cpu`
+> (`gather_u8_avx2`), executed and verified on that dev machine (AMD
+> Ryzen 9 3950X). See [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き)**: MEDの2次元近傍参照(`x-1`/`y-1`)
 > を、`vector_add`等と同じ「1つの既知コンパイル結果専用」方式の新規
 > モジュール`med2d.rs`として実装した(実`fxc.exe`出力の29命令

@@ -128,3 +128,16 @@ fn parallel_range_decoder_scales_to_512_contexts_on_real_vulkan_hardware() {
 fn parallel_range_decoder_scales_to_1024_contexts_on_real_vulkan_hardware() {
     run_and_verify(1024, 2048);
 }
+
+/// 2026-09-13追加(ユーザー指示: GT730の実際のハードウェア上限
+/// 〈`vulkaninfo`の`maxComputeWorkGroupInvocations`=1536〉まで実装)。
+/// **これがこのGPU上で単一ワークグループとして実行できる最大の
+/// レーン数**——1537以上は`vkCreateComputePipelines`等が
+/// `VK_ERROR_*`を返すはずの領域であり、このテストが実際の上限ちょうど
+/// を実機で踏むことで「1536で成功する・1537未満に制限は無い」ことを
+/// 実証する(下回った数字を安全マージンとして選んだのではなく、
+/// 実際に申告された上限そのものを試す)。
+#[test]
+fn parallel_range_decoder_reaches_the_real_hardware_ceiling_of_1536_contexts_on_real_vulkan_hardware() {
+    run_and_verify(1536, 2048);
+}
