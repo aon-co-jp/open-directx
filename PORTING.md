@@ -1428,3 +1428,50 @@ isolation, not a working FFv1 encoder/decoder end to end.
 (近傍差分からコンテキストインデックスを選ぶロジック)や実際の
 ビットストリーム解析(スライスヘッダ等)はまだ手つかず——これは
 その処理が呼び出すはずのコーダー本体を単体で検証したに留まる。
+
+## FFv1のピクセル処理ループを実装(MED予測+近傍差分からのコンテキスト選択+`get_symbol`/`put_symbol`を1つの可逆画像圧縮として結合)、往復検証成功(2026-09-13、続き)
+
+これまで個別に検証してきた3層——MED予測器、レンジコーダー本体
+`get_rac`(実GT730ハードウェアでビット単位検証済み)、FFv1シンボル
+符号化層`get_symbol`/`put_symbol`(往復検証済み)——を、新規モジュール
+`src/plane_codec.rs`で実際に1つのピクセル処理ループへ組み合わせた。
+`encode_plane`/`decode_plane`は、実際のFFv1が行う「予測→誤差計算→
+近傍勾配からのコンテキスト選択→シンボル符号化」という一連の流れを
+通しで実装する。
+
+**正直な開示(簡略化した点)**: コンテキストは`left-topleft`/
+`top-topright`の2勾配のみ(実際のFFv1仕様は最大5勾配)、量子化関数は
+単純な`clamp(-5,5)`(実際のFFv1既定量子化テーブルは非線形)、スライス
+ヘッダ等の実際のビットストリームコンテナ形式は無し(出力バイト列は
+`RangeEncoderCpu`の生出力そのもので、実際の`.mkv`ファイルとは非互換)。
+これらは「近傍差分→コンテキスト選択→シンボル符号化」という構造自体を
+検証するための意図的な簡略化であり、正直に開示する。
+
+**実装中に発見・修正した実バグ(因果性の誤り)**: 当初`med2d.rs`と同じ
+「境界は`center`(自分自身のピクセル値)で埋める」簡略化を流用したが、
+これは**復号側では成立しない**——デコード側では「そのピクセル自身の
+値」こそがこれから復号しようとしている未知の値であり、参照すると
+未初期化のプレースホルダ(0)を読んでしまいエンコード時とズレる。
+実際に往復テストが全滅したことでこの設計ミスを発見し、既に復号済みの
+近傍だけを使う因果的なフォールバック連鎖(`left`/`top`が無ければ
+互いで補い合い、両方無ければ`0`)へ修正した——「一見動きそうな
+簡略化」が符号化→復号のループでは通用しない、という実例。
+
+**検証**: 3本の往復テスト——(1) 20x15=300ピクセルの疑似乱数風画像
+(MEDの3分岐すべてを踏む)、(2) 全ピクセル同値(差分が常に0の極端
+ケース)、(3) 負値・大きな値を含む画像——のいずれも修正後は
+**完全一致**。(1)は圧縮215バイト(生データ1200バイトから、圧縮率の
+最適性は主張しないが実際に縮んだ)。
+
+`cargo test --workspace`: 全緑(75テスト、up from 72)。`cargo clippy
+-p directx-shader-translate --all-targets -- -D warnings`: 既存の
+無関係な`dxil.rs`1件を除きクリーン。
+
+**日本語(要約は上記の通り、英語版と同内容)**。
+
+**Honest scope remaining**: real FFv1's full 5-gradient context
+computation and its actual (non-linear, bit-depth-dependent) default
+quantization tables are not implemented; neither is real bitstream
+framing (slice headers, `state_transition_delta`, version fields) —
+this proves the *algorithmic structure* works end-to-end, not
+byte-for-byte compatibility with real `.mkv` FFv1 streams.

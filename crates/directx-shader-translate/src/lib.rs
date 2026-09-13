@@ -22,6 +22,7 @@ use thiserror::Error;
 
 pub mod dxil;
 pub mod med2d;
+pub mod plane_codec;
 pub mod range_coder;
 pub mod spirv_gen;
 pub use dxil::{

@@ -6,6 +6,33 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き5)**: FFv1の**ピクセル処理ループ**を
+> 実装した(`plane_codec.rs`)——これまで個別に検証してきたMED予測器・
+> レンジコーダー本体`get_rac`・シンボル符号化層`get_symbol`/
+> `put_symbol`を、実際に1つの可逆画像圧縮ループ(`encode_plane`/
+> `decode_plane`)へ結合。実装中、`med2d.rs`から流用した境界処理の
+> 簡略化が復号側の因果性を壊すという**実バグを発見・修正**
+> (詳細は下記PORTING.md参照)。300ピクセル画像・全ピクセル同値・
+> 負値含む画像の3本の往復テストすべてで完全一致。実際のFFv1仕様
+> (5勾配コンテキスト、非線形量子化テーブル、スライスヘッダ)との
+> バイナリ互換性は無い簡略版だが、アルゴリズム構造自体の正しさを
+> 実証した。詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)
+> 参照。
+>
+> *English*: Implemented FFv1's **pixel processing loop**
+> (`plane_codec.rs`) — combined the previously-separately-verified MED
+> predictor, `get_rac` range-coder core, and `get_symbol`/`put_symbol`
+> symbol layer into one actual lossless image codec (`encode_plane`/
+> `decode_plane`). While building it, **found and fixed a real bug**:
+> the border-handling simplification borrowed from `med2d.rs` breaks
+> decoder causality (see PORTING.md for the full story). Three
+> round-trip tests (a 300-pixel image, a flat solid-color image, and
+> one with negative/large values) all matched exactly. Not
+> byte-compatible with real FFv1 `.mkv` streams (simplified context/
+> quantization, no bitstream framing), but proves the algorithmic
+> structure works end to end. See [PORTING.md](PORTING.md) /
+> [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き4)**: 残課題2件に着手した。(1)
 > CPU(AVX2 gather版)とGPU(実GT730ハードウェア)を同じテストの中で
 > **直接**突き合わせ、48コンテキストで出力そのものが一致することを
