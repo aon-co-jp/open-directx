@@ -6,6 +6,30 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き7)**: `.mkv`互換調査をさらに深掘り
+> した。実際にこの開発機の`ffmpeg`でFFv1 version 0(extradata無し)の
+> 単色画像を作り、実パケットバイト列を`ffprobe`で取得して自前の
+> `encode_plane`出力と直接比較したところ4.5倍のバイト数ギャップを
+> 発見——RFC 9043の`Parameters()`(コンフィグ情報をビットストリーム
+> 内にインライン符号化する処理)が未実装だったことが原因と判明した。
+> この調査の過程で**実バグも発見・修正**: `quant_table[2]`は
+> `quant11`ではなく`quant5`が正しく、`CONTEXT_COUNT`は`7563`
+> (以前の`16638`は誤り)。次回実装できるよう`Frame`/`Parameters`/
+> `QuantizationTableSet`等の正確な擬似コードを取得・記録した。
+> 詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)参照。
+>
+> *English*: Deepened the `.mkv` interop investigation. Encoded a
+> solid-color image to real extradata-free FFv1 (version 0) with this
+> machine's `ffmpeg`, extracted the real packet bytes via `ffprobe`,
+> and found a 4.5× byte-count gap versus this repo's own encoder —
+> traced to RFC 9043's `Parameters()` (inline bitstream configuration
+> encoding) being unimplemented. Along the way, **found and fixed a
+> real bug**: `quant_table[2]` should use `quant5`, not `quant11`, and
+> `CONTEXT_COUNT` should be `7563` (the earlier `16638` was wrong).
+> Captured the exact `Frame`/`Parameters`/`QuantizationTableSet`
+> pseudocode for the next implementation pass. See
+> [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き6)**: 「今回は`.mkv`との互換性を
 > 対象とする」という指示を受け、FFmpeg実ソース
 > (`ffv1_template.c`の`predict`/`get_context`、`ffv1enc.c`の

@@ -1568,3 +1568,136 @@ FFv1実装であることも確認した。
 (4) RGBのJPEG2000-RCT、(5) 非一様な初期状態(`ver2_state`)——の
 5点がまだ必要。これらは既存の`put_symbol`基盤で実装可能な、具体的な
 次回作業リストとして記録する(漠然とした「要調査」ではない)。
+
+## `.mkv` interop research deepened: real per-frame `Parameters()`/`QuantizationTableSet()` pseudocode obtained, and a real correctness bug found and fixed in the process (2026-09-13, continued)
+
+Continuing the `.mkv` interop punch list from the previous entry,
+fetched RFC 9043's exact pseudocode for the pieces needed to actually
+write a self-contained (no external extradata) FFv1 v0/v1 bitstream:
+
+**Real experiment performed first, not just reading docs**: used this
+machine's real `ffmpeg` to encode a 16×16 solid-gray (`128`) image to
+FFv1 **version 0** (`-level 0`) — confirmed via `ffprobe` this produces
+**zero bytes of extradata** (unlike the default encode, which had 42
+bytes) — and extracted the actual encoded packet bytes with `ffprobe
+-show_data` (27 bytes: `f2fc16c606e5c3a2...`). Then encoded the same
+flat 128 image with this repo's own `encode_plane` and compared bytes
+directly: **6 bytes, not matching**. This 4.5× size gap was the real,
+concrete signal (not a guess) that something structural — not just
+table values — was still missing.
+
+**Root cause, found by reading the spec instead of guessing**: RFC
+9043 Figure 28's `Frame()`/`Parameters()` pseudocode shows that for a
+keyframe with no external `ConfigurationRecord` (extradata) — exactly
+our case at `-level 0` — the **entire configuration (version,
+coder_type, colorspace_type, bits_per_raw_sample, chroma_planes,
+quant table definitions, etc.) is encoded inline in the bitstream
+itself**, via the same range-coder/`put_symbol` machinery, before any
+pixel data. This repo's `encode_plane`/`decode_plane` had never
+written any of this — explaining essentially all of the byte-count gap.
+
+**A real bug found in the process (not related to the header, but
+found while re-deriving the quantization scale formula to match RFC
+9043's `QuantizationTableSet`)**: re-reading `ffv1enc.c`'s actual
+`quant_tables[1][...]` assignment line by line revealed
+`quant_tables[1][2]` is `121 * quant5[i]`, **not** `121 * quant11[i]`
+as this repo's `compute_context` had it — only quant-table indices 0
+and 1 use `quant11`; indices 2, 3, and 4 all use `quant5`. Fixed
+`compute_context`'s third term (`top - topright`) from `q11` to `q5`,
+and recomputed `CONTEXT_COUNT` from RFC 9043's own
+`QuantizationTableSet` scale-accumulation formula
+(`scale *= 2*len_count[i][j]-1`, `quant11`'s `len_count=6` giving a
+×11 step, `quant5`'s `len_count=3` giving a ×5 step): the real
+sequence is `1 → 11 → 121 → 605 → 3025 → 15125`, so
+`context_count = ceil(15125/2) = 7563` — not the previously recorded
+`16638` (which had assumed all five quant-table slots used `quant11`).
+This is a genuine correctness fix, verified by re-running all
+round-trip tests (still pass) and the quant-table-value regression
+test (added a fixed sample-point check earlier, still green).
+
+**Concrete pseudocode now in hand for the next session** (RFC 9043,
+transcribed here so it doesn't need re-fetching):
+```
+Frame(NumBytes) {
+    keyframe                                                | br
+    if (keyframe && !ConfigurationRecordIsPresent) Parameters()
+    while (remaining_bits_in_bitstream(NumBytes)) Slice()
+}
+Parameters() {
+    version                        | ur
+    coder_type                     | ur   (0 = default state transitions)
+    colorspace_type                | ur
+    if (version >= 1) bits_per_raw_sample | ur
+    chroma_planes                  | br
+    log2_h_chroma_subsample        | ur
+    log2_v_chroma_subsample        | ur
+    extra_plane                    | br
+    for (i = 0; i < quant_table_set_count /* = 1 for v0/v1, implicit */; i++)
+        QuantizationTableSet(i)
+    /* version>=3-only fields (num_h_slices, num_v_slices,
+       quant_table_set_count read explicitly, states_coded/
+       initial_state_delta, ec, intra) are skipped for v0/v1 */
+}
+QuantizationTableSet(i) {
+    scale = 1
+    for (j = 0; j < 5 /* MAX_CONTEXT_INPUTS */; j++) {
+        QuantizationTable(i, j, scale)
+        scale *= 2*len_count[i][j] - 1
+    }
+    context_count[i] = ceil(scale/2)
+}
+QuantizationTable(i, j, scale) {
+    v = 0
+    for (k = 0; k < 128;) { len-1 | ur; for(n=0;n<len;n++){ table[k]=scale*v; k++ }; v++ }
+    for (k=1;k<128;k++) table[256-k] = -table[k]
+    table[128] = -table[127]
+    len_count[i][j] = v
+}
+Slice() {           // for version <= 1: no SliceHeader() at all
+    SliceContent()
+    if (coder_type == 0) { pad to byte alignment }
+    if (version <= 1) { consume remaining reserved bits to end of NumBytes }
+}
+SliceContent() {    // colorspace_type==0 (YUV-like): plane-major order
+    for (p = 0; p < primary_color_count; p++)
+        for (y = 0; y < plane_pixel_height[p]; y++)
+            Line(p, y)
+}
+```
+`br` = one range-coded bit (a dedicated header-only state array, not
+the per-pixel context states), `ur`/`sr` = `get_symbol` unsigned/signed
+(exactly this repo's already-implemented primitive).
+
+**Not implemented yet, honestly**: none of the above `Parameters()`/
+`keyframe`-bit/`QuantizationTableSet()` encoding is wired into
+`plane_codec.rs` yet — this entry records the exact spec text and the
+real experimental evidence (byte-count gap, extracted real packet
+bytes) needed to implement it correctly next time, plus a real
+correctness bug this research incidentally surfaced and fixed. Full
+`.mkv` byte-for-byte interop remains not done; the punch list from the
+previous entry is now more precise (item 2, the slice/frame header, has
+its exact pseudocode in hand) but items 1 (EBML container) and 4 (RCT)
+are still just as far off as before.
+
+**日本語(要約)**: `.mkv`互換調査の続きとして、RFC 9043の`Frame()`/
+`Parameters()`/`QuantizationTableSet()`の正確な擬似コードを取得した。
+まず実際にこの開発機の`ffmpeg`で16x16の単色画像をFFv1 version 0
+(`-level 0`、extradata無し)でエンコードし、`ffprobe -show_data`で
+実パケットバイト列(27バイト)を取得、自前の`encode_plane`の出力
+(6バイト)と直接比較して4.5倍のギャップを実際に確認した——これが
+「ヘッダが足りない」という具体的な根拠になった。原因はRFC 9043の
+`Parameters()`(version/coder_type/colorspace_type等をビットストリーム
+内にインラインで符号化する処理、extradata非存在時は必須)が全く
+未実装だったこと。
+
+この過程で`ffv1enc.c`の実テーブル割り当てを再確認し、**実バグを発見・
+修正**した——`quant_table[2]`(`top-topright`項)は`quant11`ではなく
+`quant5`が正しく、`CONTEXT_COUNT`も`16638`ではなく正しくは`7563`
+(`ceil(15125/2)`)だった。往復テスト・テーブル固定値テストとも
+修正後も全て成功を維持。
+
+次回セッションが実装に着手できるよう、`Frame`/`Parameters`/
+`QuantizationTableSet`/`QuantizationTable`/`Slice`/`SliceContent`の
+擬似コードをこのエントリに書き写した。`Parameters()`/`keyframe`ビット/
+量子化テーブル定義のインライン符号化自体はまだ`plane_codec.rs`に
+配線していない——これが未完了である正直な現状。

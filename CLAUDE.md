@@ -3407,3 +3407,32 @@ Cargo.toml`に`open-cpu`を通常依存として追加(`../../../open-cpu`)、
 (正直な開示)。着手するなら`aruaru-llm`のCLAUDE.md/PORTING.mdを
 先に読み、既存のattention実装の構造を理解した上で行うべき、専用の
 セッションとして次回以降に持ち越す。
+
+## HANDOFF追記(2026-09-13続き8) .mkv互換調査を深掘り、実バグ発見・修正(quant_table[2]がquant11ではなくquant5)、Frame/Parameters擬似コードを取得
+
+`.mkv`互換の続きとして、実際にこの開発機の`ffmpeg`で16x16単色画像を
+FFv1 version 0(`-level 0`、extradata無し)でエンコードし、`ffprobe
+-show_data`で実パケットバイト列(27バイト)を取得。自前の
+`encode_plane`出力(6バイト)と直接比較し4.5倍のギャップを実際に確認
+——RFC 9043の`Parameters()`(version/coder_type/colorspace_type等を
+ビットストリーム内にインライン符号化、extradata非存在時は必須)が
+未実装だったことが原因と特定した。
+
+この過程で`ffv1enc.c`の実テーブル割り当てを再確認し、**実バグを発見・
+修正**: `quant_table[2]`(`top-topright`項)は`quant11`ではなく
+`quant5`が正しく、`CONTEXT_COUNT`は`16638`ではなく正しくは`7563`
+だった。`plane_codec.rs`を修正、往復テスト・回帰テストとも成功維持。
+
+次回セッションのため、`Frame`/`Parameters`/`QuantizationTableSet`/
+`QuantizationTable`/`Slice`/`SliceContent`の正確な擬似コードを
+`PORTING.md`に書き写した——`Parameters()`/`keyframe`ビット/量子化
+テーブル定義のインライン符号化自体はまだ配線していない。
+
+`cargo test --workspace`: 全緑。`cargo clippy`: 既存の無関係な
+`dxil.rs`1件を除きクリーン。README/PORTINGに日英併記で記録。
+
+**次回への引き継ぎ(優先順位)**: (1) `Parameters()`のインライン
+符号化(擬似コード入手済み)、(2) `keyframe`ビット、(3) 実スライス
+コンテンツのスキャン順序確認、(4) Matroska/EBMLコンテナ、
+(5) RGB用RCT。DeepSeekのMLA実装は`aruaru-llm`側の専用セッションが
+必要、引き続き未着手。

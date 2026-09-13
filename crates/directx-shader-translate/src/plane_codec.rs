@@ -15,6 +15,9 @@
 //! quant_table[2][(T-RT)&255] + quant_table[3][(LL-L)&255] +
 //! quant_table[4][(TT-T)&255]
 //! ```
+//! `quant_table[0]`/`[1]`は`quant11`、`quant_table[2..5]`は`quant5`
+//! (`ffv1enc.c`の実際のテーブル割り当てを確認——当初`[2]`も`quant11`だと
+//! 誤解しており、`.mkv`実バイナリ互換調査の過程で修正した、後述)。
 //! `predict`(同ファイル)は`mid_pred(L, L+T-LT, T)`——3値の中央値であり、
 //! これは本プロジェクトが既に実装しているMED予測器(`spirv_gen`/
 //! `med2d`)と数式として完全に一致することを、実ソースを読んで
@@ -149,8 +152,22 @@ fn neighbors(image: &[i32], width: i32, x: i32, y: i32) -> (i32, i32, i32, i32, 
 /// docコメント参照)をそのまま実装する。符号が負の場合はインデックスを
 /// 反転し、符号化する差分の符号も反転する(FFv1の「コンテキストの
 /// 符号対称性による状態テーブル半減」規約)。
+///
+/// **バグ修正(2026-09-13、続き)**: `.mkv`実バイナリ互換を目指して
+/// RFC 9043のParameters()/QuantizationTableSet()擬似コードを精読した
+/// ところ、`ffv1enc.c`の実際のテーブル割り当て
+/// (`quant_tables[1][0]=quant11`, `[1]=11*quant11`, `[2]=121*quant5`,
+/// `[3]=605*quant5`, `[4]=3025*quant5`)を見落としていたことが判明した
+/// ——**3項目(`top-topright`)は`quant11`ではなく`quant5`が正しい**
+/// (0,1番目のみ`quant11`、2,3,4番目は`quant5`)。これに伴い
+/// `CONTEXT_COUNT`も、`QuantizationTableSet`の`scale`累積式
+/// (`scale *= 2*len_count[i][j]-1`、`quant11`の`len_count=6`→11倍、
+/// `quant5`の`len_count=3`→5倍)で正しく再計算した値
+/// (`1→11→121→605→3025→15125`、`context_count=ceil(15125/2)=7563`)
+/// へ修正した——以前の`16638`は誤って全5項目`quant11`だと仮定した
+/// 計算だった。
 fn compute_context(left: i32, top: i32, topleft: i32, topright: i32, ll: i32, tt: i32) -> (usize, bool) {
-    let ctx = q11(left - topleft) + 11 * q11(topleft - top) + 121 * q11(top - topright) + 605 * q5(ll - left) + 3025 * q5(tt - top);
+    let ctx = q11(left - topleft) + 11 * q11(topleft - top) + 121 * q5(top - topright) + 605 * q5(ll - left) + 3025 * q5(tt - top);
     if ctx < 0 {
         ((-ctx) as usize, true)
     } else {
@@ -159,10 +176,11 @@ fn compute_context(left: i32, top: i32, topleft: i32, topright: i32, ll: i32, tt
 }
 
 /// [`compute_context`]が返し得るコンテキストインデックスの最大値+1。
-/// RFC 9043の`context_count[i] = ceil(scale/2)`(`scale`=各量子化
-/// テーブルの段階数の積、`11*11*11*5*5=33275`)と同じ導出——実際の
-/// FFv1が確保する状態配列のサイズそのもの。
-const CONTEXT_COUNT: usize = 16638;
+/// RFC 9043の`QuantizationTableSet`が実際に計算する
+/// `context_count[i] = ceil(scale/2)`(`scale`は`quant11`×2項+
+/// `quant5`×3項の`len_count`から`1→11→121→605→3025→15125`と累積、
+/// 上の`compute_context`のdocコメント参照)。
+const CONTEXT_COUNT: usize = 7563;
 
 /// 画像(行優先、`i32`ピクセル値)を、実FFv1の予測式・コンテキスト式・
 /// 既定量子化テーブルで可逆圧縮する。
