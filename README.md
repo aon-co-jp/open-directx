@@ -6,6 +6,25 @@
 [Українська](README-Ukrainian.md) · [עברית](README-Hebrew.md) ·
 [فارسی](README-Persian.md) · [العربية](README-Arabic.md)
 
+> 📌 **最近の更新(2026-09-13続き4)**: 残課題2件に着手した。(1)
+> CPU(AVX2 gather版)とGPU(実GT730ハードウェア)を同じテストの中で
+> **直接**突き合わせ、48コンテキストで出力そのものが一致することを
+> 確認。(2) FFv1本体のビットストリーム層`get_symbol`/`put_symbol`
+> (RFC 9043 Figure 21)を実装——エンコーダー側はFFmpeg本家の実ソースから
+> 移植し、循環論法を避けるため実GT730ハードウェアで検証済みの
+> `get_rac`で復号し直す方式で往復検証、**符号あり・符号無し両方が
+> 初回で成功**。詳細は[PORTING.md](PORTING.md)・[CLAUDE.md](CLAUDE.md)
+> 参照。
+>
+> *English*: Tackled two remaining gaps. (1) Direct CPU (AVX2 gather)
+> vs. real-GPU (GT730) cross-check within a single test — 48 contexts,
+> outputs matched directly. (2) Implemented FFv1's real bitstream layer
+> `get_symbol`/`put_symbol` (RFC 9043 Figure 21) — the encoder side was
+> ported from FFmpeg's real source, and round-trip-verified (to avoid
+> circularity) by decoding back through the already-hardware-verified
+> `get_rac`; both signed and unsigned round trips **passed on the first
+> attempt**. See [PORTING.md](PORTING.md) / [CLAUDE.md](CLAUDE.md).
+
 > 📌 **最近の更新(2026-09-13続き3)**: `open-cpu`のAVX2 gather
 > (`gather_u8_avx2`)を`range_coder.rs`本体へ実際に統合した——
 > `decode_context_batch_cpu_simd`が、複数コンテキストの状態遷移

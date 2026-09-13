@@ -1355,3 +1355,76 @@ GPU版の結果と直接突き合わせるテストは無い(別クレート・�
 実行環境をまたぐため)——両方とも同じ`one_state`/`zero_state`/
 `RangeDecoderCpu`という共通の正しさの基準(CPU参照実装)と個別に
 一致することを、それぞれ確認している。
+
+## `get_symbol`/`put_symbol` implemented (FFv1's real bitstream layer, above `get_rac`) — round-trip verified against the hardware-checked decoder (2026-09-13, continued)
+
+Closed two more of the previously-recorded gaps in the same session:
+
+**1. CPU/GPU direct cross-check** (previously "not done — separate
+binaries/environments"): new test
+`tests/range_decoder_cpu_gpu_cross_check_real_vulkan.rs` runs the same
+input (byte stream + 48 distinct initial states) through both
+`decode_context_batch_cpu_simd` (this machine's AVX2) and
+`build_range_decoder_parallel_kernel` (real GT730 hardware) in the
+*same test*, and asserts the two implementations' actual outputs match
+**each other** directly — not merely that each separately matches a
+shared reference. **Passed**: identical decoded bits and identical
+final per-context states.
+
+**2. `get_symbol`/`put_symbol`, FFv1's real integer-symbol bitstream
+layer** (previously listed as entirely unimplemented): fetched RFC
+9043 Figure 21's exact `get_symbol` pseudocode and ported it verbatim
+(`get_symbol`, using context indices 0 for zero/nonzero, 1–10 for the
+unary exponent `e` clamped to `min(e,9)`, 11–21 for the sign clamped to
+`min(e,10)`, 22–31 for the mantissa bits clamped to `min(i,9)` — all
+matching RFC 9043's own index ranges exactly). Since the RFC does not
+publish encoder pseudocode ("encoding is any process producing a
+decodable bytestream"), `put_rac`/`renorm`/`finish` (`RangeEncoderCpu`)
+were ported from the real FFmpeg source (`rangecoder.glsl`,
+`put_rac_internal`/`renorm_encoder`'s `FULL_RENORM` variant, already
+fetched in an earlier entry) and `put_symbol` was derived as
+`get_symbol`'s structural mirror (same context-index formulas, `get_rac`
+calls replaced with `put_rac` calls in matching order).
+
+**Verification, deliberately not circular**: an encoder cannot be
+checked against itself for correctness (self-consistency proves
+nothing). Instead, `put_symbol`'s output was decoded back with
+`get_symbol`, which is built on `get_rac` — the exact primitive already
+verified bit-for-bit against real GT730 hardware in earlier entries.
+Two round-trip tests (`put_symbol_and_get_symbol_round_trip_signed_values`,
+`..._unsigned_values`) encode a spread of values (`0, ±1, ±2, ±7, ±100,
+±255, ±1000, ±32768`, and unsigned up to `65535`) and confirm the
+decoded sequence matches the original exactly. **Both passed on the
+first attempt** — a meaningful signal the RFC pseudocode and the
+FFmpeg-sourced encoder arithmetic were transcribed correctly, not
+merely made mutually consistent.
+
+`cargo test --workspace`: full suite green (72 tests total, up from
+70). `cargo clippy -p directx-shader-translate --all-targets -- -D
+warnings`: clean except the same pre-existing unrelated `dxil.rs` lint.
+
+**Honest scope remaining**: this is `get_symbol`/`put_symbol` in
+isolation — FFv1's actual pixel-processing loop (which picks a context
+*index* per pixel based on quantized neighbor-difference values, then
+calls `put_symbol`/`get_symbol` with that context) is not implemented;
+neither is real FFv1 bitstream parsing (slice headers, the
+`state_transition_delta` override, version-specific framing). This is
+the coder primitive FFv1's pixel loop would call, verified correct in
+isolation, not a working FFv1 encoder/decoder end to end.
+
+**日本語(要約)**: 2つの残課題を今回のセッション内でさらに解消した。
+(1) CPU/GPUの直接突き合わせテストを追加し、同じ入力に対してCPU
+(AVX2 gather版、この開発機)とGPU(実GT730ハードウェア)の出力そのものが
+直接一致することを確認した。(2) FFv1の実際のビットストリーム層
+`get_symbol`/`put_symbol`をRFC 9043 Figure 21の擬似コードそのままに
+実装した。エンコーダー側(`put_rac`/`RangeEncoderCpu`)はRFCに擬似
+コードが無いためFFmpeg本家の実ソース(`rangecoder.glsl`)から移植し、
+`put_symbol`は`get_symbol`の構造をそのまま反転させて導出した。検証は
+循環論法を避けるため、エンコード結果を実GT730ハードウェアで既に
+ビット単位検証済みの`get_rac`ベースの`get_symbol`で復号し直し、元の
+値と一致することを確認する方式を採用——符号あり・符号無し両方の
+往復テストが**初回で成功**した。ワークスペース全体で回帰無し
+(72テスト)。未実装として正直に開示: FFv1本体のピクセル処理ループ
+(近傍差分からコンテキストインデックスを選ぶロジック)や実際の
+ビットストリーム解析(スライスヘッダ等)はまだ手つかず——これは
+その処理が呼び出すはずのコーダー本体を単体で検証したに留まる。

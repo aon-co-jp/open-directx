@@ -3319,3 +3319,29 @@ Cargo.toml`に`open-cpu`を通常依存として追加(`../../../open-cpu`)、
 40コンテキストで完全一致することを確認。詳細は`PORTING.md`参照。
 
 `cargo test --workspace`: 全緑(70件)。README/PORTINGに日英併記で記録。
+
+## HANDOFF追記(2026-09-13続き5) CPU/GPU直接突き合わせ+get_symbol/put_symbol(FFv1本体のビットストリーム層)を実装、往復検証成功
+
+ユーザー指示により残課題2件に着手した。詳細は`PORTING.md`参照。
+
+- **CPU/GPU直接突き合わせ**: `tests/range_decoder_cpu_gpu_cross_check_
+  real_vulkan.rs`を追加。同じ入力をCPU(AVX2 gather版)とGPU(実GT730
+  ハードウェア)の両方に与え、出力そのものを直接比較(参照実装を介した
+  間接一致ではなく)——48コンテキストで完全一致。
+- **`get_symbol`/`put_symbol`を実装**: RFC 9043 Figure 21の擬似コードを
+  そのまま`get_symbol`として移植(コンテキストindex 0=ゼロ/非ゼロ、
+  1-10=指数部、11-21=符号、22-31=仮数部)。エンコーダー側はRFCに
+  擬似コードが無いため、本セッションで既にfetch済みのFFmpeg実ソース
+  (`rangecoder.glsl`)から`RangeEncoderCpu`(`put_rac`/`renorm`/
+  `finish`)を移植し、`put_symbol`は`get_symbol`の構造を反転させて導出。
+  **検証は循環論法を避け**、エンコード結果を実GT730ハードウェアで
+  ビット単位検証済みの`get_rac`ベース`get_symbol`で復号し直す方式を
+  採用——符号あり・符号無し両方の往復テストが**初回で成功**。
+
+`cargo test --workspace`: 全緑(72件)。`cargo clippy`: 既存の無関係な
+`dxil.rs`1件を除きクリーン。README/PORTINGに日英併記で記録。
+
+**未実装として正直に開示**: FFv1本体のピクセル処理ループ(近傍差分から
+コンテキストインデックスを選ぶロジック)、実際のビットストリーム解析
+(スライスヘッダ等)はまだ手つかず。DeepSeekのMLA実装は引き続き
+`aruaru-llm`側の別作業として範囲外。

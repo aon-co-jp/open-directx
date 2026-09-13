@@ -136,6 +136,174 @@ impl<'a> RangeDecoderCpu<'a> {
     }
 }
 
+/// FFv1本体のビットストリーム層(`get_symbol`、RFC 9043 Figure 21)を
+/// そのまま実装する(2026-09-13追加)。整数値1個を、32個のコンテキスト
+/// (`states`、`CONTEXT_SIZE=32`と同じ規約——index 0=ゼロ/非ゼロ判定、
+/// 1..10=指数部〈`min(e,9)`でクランプ〉、11..21=符号〈`min(e,10)`で
+/// クランプ、`is_signed`時のみ〉、22..31=仮数部〈`min(i,9)`でクランプ〉)
+/// を使って`get_rac`で逐次復号する。
+///
+/// これまでの`get_rac`本体(実GT730ハードウェアでビット単位検証済み)
+/// より一段上のFFv1ビットストリーム層——1シンボル(整数値)を復号する
+/// のに複数回`get_rac`を呼ぶ、実際にFFv1が使う形——であり、ここまでで
+/// 「未実装」としていた`get_symbol`/`put_symbol`のうち復号側を実装する。
+pub fn get_symbol(dec: &mut RangeDecoderCpu, states: &mut [u8; 32], is_signed: bool) -> i32 {
+    let one = one_state();
+    let zero = zero_state();
+
+    if dec.get_rac(&mut states[0], &one, &zero) != 0 {
+        return 0;
+    }
+
+    let mut e: usize = 0;
+    while dec.get_rac(&mut states[1 + e.min(9)], &one, &zero) != 0 {
+        e += 1;
+    }
+
+    let mut a: i32 = 1;
+    for i in (0..e).rev() {
+        let bit = dec.get_rac(&mut states[22 + i.min(9)], &one, &zero);
+        a = a * 2 + bit as i32;
+    }
+
+    if !is_signed {
+        return a;
+    }
+
+    if dec.get_rac(&mut states[11 + e.min(10)], &one, &zero) != 0 {
+        -a
+    } else {
+        a
+    }
+}
+
+/// FFv1のレンジ**エンコーダー**(RFC 9043本文は`get_rac`の擬似コードのみ
+/// 掲載し「エンコードは復号可能なバイト列を生成する任意の過程」としか
+/// 書いていないため、実際の算術はFFmpeg本家の実装〈`libavcodec/vulkan/
+/// rangecoder.glsl`、2026-09-13に本セッションで既に一度fetchして
+/// `put_rac_internal`/`renorm_encoder`〈FULL_RENORMの完全版〉を確認済み〉
+/// をRustへ素直に移植したもの)。
+///
+/// **検証方針**: このエンコーダーの正しさは、単体では判定できない
+/// (「自分自身と整合している」だけでは循環論法になる)——そのため、
+/// 実GT730ハードウェアで既に検証済みの[`RangeDecoderCpu::get_rac`]で
+/// 実際にデコードし直して、元のビット列と一致することを確認する
+/// (このモジュール末尾のテスト参照)。
+pub struct RangeEncoderCpu {
+    out: Vec<u8>,
+    low: u32,
+    range: u32,
+    outstanding_count: u32,
+    /// `-1`は初期状態を表す番兵(RFC本文に対応記述は無いが、FFmpeg実装
+    /// コメント「-1 at init, different meaning from 0xFF」の通り)。
+    outstanding_byte: i32,
+}
+
+impl Default for RangeEncoderCpu {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RangeEncoderCpu {
+    pub fn new() -> Self {
+        Self { out: Vec::new(), low: 0, range: 0xFF00, outstanding_count: 0, outstanding_byte: -1 }
+    }
+
+    /// `renorm_encoder`(FULL_RENORM版、`outstanding_byte<0`の初期状態を
+    /// 正しく扱える完全版)をそのまま移植。
+    fn renorm(&mut self) {
+        if self.outstanding_byte < 0 {
+            self.outstanding_byte = (self.low >> 8) as i32;
+        } else if self.low <= 0xFF00 {
+            self.out.push(self.outstanding_byte as u8);
+            for _ in 0..self.outstanding_count {
+                self.out.push(0xFF);
+            }
+            self.outstanding_count = 0;
+            self.outstanding_byte = (self.low >> 8) as i32;
+        } else if self.low >= 0x10000 {
+            self.out.push((self.outstanding_byte as u8).wrapping_add(1));
+            for _ in 0..self.outstanding_count {
+                self.out.push(0x00);
+            }
+            self.outstanding_count = 0;
+            self.outstanding_byte = ((self.low >> 8) & 0xFF) as i32;
+        } else {
+            self.outstanding_count += 1;
+        }
+        self.range <<= 8;
+        // GLSLの`bitfieldInsert(0, low, 8, 8)` == `(low & 0xFF) << 8`。
+        self.low = (self.low & 0xFF) << 8;
+    }
+
+    fn put_rac_internal(&mut self, range1: u32, bit: bool) {
+        let ranged = self.range - range1;
+        self.low += if bit { ranged } else { 0 };
+        self.range = if bit { range1 } else { ranged };
+        if self.range < 0x100 {
+            self.renorm();
+        }
+    }
+
+    /// [`RangeDecoderCpu::get_rac`]の逆操作。`state`の更新式
+    /// (`zero_state[state]`/`one_state[state]`)は復号側と全く同じ
+    /// (レンジコーダーの状態遷移テーブルはエンコード/デコードで共通)。
+    pub fn put_rac(&mut self, state: &mut u8, bit: bool, one: &[u8; 256], zero: &[u8; 256]) {
+        let range1 = (self.range * (*state as u32)) / 256;
+        self.put_rac_internal(range1, bit);
+        *state = if bit { one[*state as usize] } else { zero[*state as usize] };
+    }
+
+    /// ストリーム終端処理(`rac_terminate`のFULL_RENORM版に相当)。
+    /// これを呼ばないと末尾の`outstanding_byte`/`outstanding_count`が
+    /// 出力バイト列へ反映されない。
+    pub fn finish(mut self) -> Vec<u8> {
+        let range1 = (self.range * 129) / 256;
+        self.range -= range1;
+        if self.range < 0x100 {
+            self.renorm();
+        }
+        self.range = 0xFF;
+        self.low += 0xFF;
+        self.renorm();
+        self.range = 0xFF;
+        self.renorm();
+        self.out
+    }
+}
+
+/// [`get_symbol`]の逆操作(エンコード側)。RFC 9043 Figure 21の構造を
+/// そのまま反転する(`get_rac`→`put_rac`)。
+pub fn put_symbol(enc: &mut RangeEncoderCpu, states: &mut [u8; 32], value: i32, is_signed: bool) {
+    let one = one_state();
+    let zero = zero_state();
+
+    if value == 0 {
+        enc.put_rac(&mut states[0], true, &one, &zero);
+        return;
+    }
+    enc.put_rac(&mut states[0], false, &one, &zero);
+
+    let a = value.unsigned_abs() as i64;
+    // e = floor(log2(a))(aは1以上なのでe>=0)。
+    let e = (63 - a.leading_zeros() as i32) as usize;
+
+    for i in 0..e {
+        enc.put_rac(&mut states[1 + i.min(9)], true, &one, &zero);
+    }
+    enc.put_rac(&mut states[1 + e.min(9)], false, &one, &zero);
+
+    for i in (0..e).rev() {
+        let bit = ((a >> i) & 1) != 0;
+        enc.put_rac(&mut states[22 + i.min(9)], bit, &one, &zero);
+    }
+
+    if is_signed {
+        enc.put_rac(&mut states[11 + e.min(10)], value < 0, &one, &zero);
+    }
+}
+
 /// [`RangeDecoderCpu::get_rac`]を`states.len()`個のコンテキストへ順に
 /// 適用する(共有の1本のバイトストリームを、コンテキスト0から順に
 /// 使う——`spirv_gen`側の`build_range_decoder_parallel_kernel`が
@@ -776,5 +944,49 @@ mod tests {
 
         assert_eq!(simd_bits, sequential_bits, "AVX2 gatherバッチ版は逐次版と同じビット列を生成するべき");
         assert_eq!(simd_states, sequential_states, "AVX2 gatherバッチ版は逐次版と同じ最終状態になるべき");
+    }
+
+    #[test]
+    fn put_symbol_and_get_symbol_round_trip_signed_values() {
+        // RFC 9043 Figure 21(get_symbol)の逆操作として実装した
+        // put_symbolでエンコードし、実GT730ハードウェアで既に検証済みの
+        // get_rac(RangeDecoderCpu)ベースのget_symbolでデコードし直して、
+        // 元の値と一致することを確認する——エンコーダー単体では
+        // 正しさを判定できない(循環論法になる)ため、既に信頼できる
+        // デコーダー側と突き合わせるのがこのテストの意図。
+        let values: Vec<i32> = vec![0, 1, -1, 2, -2, 3, 7, -7, 8, 100, -100, 255, -255, 1000, -1000, 32767, -32768];
+        let mut enc = RangeEncoderCpu::new();
+        let mut enc_states = [128u8; 32];
+        for &v in &values {
+            put_symbol(&mut enc, &mut enc_states, v, true);
+        }
+        let mut bytes = enc.finish();
+        // RangeDecoderCpu::newは先頭2バイトを読むため、極端に短い
+        // 出力(値0だけ等)でも安全なようパディングする。
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut dec = RangeDecoderCpu::new(&bytes);
+        let mut dec_states = [128u8; 32];
+        let decoded: Vec<i32> = values.iter().map(|_| get_symbol(&mut dec, &mut dec_states, true)).collect();
+
+        assert_eq!(decoded, values, "put_symbolでエンコードした値をget_symbolで復号すると元の値と一致するべき");
+    }
+
+    #[test]
+    fn put_symbol_and_get_symbol_round_trip_unsigned_values() {
+        let values: Vec<i32> = vec![0, 1, 2, 3, 4, 5, 10, 100, 1000, 65535];
+        let mut enc = RangeEncoderCpu::new();
+        let mut enc_states = [128u8; 32];
+        for &v in &values {
+            put_symbol(&mut enc, &mut enc_states, v, false);
+        }
+        let mut bytes = enc.finish();
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut dec = RangeDecoderCpu::new(&bytes);
+        let mut dec_states = [128u8; 32];
+        let decoded: Vec<i32> = values.iter().map(|_| get_symbol(&mut dec, &mut dec_states, false)).collect();
+
+        assert_eq!(decoded, values);
     }
 }
