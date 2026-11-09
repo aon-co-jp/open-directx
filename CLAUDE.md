@@ -3548,3 +3548,7 @@ FFv1 version 0(`-level 0`、extradata無し)でエンコードし、`ffprobe
 - **WASM по-прежнему остаётся технологией для интерфейса.** Изменилось лишь то, что вызываемый им API теперь построен на Connect.
 - Интерфейсы, форма которых задана внешним стандартом (ACME, обратные вызовы OAuth, вебхуки сторонних сервисов, проверки работоспособности, статические файлы, OTLP), остаются обычным HTTP.
 - **Если есть сомнения — выбирайте Connect.**
+
+## 配備方針に対する判断(2026-11-09、共有基盤、調査のみ)
+- 判断: `open-directx`は**ライブラリのまま**。共有サービス化しない。理由: DirectX互換の抽象化層でサンプルゲームがgit依存として取り込む形であり、サイトからネットワーク越しに呼ぶ用途が無く、VPSにGPUも無い。サイトごとのインストールは元から発生しない(コンパイル時の依存)。コードは変更していない。
+- Decision (investigation only): `open-directx` stays a library (a compile-time git dependency of sample games; nothing for sites to call over the network; no GPU on the VPS). No code changed.
